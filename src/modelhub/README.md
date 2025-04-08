@@ -1,3 +1,5 @@
+# TODO: UPDATE FOR NEW MODELHUB
+
 # Inference with `modelhub-AF3` repository
 
 We have reproduced AF3 and are sharing the weights with the lab to use for various tasks. 
