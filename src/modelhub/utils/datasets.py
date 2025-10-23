@@ -403,30 +403,3 @@ def assemble_val_loader_dict(
         val_loaders[val_dataset_name] = val_loader
 
     return val_loaders
-
-
-def assemble_distributed_inference_loader_from_list_of_paths(
-    paths: list[str], rank: int, world_size: int
-) -> DataLoader:
-    """Assemble a distributed inference DataLoader from a list of file paths."""
-    dataset = FilePathDataset(paths)
-    sampler = SequentialSampler(dataset)
-    return assemble_distributed_loader(
-        dataset=dataset,
-        sampler=sampler,
-        rank=rank,
-        world_size=world_size,
-    )
-
-
-class FilePathDataset(Dataset):
-    """Lightweight dataset wrapper for file paths"""
-
-    def __init__(self, files):
-        self.files = files
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        return self.files[idx]
