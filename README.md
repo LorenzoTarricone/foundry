@@ -11,27 +11,34 @@ All models within Foundry rely on [AtomWorks](https://github.com/RosettaCommons/
 pip install rc-foundry[all]
 ```
 
-**Downloading weights** All models can be downloaded to a target folder with:
+**Downloading weights** Models can be downloaded to a target folder with:
+```
+foundry install base-models --checkpoint-dir <path/to/ckpt/dir>
+```
+where `checkpoint-dir` will be `~/.foundry/checkpoints` by default. Foundry always searches `~/.foundry/checkpoints` plus any colon-separated entries in `$FOUNDRY_CHECKPOINT_DIRS` during inference or subsequent commands to find checkpoints. `base-models` installs the latest RFD3, RF3 and MPNN variants - you can also download all of the models supported (including multiple checkpoints of RF3) with `all`, or by listing the models sequentially (e.g. `foundry install rfd3 rf3 ...`).
+To list the registry of available checkpoints:
+```
+foundry list-available
+```
+To check what you already have downloaded (searches `~/.foundry/checkpoints` plus `$FOUNDRY_CHECKPOINT_DIRS` if set):
+```
+foundry list-installed
+```
 
-```
-foundry install all --checkpoint_dir <path/to/ckpt/dir>
-```
-This will download all the models supported (including multiple checkpoints of RF3) but as a beginner you can start with:
-```
-foundry install rfd3 ligandmpnn rf3 --checkpoint_dir  <path/to/ckpt/dir>
-```
+>*See `examples/all.ipynb` for how to run each model and design proteins end-to-end in a notebook.*
 
->*See `examples/all.ipynb` for how to run each model in a notebook.*
+### Google Colab
+For an interactive Google Colab notebook walking through a basic design pipeline with RFD3, MPNN, and RF3, please see the [IPD Design Pipeline Tutorial](https://colab.research.google.com/drive/1ZwIMV3n9h0ZOnIXX0GyKUuoiahgifBxh?usp=sharing).
 
 ### RFdiffusion3 (RFD3)
 
 [RFdiffusion3](https://www.biorxiv.org/content/10.1101/2025.09.18.676967v2) is an all-atom generative model capable of designing protein structures under complex constraints. 
 
-> *See [models/rfd3/README.md](models/rfd3/README.md) for complete documentation.*
-
 <div align="center">
   <img src="docs/_static/cover.png" alt="RFdiffusion3 generation trajectory." width="700">
 </div>
+
+> *See [models/rfd3/README.md](models/rfd3/README.md) for complete documentation.*
 
 ### RosettaFold3 (RF3)
 
@@ -65,11 +72,7 @@ foundry install rfd3 ligandmpnn rf3 --checkpoint_dir  <path/to/ckpt/dir>
 Install both `foundry` and models in editable mode for development:
 
 ```bash
-# Install foundry and RF3 in editable mode
-uv pip install -e . -e ./models/rf3 -e ./models/rfd3 -e ./models/mpnn
-
-# Or install only foundry (no models)
-uv pip install -e .
+uv pip install -e '.[all,dev]'
 ```
 
 This approach allows you to:

@@ -23,7 +23,10 @@ from rfd3.inference.datasets import (
 )
 from rfd3.inference.input_parsing import DesignInputSpecification
 from rfd3.model.inference_sampler import SampleDiffusionConfig
-from rfd3.utils.inference import ensure_input_is_abspath
+from rfd3.utils.inference import (
+    ensure_inference_sampler_matches_design_spec,
+    ensure_input_is_abspath,
+)
 from rfd3.utils.io import (
     CIF_LIKE_EXTENSIONS,
     build_stack_from_atom_array_and_batched_coords,
@@ -171,6 +174,7 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         )
         # save
         self.specification_overrides = dict(specification or {})
+        self.inference_sampler_overrides = dict(inference_sampler or {})
 
         # Setup output directories and args
         self.global_prefix = global_prefix
@@ -209,6 +213,9 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         design_specifications = self._multiply_specifications(
             inputs=inputs,
             n_batches=n_batches,
+        )
+        ensure_inference_sampler_matches_design_spec(
+            design_specifications, self.inference_sampler_overrides
         )
         # init before
         self.initialize()
@@ -383,6 +390,11 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         # Based on inputs, construct the specifications to loop through
         design_specifications = {}
         for prefix, example_spec in inputs.items():
+            # Record task name in the specification
+            if "extra" not in example_spec:
+                example_spec["extra"] = {}
+            example_spec["extra"]["task_name"] = prefix
+
             # ... Create n_batches for example
             for batch_id in range((n_batches) if exists(n_batches) else 1):
                 # ... Example ID
@@ -524,21 +536,19 @@ def process_input(
 
 
 def _reshape_trajectory(traj, align_structures: bool):
-    traj = [traj[i] for i in range(len(traj))]
-    n_steps = len(traj)
+    traj = [traj[i] for i in range(len(traj))]  # make list of arrays
     max_frames = 100
-
+    if len(traj) > max_frames:
+        selected_indices = torch.linspace(0, len(traj) - 1, max_frames).long().tolist()
+        traj = [traj[i] for i in selected_indices]
     if align_structures:
         # ... align the trajectories on the last prediction
-        for step in range(n_steps - 1):
+        for step in range(len(traj) - 1):
             traj[step] = weighted_rigid_align(
-                X_L=traj[-1],
-                X_gt_L=traj[step],
-            )
+                X_L=traj[-1][None],
+                X_gt_L=traj[step][None],
+            ).squeeze(0)
     traj = traj[::-1]  # reverse to go from noised -> denoised
-    if n_steps > max_frames:
-        selected_indices = torch.linspace(0, n_steps - 1, max_frames).long().tolist()
-        traj = [traj[i] for i in selected_indices]
 
     traj = torch.stack(traj).cpu().numpy()
     return traj

@@ -4,6 +4,7 @@ from typing import Any, Literal
 
 import torch
 from jaxtyping import Float
+from rfd3.model.cfg_utils import strip_X
 
 from foundry.common import exists
 from foundry.utils.ddp import RankedLogger
@@ -11,6 +12,7 @@ from foundry.utils.rotation_augmentation import (
     rot_vec_mul,
     uniform_random_rotation,
 )
+from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
