@@ -1,4 +1,6 @@
 # For docs / outputs from example notebooks;
+demo/*/**.cif*
+demo/*/**.json
 examples/*.cif
 **.ckpt
 **.pt
@@ -187,7 +189,6 @@ dev.py
 *.benchmarks/
 
 # Images
-*.png
 *.pdf
 *.svg
 *.jpg
@@ -216,6 +217,7 @@ logs/
 **/notebooks/
 **/scratch/
 **/outputs/
+**/inference_outputs/
 **/slurm_logs/
 **/tmp/
 *.ckpt
@@ -225,3 +227,7 @@ logs/
 # AI
 **/CLAUDE.md
 **/.claude
+
+
+# Others 
+**/models/rfd3/docs/c5_symmetry.json

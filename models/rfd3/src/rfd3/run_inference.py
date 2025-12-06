@@ -2,6 +2,7 @@
 
 import os
 
+import torch
 import hydra
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
@@ -12,7 +13,9 @@ load_dotenv(override=True)
 
 # For pip-installed package, configs should be relative to this file
 # Adjust this path based on where configs are bundled in the package
-_config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "configs")
+_config_path = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "configs"
+)
 
 
 @hydra.main(
@@ -22,6 +25,7 @@ _config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__fi
 )
 def run_inference(cfg: DictConfig) -> None:
     """Execute the specified inference pipeline"""
+    torch.set_float32_matmul_precision("high")
 
     run_params_set = {"inputs", "n_batches", "out_dir"}
     run_params = {k: v for k, v in cfg.items() if k in run_params_set}
