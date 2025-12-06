@@ -217,6 +217,7 @@ logs/
 **/notebooks/
 **/scratch/
 **/outputs/
+**/inference_outputs/
 **/slurm_logs/
 **/tmp/
 *.ckpt
@@ -226,3 +227,7 @@ logs/
 # AI
 **/CLAUDE.md
 **/.claude
+
+
+# Others 
+**/models/rfd3/docs/c5_symmetry.json
