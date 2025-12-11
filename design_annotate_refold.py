@@ -4,6 +4,11 @@ Script to run RFDiffusion3 -> ProteinMPNN -> RF3 (validation)
 Based on design_with_symmetry.py
 """
 
+# Set environment variables BEFORE any imports that use them
+import os
+os.environ.setdefault('CCD_MIRROR_PATH', '')
+os.environ.setdefault('PDB_MIRROR_PATH', '')
+
 import sys
 import argparse
 from pathlib import Path
@@ -346,7 +351,7 @@ def main():
     parser.add_argument("--length", type=int, default=100)
     parser.add_argument("--num_designs", type=int, default=1)
     parser.add_argument("--symmetry", type=str, default=None)
-    parser.add_argument("--mpnn_batch_size", type=int, default=2) # Reduced default for validation speed
+    parser.add_argument("--mpnn_batch_size", type=int, default=5) # Reduced default for validation speed
     parser.add_argument("--designed_folded_file", type=bool, default=True, help="Generate a combined CIF of designed and refolded structures")
     args = parser.parse_args()
 
