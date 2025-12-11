@@ -214,9 +214,11 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             inputs=inputs,
             n_batches=n_batches,
         )
+        # Checks that the design specifications that require symmetric sampler have
+        # been set to the correct sampler.
         ensure_inference_sampler_matches_design_spec(
             design_specifications, self.inference_sampler_overrides
-        )
+        ) 
         # init before
         self.initialize()
         outputs = self._run_multi(design_specifications)

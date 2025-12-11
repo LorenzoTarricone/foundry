@@ -4,6 +4,11 @@ Script to run RFDiffusion3 design and annotate with ProteinMPNN.
 Supports optional symmetry constraints.
 """
 
+# Set environment variables BEFORE any imports that use them
+import os
+os.environ.setdefault('CCD_MIRROR_PATH', '')
+os.environ.setdefault('PDB_MIRROR_PATH', '')
+
 import sys
 import argparse
 from pathlib import Path
