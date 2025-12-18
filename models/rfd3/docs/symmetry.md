@@ -49,6 +49,7 @@ Cyclic symmetry with n-fold rotational symmetry around a single axis. Generates 
 {
     "uncond_C15": {
         "length": 100,
+        "is_non_loopy": true,
         "symmetry": {
             "id": "C15"
         }
@@ -63,6 +64,7 @@ Dihedral symmetry combines n-fold rotational symmetry with a 2-fold rotation per
 {
     "uncond_D4": { 
         "length": 100,
+        "is_non_loopy": true,
         "symmetry": {
             "id": "D4"
         }
@@ -176,7 +178,7 @@ The tasks that these examples describe are as follows:
             "M52": "CG,SD,CE"
         }
     },
-    "uncond_unsym_C3_6t8h": {
+    "unsym_C3_6t8h": {
         "symmetry": {
             "id": "C3",
             "is_symmetric_motif": true,
@@ -184,7 +186,8 @@ The tasks that these examples describe are as follows:
         },
         "input": "symmetry_examples/6t8h_C3.pdb",
         "contig": "150-150,/0,Y1-11,/0,Z16-25",
-        "length": null
+        "length": null,
+        "is_non_loopy": true
     }
 }
 ```
