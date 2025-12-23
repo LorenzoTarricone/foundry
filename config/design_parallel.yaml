@@ -1,0 +1,34 @@
+# Parallel Multi-GPU Design Configuration
+# ========================================
+# Multi-GPU parallel inference - splits attention across GPUs
+# Avoids materializing full L×L and I×I tensors
+#
+# SETUP:
+#   1. Allocate GPUs:  srun --gpus=4 --time=03:00:00 --pty /bin/bash --login
+#   2. Run script:     python scripts/design_parallel.py --config config/design_parallel.yaml
+#
+# Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
+
+# Output settings
+out_dir: "inference_outputs/design_demo_parallel"
+
+# Protein design parameters
+length: 100
+num_designs: 1
+
+# Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
+symmetry: I
+
+# MPNN settings
+mpnn_batch_size: 5
+
+# Parallel processing
+# The script auto-detects allocated GPUs from CUDA_VISIBLE_DEVICES
+# Set attention_parallel_factor to override (e.g., 2 to use only 2 of 4 allocated GPUs)
+attention_parallel_factor: null
+
+# Weights & Biases logging
+wandb:
+  enabled: false
+  project: "fast-rfd3"
+  run_name: null  # null = auto-generated

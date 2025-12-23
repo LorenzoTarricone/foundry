@@ -191,6 +191,8 @@ def run_design(
     symmetry_id=None,  # <--- CHANGE THIS: Set to "C3", "D2", etc. for symmetry. None for no symmetry.
     mpnn_batch_size=8,
     low_memory_mode=False,
+    attention_parallel=False,
+    attention_parallel_factor=None,
     use_wandb=False,
     wandb_project="fast-rfd3",
     wandb_run_name=None
@@ -204,6 +206,12 @@ def run_design(
                            If None, runs unconditionally without symmetry.
         low_memory_mode (bool): Enable low memory mode for RFD3 (memory efficient tokenization).
                                 Useful for symmetric designs or large structures.
+        attention_parallel (bool): Enable multi-GPU parallel attention mode.
+                                   When True, splits queries across GPUs to avoid materializing
+                                   full L×L or I×I tensors. Requires multiple GPUs.
+                                   Falls back to low_memory_mode if only 1 GPU available.
+        attention_parallel_factor (int): Override the parallelism factor (default: number of GPUs).
+                                         Set to control how many chunks to split attention into.
         use_wandb (bool): Enable W&B logging for memory tracking.
         wandb_project (str): W&B project name.
         wandb_run_name (str): W&B run name. Auto-generated if None.
@@ -229,6 +237,9 @@ def run_design(
                     "symmetry_id": symmetry_id,
                     "mpnn_batch_size": mpnn_batch_size,
                     "low_memory_mode": low_memory_mode,
+                    "attention_parallel": attention_parallel,
+                    "attention_parallel_factor": attention_parallel_factor,
+                    "n_gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
                     "pipeline": "design_annotate",
                 }
             )
@@ -287,13 +298,22 @@ def run_design(
     
     if low_memory_mode:
         print(f"  Low memory mode enabled (memory efficient tokenization)")
+    
+    if attention_parallel:
+        n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        factor = attention_parallel_factor or n_gpus
+        print(f"  Attention parallel mode enabled (n_gpus={n_gpus}, factor={factor})")
+        if n_gpus <= 1:
+            print(f"    -> Will fall back to LOW_MEMORY_MODE (only {n_gpus} GPU available)")
 
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
         diffusion_batch_size=rfd3_batch_size,
         inference_sampler=rfd3_inference_sampler,
         ckpt_path=ckpt_path,
-        low_memory_mode=low_memory_mode
+        low_memory_mode=low_memory_mode,
+        attention_parallel=attention_parallel,
+        attention_parallel_factor=attention_parallel_factor,
     )
     
     rfd3_engine = RFD3InferenceEngine(**rfd3_config)
@@ -410,6 +430,10 @@ def main():
     parser.add_argument("--symmetry", type=str, default=None, help="Symmetry ID (e.g. C3, D2). Default None.")
     parser.add_argument("--mpnn_batch_size", type=int, default=5)
     parser.add_argument("--low_memory_mode", action="store_true", help="Enable low memory mode for RFD3 (memory efficient tokenization)")
+    parser.add_argument("--attention_parallel", action="store_true", 
+                        help="Enable multi-GPU parallel attention mode. Splits queries across GPUs to avoid full L×L/I×I tensors. Falls back to low_memory_mode if only 1 GPU.")
+    parser.add_argument("--attention_parallel_factor", type=int, default=None,
+                        help="Override parallelism factor (default: number of GPUs)")
     # W&B arguments
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging for memory tracking")
     parser.add_argument("--wandb_project", type=str, default="fast-rfd3", help="W&B project name")
@@ -420,9 +444,11 @@ def main():
         out_dir=args.out_dir,
         length=args.length,
         num_designs=args.num_designs,
-        symmetry_id=args.symmetry, # Pass symmetry argument here
+        symmetry_id=args.symmetry,
         mpnn_batch_size=args.mpnn_batch_size,
         low_memory_mode=args.low_memory_mode,
+        attention_parallel=args.attention_parallel,
+        attention_parallel_factor=args.attention_parallel_factor,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name

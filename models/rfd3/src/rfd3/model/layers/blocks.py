@@ -1,5 +1,6 @@
 import logging
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -63,6 +64,14 @@ class ConditionedTransitionBlock(nn.Module):
 
 
 class PositionPairDistEmbedder(nn.Module):
+    """
+    Embeds pairwise position differences into pair features.
+    
+    Supports both full and chunked (streaming) forward passes:
+    - forward(): Full [I, I, c] or [L, L, c] output
+    - forward_chunk(): Chunked [I_par, I, c] output for streaming mode
+    """
+    
     def __init__(self, c_atompair, embed_frame=True):
         super().__init__()
         self.embed_frame = embed_frame
@@ -98,8 +107,18 @@ class PositionPairDistEmbedder(nn.Module):
         return P_LL
 
     def forward(self, ref_pos, valid_mask):
-        D_LL = ref_pos.unsqueeze(-2) - ref_pos.unsqueeze(-3)
-        V_LL = valid_mask
+        """
+        Full forward pass.
+        
+        Args:
+            ref_pos: [I, 3] or [L, 3] reference positions
+            valid_mask: [I, I, 1] or [L, L, 1] validity mask
+            
+        Returns:
+            P_LL: [I, I, c] or [L, L, c] pair embeddings
+        """
+        D_LL = ref_pos.unsqueeze(-2) - ref_pos.unsqueeze(-3)  # [I, I, 3]
+        V_LL = valid_mask  # [I, I, 1]
 
         if self.embed_frame:
             # Embed pairwise distances
@@ -110,6 +129,50 @@ class PositionPairDistEmbedder(nn.Module):
         P_LL = self.process_inverse_dist(inv_dist) * V_LL
         P_LL = P_LL + self.process_valid_mask(V_LL.to(P_LL.dtype)) * V_LL
         return P_LL
+
+    def forward_chunk(
+        self, 
+        ref_pos_query: torch.Tensor,  # [I_par, 3] query positions
+        ref_pos_key: torch.Tensor,    # [I, 3] all key positions
+        valid_mask: torch.Tensor,     # [I_par, I, 1] validity mask for this chunk
+    ) -> torch.Tensor:
+        """
+        Chunked forward pass for streaming mode.
+        
+        Computes pair embeddings for a subset of query positions against all key positions.
+        Never materializes full [I, I, c] tensor.
+        
+        Args:
+            ref_pos_query: [I_par, 3] query reference positions
+            ref_pos_key: [I, 3] key reference positions (all tokens)
+            valid_mask: [I_par, I, 1] validity mask
+            
+        Returns:
+            P_chunk: [I_par, I, c] pair embeddings for query chunk
+        """
+        # Compute pairwise differences: [I_par, I, 3]
+        D_chunk = ref_pos_query.unsqueeze(-2) - ref_pos_key.unsqueeze(-3)  # [I_par, I, 3]
+        V_chunk = valid_mask  # [I_par, I, 1]
+        
+        if self.embed_frame:
+            # Embed using AF3 style
+            P_chunk = self.process_d(D_chunk) * V_chunk  # [I_par, I, c]
+            
+            norm = torch.linalg.norm(D_chunk, dim=-1, keepdim=True) ** 2  # [I_par, I, 1]
+            norm = torch.clamp(norm, min=1e-6)
+            inv_dist = 1 / (1 + norm)  # [I_par, I, 1]
+            
+            P_chunk = P_chunk + self.process_inverse_dist(inv_dist) * V_chunk
+            P_chunk = P_chunk + self.process_valid_mask(V_chunk.to(P_chunk.dtype)) * V_chunk
+        else:
+            # Simpler embedding without frame
+            norm = torch.linalg.norm(D_chunk, dim=-1, keepdim=True) ** 2
+            norm = torch.clamp(norm, min=1e-6)
+            inv_dist = 1 / (1 + norm)
+            P_chunk = self.process_inverse_dist(inv_dist) * V_chunk
+            P_chunk = P_chunk + self.process_valid_mask(V_chunk.to(P_chunk.dtype)) * V_chunk
+        
+        return P_chunk  # [I_par, I, c]
 
 
 class OneDFeatureEmbedder(nn.Module):
@@ -148,6 +211,10 @@ class SinusoidalDistEmbed(nn.Module):
     """
     Applies sinusoidal embedding to pairwise distances and projects to c_atompair.
 
+    Supports both full and chunked (streaming) forward passes:
+    - forward(): Full [L, L, c] output
+    - forward_chunk(): Chunked [L_par, L, c] output for streaming mode
+
     Args:
         c_atompair (int): Output dimension of the projected embedding (must be even).
     """
@@ -166,6 +233,8 @@ class SinusoidalDistEmbed(nn.Module):
 
     def forward(self, pos, valid_mask):
         """
+        Full forward pass.
+        
         Args:
             pos: [L, 3] or [B, L, 3] ground truth atom positions
             valid_mask: [L, L, 1] or [B, L, L, 1] boolean mask
@@ -196,6 +265,57 @@ class SinusoidalDistEmbed(nn.Module):
         # Add linear embedding of valid mask
         P_LL = P_LL + self.process_valid_mask(valid_mask.to(P_LL.dtype)) * valid_mask
         return P_LL
+
+    def forward_chunk(
+        self, 
+        pos_query: torch.Tensor,   # [B, I_par, 3] query positions
+        pos_key: torch.Tensor,     # [B, I, 3] all key positions
+        valid_mask: torch.Tensor,  # [I_par, I, 1] validity mask
+    ) -> torch.Tensor:
+        """
+        Chunked forward pass for streaming mode.
+        
+        Computes sinusoidal distance embeddings for a subset of query positions
+        against all key positions. Never materializes full [I, I, c] tensor.
+        
+        Args:
+            pos_query: [B, I_par, 3] query positions
+            pos_key: [B, I, 3] key positions (all tokens)
+            valid_mask: [I_par, I, 1] validity mask
+            
+        Returns:
+            P_chunk: [B, I_par, I, c_atompair] embeddings for query chunk
+        """
+        # Compute pairwise distances for chunk: [B, I_par, I, 3]
+        D_chunk = pos_query.unsqueeze(-2) - pos_key.unsqueeze(-3)  # [B, I_par, I, 3]
+        dist_matrix = torch.linalg.norm(D_chunk, dim=-1)           # [B, I_par, I]
+        
+        # Sinusoidal embedding
+        half_dim = self.n_freqs
+        freq = torch.exp(
+            -math.log(10000.0)
+            * torch.arange(0, half_dim, dtype=torch.float32)
+            / half_dim
+        ).to(dist_matrix.device)  # [n_freqs]
+        
+        angles = dist_matrix.unsqueeze(-1) * freq  # [B, I_par, I, n_freqs]
+        sin_embed = torch.sin(angles)
+        cos_embed = torch.cos(angles)
+        sincos_embed = torch.cat([sin_embed, cos_embed], dim=-1)  # [B, I_par, I, 2*n_freqs]
+        
+        # Linear projection
+        P_chunk = self.output_proj(sincos_embed)   # [B, I_par, I, c_atompair]
+        
+        # Apply mask (broadcast over batch)
+        valid_mask_expanded = valid_mask.unsqueeze(0)  # [1, I_par, I, 1]
+        P_chunk = P_chunk * valid_mask_expanded
+        
+        # Add linear embedding of valid mask
+        P_chunk = P_chunk + self.process_valid_mask(
+            valid_mask_expanded.to(P_chunk.dtype)
+        ) * valid_mask_expanded
+        
+        return P_chunk  # [B, I_par, I, c_atompair]
 
 
 class LinearEmbedWithPool(nn.Module):
@@ -295,8 +415,21 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
         self.linear = linearNoBias(
             2 * self.num_tok_pos_bins + (2 * self.s_max + 2) + 1, c_z
         )
+        self.chunk_size = None
+        # If attention parallel is enabled, stream RPE computation to avoid full LxL materialization
+        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
+        if attn_parallel is not None:
+            n_parallel = max(int(attn_parallel), 1)
+            # will be set at runtime based on L to keep chunks ~L/n_parallel
+            self.chunk_size = n_parallel
 
     def forward(self, f):
+        if self.chunk_size is None:
+            return self._forward_full(f)
+        else:
+            return self._forward_chunked(f)
+
+    def _forward_full(self, f):
         b_samechain_II = f["asym_id"].unsqueeze(-1) == f["asym_id"].unsqueeze(-2)
         b_same_entity_II = f["entity_id"].unsqueeze(-1) == f["entity_id"].unsqueeze(-2)
         d_residue_II = torch.where(
@@ -365,6 +498,141 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
                 dim=-1,
             ).to(torch.float)
         )
+
+    def _forward_chunked(self, f):
+        # Stream over query dimension to avoid holding full LxL intermediates
+        L = f["asym_id"].shape[0]
+        n_parallel = max(self.chunk_size, 1)
+        chunk = max(1, (L + n_parallel - 1) // n_parallel)
+        device = f["asym_id"].device
+
+        # Precompute 1D arrays
+        asym = f["asym_id"]
+        entity = f["entity_id"]
+        residue = f["residue_index"]
+        token_idx = f["token_index"]
+        sym_id = f["sym_id"]
+        unindex_mask = f["unindexing_pair_mask"]  # [L, L]
+
+        outputs = []
+        for i_start in range(0, L, chunk):
+            i_end = min(i_start + chunk, L)
+            qs = slice(i_start, i_end)
+
+            b_samechain = asym[qs, None] == asym[None, :]
+            b_same_entity = entity[qs, None] == entity[None, :]
+
+            # residue distances
+            res_diff = residue[qs, None] - residue[None, :]
+            d_res = torch.where(
+                b_samechain,
+                torch.clip(res_diff + self.r_max, 0, 2 * self.r_max),
+                2 * self.r_max + 1,
+            )
+
+            b_sameres = residue[qs, None] == residue[None, :]
+            tok_diff = token_idx[qs, None] - token_idx[None, :] + self.r_max
+            d_tok = torch.where(
+                b_samechain * b_sameres,
+                torch.clip(tok_diff, 0, 2 * self.r_max),
+                2 * self.r_max + 1,
+            )
+
+            # chain distances
+            sym_diff = sym_id[qs, None] - sym_id[None, :]
+            d_chain = torch.where(
+                b_same_entity,
+                torch.clip(sym_diff + self.s_max, 0, 2 * self.s_max),
+                2 * self.s_max + 1,
+            )
+
+            # unindexing mask
+            unmask = unindex_mask[qs, :]
+            d_tok[unmask] = self.num_tok_pos_bins - 1
+            d_res[unmask] = self.num_tok_pos_bins - 1
+
+            A_res = one_hot(d_res.long(), self.num_tok_pos_bins)
+            A_tok = one_hot(d_tok.long(), self.num_tok_pos_bins)
+            A_chain = one_hot(d_chain.long(), 2 * self.s_max + 2)
+
+            feats = torch.cat(
+                [A_res, A_tok, b_same_entity.unsqueeze(-1).float(), A_chain], dim=-1
+            )
+            outputs.append(self.linear(feats))
+
+        return torch.cat(outputs, dim=0)
+
+    def forward_chunk(self, f: dict, start_i: int, end_i: int) -> torch.Tensor:
+        """
+        Compute RPE for a specific row range (query chunk) against all columns (keys).
+        
+        For streaming mode: computes [I_par, I, c_z] instead of full [I, I, c_z].
+        
+        Args:
+            f: Feature dictionary containing asym_id, entity_id, residue_index, etc.
+            start_i: Start index for query tokens
+            end_i: End index for query tokens
+            
+        Returns:
+            rpe_chunk: [I_par, I, c_z] relative position encoding for query chunk
+        """
+        I_par = end_i - start_i  # Number of queries
+        qs = slice(start_i, end_i)
+        
+        # Get 1D arrays
+        asym = f["asym_id"]           # [I]
+        entity = f["entity_id"]       # [I]
+        residue = f["residue_index"]  # [I]
+        token_idx = f["token_index"]  # [I]
+        sym_id = f["sym_id"]          # [I]
+        unindex_mask = f["unindexing_pair_mask"]  # [I, I]
+        
+        # Compute pairwise comparisons: [I_par, I]
+        b_samechain = asym[qs, None] == asym[None, :]     # [I_par, I]
+        b_same_entity = entity[qs, None] == entity[None, :]  # [I_par, I]
+        
+        # Residue distances: [I_par, I]
+        res_diff = residue[qs, None] - residue[None, :]
+        d_res = torch.where(
+            b_samechain,
+            torch.clip(res_diff + self.r_max, 0, 2 * self.r_max),
+            2 * self.r_max + 1,
+        )  # [I_par, I]
+        
+        # Token distances: [I_par, I]
+        b_sameres = residue[qs, None] == residue[None, :]
+        tok_diff = token_idx[qs, None] - token_idx[None, :] + self.r_max
+        d_tok = torch.where(
+            b_samechain * b_sameres,
+            torch.clip(tok_diff, 0, 2 * self.r_max),
+            2 * self.r_max + 1,
+        )  # [I_par, I]
+        
+        # Chain distances: [I_par, I]
+        sym_diff = sym_id[qs, None] - sym_id[None, :]
+        d_chain = torch.where(
+            b_same_entity,
+            torch.clip(sym_diff + self.s_max, 0, 2 * self.s_max),
+            2 * self.s_max + 1,
+        )  # [I_par, I]
+        
+        # Apply unindexing mask: [I_par, I]
+        unmask = unindex_mask[qs, :]
+        d_tok[unmask] = self.num_tok_pos_bins - 1
+        d_res[unmask] = self.num_tok_pos_bins - 1
+        
+        # One-hot encodings: [I_par, I, num_bins]
+        A_res = one_hot(d_res.long(), self.num_tok_pos_bins)    # [I_par, I, num_tok_pos_bins]
+        A_tok = one_hot(d_tok.long(), self.num_tok_pos_bins)    # [I_par, I, num_tok_pos_bins]
+        A_chain = one_hot(d_chain.long(), 2 * self.s_max + 2)   # [I_par, I, 2*s_max+2]
+        
+        # Concatenate features and project: [I_par, I, c_z]
+        feats = torch.cat(
+            [A_res, A_tok, b_same_entity.unsqueeze(-1).float(), A_chain], 
+            dim=-1
+        )  # [I_par, I, input_dim]
+        
+        return self.linear(feats)  # [I_par, I, c_z]
 
 
 class VirtualPredictor(nn.Module):
@@ -638,6 +906,78 @@ class LocalTokenTransformer(nn.Module):
 
         return A_I
 
+    def forward_cross_attn(
+        self,
+        A_I_chunk,         # [B, I_par, c_token] - queries from this GPU's chunk
+        S_I_chunk,         # [I_par, c_s] or [B, I_par, c_s] - conditioning for queries
+        A_I_full,          # [B, I, c_token] - keys/values from all tokens
+        S_I_full,          # [I, c_s] or [B, I, c_s] - conditioning for K/V
+        Z_chunk,           # [I_par, I, c_z] or [B, I_par, I, c_z] - pair bias
+        f,                 # Feature dictionary
+        X_L,               # [B, I, 3] - CA positions for index computation
+        query_start,       # int - global start index of this GPU's queries
+    ):
+        """
+        Cross-attention forward: query chunk attends to all keys.
+        
+        Multi-GPU parallel inference:
+        - Each GPU processes I_par = I // n_gpus query tokens
+        - All GPUs have access to all I key tokens
+        - Z_chunk is [I_par, I] not [I, I] - avoids I×I memory
+        
+        Args:
+            A_I_chunk: Query features [B, I_par, c_token]
+            S_I_chunk: Query conditioning [I_par, c_s] or [B, I_par, c_s]
+            A_I_full: Key/Value features [B, I, c_token]
+            S_I_full: K/V conditioning [I, c_s] or [B, I, c_s]
+            Z_chunk: Pair bias [I_par, I, c_z] or [B, I_par, I, c_z]
+            f: Feature dictionary
+            X_L: CA positions [B, I, 3]
+            query_start: Global start index of queries
+            
+        Returns:
+            A_I_chunk: Updated query features [B, I_par, c_token]
+        """
+        B, I_par, c_token = A_I_chunk.shape
+        I = A_I_full.shape[1]
+        device = A_I_chunk.device
+        
+        # Compute attention indices for the query chunk
+        # indices specify which keys (from 0..I-1) each query should attend to
+        indices_full = create_attention_indices(
+            X_L=X_L,
+            f=f,
+            tok_idx=torch.arange(I, device=device),
+            n_attn_keys=self.n_keys,
+            n_attn_seq_neighbours=self.n_local_tokens,
+        )  # [B, I, k]
+        
+        # Slice indices for this GPU's queries
+        query_end = query_start + I_par
+        indices_chunk = indices_full[:, query_start:query_end, :]  # [B, I_par, k]
+        
+        # Expand S_I if needed for batch dimension
+        if S_I_chunk.ndim == 2:
+            S_I_chunk = S_I_chunk.unsqueeze(0).expand(B, -1, -1)  # [B, I_par, c_s]
+        if S_I_full.ndim == 2:
+            S_I_full = S_I_full.unsqueeze(0).expand(B, -1, -1)    # [B, I, c_s]
+        
+        # Run cross-attention through blocks
+        for block in self.blocks:
+            block.attention_pair_bias.use_checkpointing = not DISABLE_CHECKPOINTING
+            
+            # Cross-attention: chunk queries → all keys
+            A_I_chunk = block.forward_cross_attn(
+                Q_chunk=A_I_chunk,                  # [B, I_par, c_token]
+                C_Q_chunk=S_I_chunk,                # [B, I_par, c_s]
+                K_V_full=A_I_full,                  # [B, I, c_token]
+                C_KV_full=S_I_full,                 # [B, I, c_s]
+                P_chunk=Z_chunk,                    # [I_par, I, c_z] or [B, I_par, I, c_z]
+                indices_chunk=indices_chunk,        # [B, I_par, k]
+            )  # [B, I_par, c_token]
+        
+        return A_I_chunk  # [B, I_par, c_token]
+
 
 class LocalAtomTransformer(nn.Module):
     def __init__(self, c_atom, c_s, c_atompair, atom_transformer_block, n_blocks):
@@ -710,6 +1050,102 @@ class StructureLocalAtomTransformerBlock(nn.Module):
             Q_L = Q_L + self.transition_block(Q_L)
         return Q_L
 
+    def forward_cross_attn(
+        self,
+        Q_chunk,           # [D, L_par, c_a] - queries from this GPU's chunk
+        C_Q_chunk,         # [D, L_par, c_s] - conditioning for queries
+        K_V_full,          # [D, L, c_a] - keys/values from all tokens
+        C_KV_full,         # [D, L, c_s] - conditioning for K/V
+        P_chunk,           # [L_par, L, c_pair] - pair bias for chunk×all
+        indices_chunk,     # [D, L_par, k] - sparse attention indices
+    ):
+        """
+        Cross-attention forward: queries from chunk attend to all keys.
+        
+        For multi-GPU parallel inference:
+        - Each GPU processes L_par = L // n_gpus queries
+        - All GPUs have access to all L keys
+        - P_chunk is [L_par, L] not [L, L] - avoids L×L memory
+        
+        Args:
+            Q_chunk: Query features [D, L_par, c_a]
+            C_Q_chunk: Query conditioning [D, L_par, c_s]
+            K_V_full: Key/Value features [D, L, c_a]
+            C_KV_full: K/V conditioning [D, L, c_s]
+            P_chunk: Pair bias [L_par, L, c_pair] or [D, L_par, L, c_pair]
+            indices_chunk: Attention indices [D, L_par, k]
+            
+        Returns:
+            Q_chunk: Updated query features [D, L_par, c_a]
+        """
+        # Cross-attention: Q_chunk queries attend to K_V_full keys
+        attn_out = self.attention_pair_bias.forward_cross_attn(
+            Q_chunk=Q_chunk,                               # [D, L_par, c_a]
+            C_Q_chunk=C_Q_chunk,                           # [D, L_par, c_s]
+            K_V_full=K_V_full,                             # [D, L, c_a]
+            C_KV_full=C_KV_full,                           # [D, L, c_s]
+            P_chunk=P_chunk,                               # [L_par, L, c_pair]
+            indices_chunk=indices_chunk,                   # [D, L_par, k]
+        )                                                  # [D, L_par, c_a]
+        
+        Q_chunk = Q_chunk + self.dropout(attn_out)         # [D, L_par, c_a]
+        
+        # Transition block on query chunk
+        if exists(C_Q_chunk):
+            Q_chunk = Q_chunk + self.transition_block(Q_chunk, C_Q_chunk)
+        else:
+            Q_chunk = Q_chunk + self.transition_block(Q_chunk)
+        
+        return Q_chunk                                     # [D, L_par, c_a]
+
+    def forward_sparse_cross_attn(
+        self,
+        Q_chunk,             # [D, L_par, c_a] - queries from this GPU's chunk
+        C_Q_chunk,           # [D, L_par, c_s] - conditioning for queries
+        K_V_full,            # [D, L, c_a] - keys/values (full, for gathering)
+        C_KV_full,           # [D, L, c_s] - conditioning for K/V
+        P_sparse_chunk,      # [D, L_par, k, c_pair] - SPARSE pair bias
+        indices_chunk,       # [D, L_par, k] - which keys each query attends to
+    ):
+        """
+        Sparse cross-attention: queries attend to k sparse neighbors.
+        
+        Combines parallelism (L_par queries) with sparse attention (k neighbors):
+        - P_sparse_chunk is [L_par, k] not [L_par, L] or [L, L]
+        - K/V are gathered from indices, not dense
+        - Memory: O(L_par * k) instead of O(L_par * L) or O(L²)
+        
+        Args:
+            Q_chunk: Query features [D, L_par, c_a]
+            C_Q_chunk: Query conditioning [D, L_par, c_s]
+            K_V_full: Key/Value features [D, L, c_a]
+            C_KV_full: K/V conditioning [D, L, c_s]
+            P_sparse_chunk: Sparse pair bias [D, L_par, k, c_pair]
+            indices_chunk: Sparse attention indices [D, L_par, k]
+            
+        Returns:
+            Q_chunk: Updated query features [D, L_par, c_a]
+        """
+        # Sparse cross-attention: Q_chunk queries attend to sparse K/V
+        attn_out = self.attention_pair_bias.forward_sparse_cross_attn(
+            Q_chunk=Q_chunk,                               # [D, L_par, c_a]
+            C_Q_chunk=C_Q_chunk,                           # [D, L_par, c_s]
+            K_V_full=K_V_full,                             # [D, L, c_a]
+            C_KV_full=C_KV_full,                           # [D, L, c_s]
+            P_sparse_chunk=P_sparse_chunk,                 # [D, L_par, k, c_pair]
+            indices_chunk=indices_chunk,                   # [D, L_par, k]
+        )                                                  # [D, L_par, c_a]
+        
+        Q_chunk = Q_chunk + self.dropout(attn_out)         # [D, L_par, c_a]
+        
+        # Transition block on query chunk
+        if exists(C_Q_chunk):
+            Q_chunk = Q_chunk + self.transition_block(Q_chunk, C_Q_chunk)
+        else:
+            Q_chunk = Q_chunk + self.transition_block(Q_chunk)
+        
+        return Q_chunk                                     # [D, L_par, c_a]
+
 
 class CompactStreamingDecoder(nn.Module):
     def __init__(
@@ -771,6 +1207,178 @@ class CompactStreamingDecoder(nn.Module):
             )
 
         # Downcast to sequence
+        A_I = self.downcast(Q_L.detach(), A_I.detach(), S_I.detach(), tok_idx=tok_idx)
+
+        o = {}
+        return A_I, Q_L, o
+
+    def forward_parallel(
+        self,
+        A_I,                   # [B, I, c_token] - full token features
+        S_I,                   # [I, c_s] - single features
+        Q_L,                   # [B, L, c_atom] - atom features
+        C_L,                   # [B, L, c_atom] - conditioned atom features
+        P_chunk,               # [L_par, L, c_pair] - THIS GPU's P_LL rows
+        tok_idx,               # [L] - atom to token mapping
+        indices,               # [B, L, k] - full attention indices
+        query_start,           # int - start index of this GPU's atom queries
+        query_end,             # int - end index of this GPU's atom queries
+        all_gather_fn,         # Callable to gather tensors from all GPUs
+        world_size,            # int - number of GPUs
+    ):
+        """
+        Parallel decoder: each GPU processes its chunk of atom queries.
+        
+        Multi-GPU parallelization:
+        - Each GPU processes L_par = L // n_gpus atom queries
+        - P_chunk is [L_par, L] not [L, L] - avoids L×L memory
+        - Upcast operates on full A_I (no L×L)
+        - Atom transformer uses cross-attention with P_chunk
+        - Q_L chunks are all_gathered for downcast
+        
+        Args:
+            A_I: Token features [B, I, c_token]
+            S_I: Single features [I, c_s]
+            Q_L: Atom features [B, L, c_atom]
+            C_L: Conditioned atom features [B, L, c_atom]
+            P_chunk: This GPU's P_LL rows [L_par, L, c_pair]
+            tok_idx: Atom to token mapping [L]
+            indices: Full attention indices [B, L, k]
+            query_start: Start index of this GPU's queries
+            query_end: End index of this GPU's queries
+            all_gather_fn: Function to gather tensors from all GPUs
+            world_size: Number of GPUs
+            
+        Returns:
+            A_I: Updated token features [B, I, c_token]
+            Q_L: Updated atom features [B, L, c_atom]
+            o: Empty dict (for compatibility)
+        """
+        B = A_I.shape[0]
+        L = Q_L.shape[1]
+        L_par = query_end - query_start                    # This GPU's chunk size
+        
+        # Slice indices for this GPU's queries
+        indices_chunk = indices[:, query_start:query_end, :]  # [B, L_par, k]
+        
+        # Run blocks with cross-attention
+        for i in range(self.n_blocks):
+            # Upcast: token → atom (operates on full, no L×L)
+            Q_L = self.upcast[i](Q_L, A_I, tok_idx=tok_idx)  # [B, L, c_atom]
+            
+            # Extract this GPU's Q_L chunk for attention
+            Q_L_chunk = Q_L[:, query_start:query_end, :]    # [B, L_par, c_atom]
+            C_L_chunk = C_L[:, query_start:query_end, :]    # [B, L_par, c_atom]
+            
+            # Cross-attention: Q_L_chunk queries attend to Q_L keys
+            # P_chunk is [L_par, L] - no L×L tensor
+            Q_L_chunk = self.atom_transformer[i].forward_cross_attn(
+                Q_chunk=Q_L_chunk,                          # [B, L_par, c_atom]
+                C_Q_chunk=C_L_chunk,                        # [B, L_par, c_atom]
+                K_V_full=Q_L,                               # [B, L, c_atom]
+                C_KV_full=C_L,                              # [B, L, c_atom]
+                P_chunk=P_chunk,                            # [L_par, L, c_pair]
+                indices_chunk=indices_chunk,                # [B, L_par, k]
+            )                                              # [B, L_par, c_atom]
+            
+            # All-gather Q_L chunks to reconstruct full Q_L
+            Q_L = all_gather_fn(Q_L_chunk, world_size, dim=1)  # [B, L, c_atom]
+
+        # Downcast to sequence (operates on full Q_L, no L×L)
+        A_I = self.downcast(Q_L.detach(), A_I.detach(), S_I.detach(), tok_idx=tok_idx)
+
+        o = {}
+        return A_I, Q_L, o
+
+    def forward_parallel_sparse(
+        self,
+        A_I,                        # [B, I, c_token] - full token features
+        S_I,                        # [I, c_s] - single features
+        Q_L,                        # [B, L, c_atom] - atom features
+        C_L,                        # [B, L, c_atom] - conditioned atom features
+        tok_idx,                    # [L] - atom to token mapping
+        tok_idx_chunk,              # [L_par] - this GPU's atoms
+        indices,                    # [B, L, k] - full attention indices
+        indices_chunk,              # [B, L_par, k] - this GPU's attention indices
+        query_start,                # int - start index
+        query_end,                  # int - end index
+        f,                          # Feature dict
+        chunked_pairwise_embedder,  # ChunkedPairwiseEmbedder
+        initializer_outputs,        # Dict with embedder state
+        all_gather_fn,              # Callable to gather tensors
+        world_size,                 # int - number of GPUs
+    ):
+        """
+        Parallel decoder with SPARSE P_LL computation.
+        
+        Combines two memory optimizations:
+        1. Multi-GPU parallelism: each GPU handles L_par queries
+        2. Sparse P_LL: only k neighbors per atom via chunked_pairwise_embedder
+        
+        Memory footprint:
+        - P_LL is never [L, L], only [L_par, k] per GPU
+        - Total memory: O(L_par * k) = O(L * k / n_gpus) per GPU
+        
+        Args:
+            A_I: Token features [B, I, c_token]
+            S_I: Single features [I, c_s]
+            Q_L: Atom features [B, L, c_atom]
+            C_L: Conditioned atom features [B, L, c_atom]
+            tok_idx: Full atom to token mapping [L]
+            tok_idx_chunk: This GPU's atom to token mapping [L_par]
+            indices: Full attention indices [B, L, k]
+            indices_chunk: This GPU's attention indices [B, L_par, k]
+            query_start: Start of this GPU's atom queries
+            query_end: End of this GPU's atom queries
+            f: Feature dictionary
+            chunked_pairwise_embedder: For sparse P_LL computation
+            initializer_outputs: Embedder state
+            all_gather_fn: Function to gather tensors from all GPUs
+            world_size: Number of GPUs
+            
+        Returns:
+            A_I: Updated token features [B, I, c_token]
+            Q_L: Updated atom features [B, L, c_atom]
+            o: Empty dict
+        """
+        B = A_I.shape[0]
+        L = Q_L.shape[1]
+        L_par = query_end - query_start                    # This GPU's chunk size
+        
+        # Run blocks
+        for i in range(self.n_blocks):
+            # Upcast: token → atom (operates on full, no L×L)
+            Q_L = self.upcast[i](Q_L, A_I, tok_idx=tok_idx)  # [B, L, c_atom]
+            
+            # Extract this GPU's Q_L chunk for attention
+            Q_L_chunk = Q_L[:, query_start:query_end, :]    # [B, L_par, c_atom]
+            C_L_chunk = C_L[:, query_start:query_end, :]    # [B, L_par, c_atom]
+            
+            # Compute SPARSE P_LL for this GPU's chunk only
+            # Uses chunked_pairwise_embedder which computes P only for (L_par, k) pairs
+            # indices_chunk tells which k neighbors each of the L_par atoms attends to
+            P_sparse_chunk = chunked_pairwise_embedder.forward_chunked(
+                indices=indices_chunk,                      # [B, L_par, k]
+                f=f,
+                initializer_outputs=initializer_outputs,
+                query_start=query_start,                    # Offset for feature indexing
+            )                                              # [B, L_par, k, c_atompair]
+            
+            # Sparse cross-attention: Q_L_chunk queries attend to sparse K/V
+            # Uses indices_chunk to gather sparse keys/values
+            Q_L_chunk = self.atom_transformer[i].forward_sparse_cross_attn(
+                Q_chunk=Q_L_chunk,                          # [B, L_par, c_atom]
+                C_Q_chunk=C_L_chunk,                        # [B, L_par, c_atom]
+                K_V_full=Q_L,                               # [B, L, c_atom]
+                C_KV_full=C_L,                              # [B, L, c_atom]
+                P_sparse_chunk=P_sparse_chunk,              # [B, L_par, k, c_atompair]
+                indices_chunk=indices_chunk,                # [B, L_par, k]
+            )                                              # [B, L_par, c_atom]
+            
+            # All-gather Q_L chunks to reconstruct full Q_L
+            Q_L = all_gather_fn(Q_L_chunk, world_size, dim=1)  # [B, L, c_atom]
+
+        # Downcast to sequence (operates on full Q_L, no L×L)
         A_I = self.downcast(Q_L.detach(), A_I.detach(), S_I.detach(), tok_idx=tok_idx)
 
         o = {}

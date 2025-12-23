@@ -1,9 +1,11 @@
 import inspect
+import os
 import time
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, Optional, Tuple, List
 
 import torch
+import torch.distributed as dist
 from jaxtyping import Float
 from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 from rfd3.model.cfg_utils import strip_X
@@ -15,9 +17,137 @@ from foundry.utils.rotation_augmentation import (
     rot_vec_mul,
     uniform_random_rotation,
 )
-from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
+
+
+# =============================================================================
+# Multi-GPU Parallel Inference Utilities
+# =============================================================================
+
+def _get_n_parallel() -> int:
+    """Get parallelism factor from environment, or 0 if not set."""
+    val = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
+    if val is None:
+        return 0
+    try:
+        return int(val)
+    except ValueError:
+        return 0
+
+
+def _is_streaming_mode() -> bool:
+    """Check if streaming/parallel attention mode is enabled."""
+    return _get_n_parallel() > 1
+
+
+def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
+    """Get current GPU rank and total world size for distributed processing."""
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    else:
+        return 0, 1
+
+
+def _compute_gpu_query_range(total: int, rank: int, world_size: int) -> Tuple[int, int]:
+    """
+    Compute the query index range for a specific GPU.
+    
+    Each GPU handles a contiguous chunk of queries. Queries are split evenly,
+    with earlier ranks getting any remainder.
+    
+    Args:
+        total: Total number of queries (I or L)
+        rank: This GPU's rank (0 to world_size-1)
+        world_size: Total number of GPUs
+        
+    Returns:
+        (start_idx, end_idx): Query range for this GPU [start, end)
+    """
+    chunk_size = total // world_size
+    remainder = total % world_size
+    
+    # Earlier ranks get one extra if there's remainder
+    if rank < remainder:
+        start = rank * (chunk_size + 1)
+        end = start + chunk_size + 1
+    else:
+        start = rank * chunk_size + remainder
+        end = start + chunk_size
+    
+    return start, end
+
+
+def _all_gather_variable_size(
+    tensor: torch.Tensor, 
+    dim: int, 
+    sizes: List[int],
+) -> torch.Tensor:
+    """
+    Gather tensors of potentially different sizes along a dimension.
+    
+    Args:
+        tensor: Local tensor chunk
+        dim: Dimension along which chunks vary
+        sizes: List of sizes for each GPU's chunk
+        
+    Returns:
+        Concatenated tensor from all GPUs
+    """
+    if not dist.is_initialized():
+        return tensor
+    
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return tensor
+    
+    # Create placeholder tensors for each GPU's contribution
+    gathered = []
+    for i, size in enumerate(sizes):
+        # Create tensor with correct size for GPU i
+        shape = list(tensor.shape)
+        shape[dim] = size
+        gathered.append(torch.zeros(shape, dtype=tensor.dtype, device=tensor.device))
+    
+    # Gather all tensors
+    dist.all_gather(gathered, tensor)
+    
+    return torch.cat(gathered, dim=dim)
+
+
+def _all_gather_concat(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+    """
+    Gather tensors from all GPUs and concatenate along specified dimension.
+    
+    Assumes all tensors have the same size along the gather dimension.
+    
+    Args:
+        tensor: Local tensor to gather
+        dim: Dimension to concatenate along
+        
+    Returns:
+        Concatenated tensor from all GPUs
+    """
+    if not dist.is_initialized():
+        return tensor
+    
+    world_size = dist.get_world_size()
+    if world_size == 1:
+        return tensor
+    
+    # Gather all tensors
+    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+    dist.all_gather(gathered, tensor)
+    
+    return torch.cat(gathered, dim=dim)
+
+
+def _broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+    """Broadcast tensor from source rank to all GPUs."""
+    if not dist.is_initialized():
+        return tensor
+    dist.broadcast(tensor, src=src)
+    return tensor
 
 
 @dataclass(kw_only=True)
@@ -148,6 +278,37 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         ref_initializer_outputs: dict[str, Any] | None,
         f_ref: dict[str, Any] | None,
     ) -> dict[str, Any]:
+        """
+        Diffusion sampling loop with optional multi-GPU parallel processing.
+        
+        When RFD3_ATTENTION_PARALLEL is set and multiple GPUs are available,
+        this uses DistriFusion-style parallel inference where:
+        - Queries are split across GPUs (each GPU processes I/n_parallel tokens)
+        - Each GPU computes its chunk of the output
+        - Results are gathered and reassembled after each diffusion step
+        
+        Args:
+            f: Feature dictionary
+            diffusion_module: The diffusion model
+            diffusion_batch_size: Number of parallel diffusion samples (D)
+            coord_atom_lvl_to_be_noised: [D, L, 3] coordinates to denoise
+            initializer_outputs: Outputs from TokenInitializer
+            ref_initializer_outputs: Reference outputs for CFG (optional)
+            f_ref: Reference features for CFG (optional)
+            
+        Returns:
+            dict with X_L, trajectories, sequence predictions
+        """
+        # Check for streaming/parallel mode
+        streaming_mode = initializer_outputs.get("streaming_mode", False)
+        n_parallel = _get_n_parallel()
+        gpu_rank, world_size = _get_gpu_rank_and_world_size()
+        
+        if streaming_mode and world_size > 1:
+            ranked_logger.info(
+                f"Parallel diffusion sampling: GPU {gpu_rank}/{world_size}, n_parallel={n_parallel}"
+            )
+        
         # Motif setup to recenter the motif at every step
         is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
 
@@ -157,8 +318,8 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             partial_t=f.get("partial_t", None),
         )
 
-        L = f["ref_element"].shape[0]
-        D = diffusion_batch_size
+        L = f["ref_element"].shape[0]                      # Number of atoms
+        D = diffusion_batch_size                           # Diffusion batch size
 
         X_L = self._get_initial_structure(
             c0=noise_schedule[0],
@@ -166,7 +327,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             L=L,
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
-        )  # (D, L, 3)
+        )                                                  # [D, L, 3]
 
         if self.s_jitter_origin > 0.0:
             X_L[:, is_motif_atom_with_fixed_coord, :] += torch.normal(
@@ -197,10 +358,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                     coord_atom_lvl_to_be_noised,
                     is_motif_atom_with_fixed_coord,
                     center_option=self.center_option,
-                    # If centering_affects_motif is True, the model's predictions from (step_num-1) might affect the motif
                     centering_affects_motif=(max(step_num - 1, 0)) >= threshold_step,
-                    # If keeping the motif position wrt the origin fixed, we can't do translational augmentation
-                    # We want to keep this position fixed in the interval where the model is not allowed to change it
                     s_trans=self.s_trans if step_num >= threshold_step else 0.0,
                 )
 
@@ -216,73 +374,119 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 self.noise_scale
                 * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
                 * torch.normal(mean=0.0, std=1.0, size=X_L.shape, device=X_L.device)
-            )
-            epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
-                0  # No noise injection for fixed atoms
-            )
-            X_noisy_L = X_L + epsilon_L
+            )                                              # [D, L, 3]
+            epsilon_L[..., is_motif_atom_with_fixed_coord, :] = 0  # No noise for fixed atoms
+            X_noisy_L = X_L + epsilon_L                    # [D, L, 3]
 
-            # Denoise the coordinates
-            # Handle chunked mode vs standard mode
-            if "chunked_pairwise_embedder" in initializer_outputs:
-                # Chunked mode: explicitly provide P_LL=None
-                tic = time.time()
-                chunked_embedder = initializer_outputs[
-                    "chunked_pairwise_embedder"
-                ]  # Don't pop, just get
+            # ================================================================
+            # Denoise the coordinates - handle chunked/streaming mode
+            # ================================================================
+            tic = time.time()
+            
+            # Prepare common arguments
+            chunked_embedder = initializer_outputs.get("chunked_pairwise_embedder", None)
+            
+            if chunked_embedder is not None or streaming_mode:
+                # Chunked/streaming mode: explicitly provide P_LL=None
                 other_outputs = {
                     k: v
                     for k, v in initializer_outputs.items()
-                    if k != "chunked_pairwise_embedder"
+                    if k not in ("chunked_pairwise_embedder", "streaming_mode")
                 }
+                
                 outs = diffusion_module(
-                    X_noisy_L=X_noisy_L,
-                    t=t_hat.tile(D),
+                    X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                    t=t_hat.tile(D),                       # [D]
                     f=f,
-                    P_LL=None,  # Not used in chunked mode
+                    P_LL=None,                             # Not used in chunked/streaming mode
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
+                    streaming_mode=streaming_mode,         # Pass streaming flag!
                     **other_outputs,
                 )
+                
                 toc = time.time()
-                ranked_logger.info(f"Chunked mode time: {toc - tic} seconds")
+                if step_num == 0:  # Log only first step to avoid spam
+                    ranked_logger.info(
+                        f"{'Streaming' if streaming_mode else 'Chunked'} mode step time: {toc - tic:.2f}s"
+                    )
             else:
                 # Standard mode: P_LL is included in initializer_outputs
                 outs = diffusion_module(
-                    X_noisy_L=X_noisy_L,
-                    t=t_hat.tile(D),
+                    X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                    t=t_hat.tile(D),                       # [D]
                     f=f,
                     **initializer_outputs,
                 )
 
-            X_denoised_L = outs["X_L"] if "X_L" in outs else outs
+            X_denoised_L = outs["X_L"] if "X_L" in outs else outs  # [D, L, 3]
+
+            # ================================================================
+            # Multi-GPU synchronization
+            # ================================================================
+            # In true multi-GPU parallel mode:
+            # - Token features (S_I, A_I) are all_gathered within the encoder
+            # - Each GPU computes full X_L from the synced token features
+            # - X_L should be identical across GPUs, but we sync to ensure consistency
+            if streaming_mode and world_size > 1:
+                # Barrier to ensure all GPUs have finished this step
+                dist.barrier()
+                
+                # Broadcast X_L from rank 0 to ensure exact consistency
+                # (should be identical, but floating point differences can accumulate)
+                _broadcast_tensor(X_denoised_L, src=0)
+                
+                # Sync sequence predictions
+                if "sequence_logits_I" in outs and outs["sequence_logits_I"] is not None:
+                    _broadcast_tensor(outs["sequence_logits_I"], src=0)
 
             # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
-            delta_L = (
-                X_noisy_L - X_denoised_L
-            ) / t_hat  # gradient of x wrt. t at x_t_hat
+            delta_L = (X_noisy_L - X_denoised_L) / t_hat   # [D, L, 3]
             d_t = c_t - t_hat
 
+            # ================================================================
+            # Classifier-free guidance (optional)
+            # ================================================================
             if self.use_classifier_free_guidance and (
                 self.cfg_t_max is None or c_t > self.cfg_t_max
             ):
                 X_noisy_L_stripped = strip_X(X_noisy_L, f_ref)
 
-                # unconditional forward pass
-                outs_ref = diffusion_module(
-                    X_noisy_L=X_noisy_L_stripped,  # modify X
-                    t=t_hat.tile(D),
-                    f=f_ref,  # modified f
-                    **ref_initializer_outputs,
-                )
+                # Unconditional forward pass
+                if chunked_embedder is not None or streaming_mode:
+                    ref_other = {
+                        k: v
+                        for k, v in ref_initializer_outputs.items()
+                        if k not in ("chunked_pairwise_embedder", "streaming_mode")
+                    }
+                    outs_ref = diffusion_module(
+                        X_noisy_L=X_noisy_L_stripped,
+                        t=t_hat.tile(D),
+                        f=f_ref,
+                        P_LL=None,
+                        chunked_pairwise_embedder=ref_initializer_outputs.get(
+                            "chunked_pairwise_embedder"
+                        ),
+                        streaming_mode=ref_initializer_outputs.get("streaming_mode", False),
+                        **ref_other,
+                    )
+                else:
+                    outs_ref = diffusion_module(
+                        X_noisy_L=X_noisy_L_stripped,
+                        t=t_hat.tile(D),
+                        f=f_ref,
+                        **ref_initializer_outputs,
+                    )
 
                 X_denoised_L_stripped = outs_ref["X_L"]
 
-                delta_L_ref = (
-                    X_noisy_L_stripped - X_denoised_L_stripped
-                ) / t_hat  # gradient of x wrt. t at x_t_hat
+                # Sync CFG outputs if distributed
+                if streaming_mode and world_size > 1:
+                    dist.all_reduce(X_denoised_L_stripped, op=dist.ReduceOp.AVG)
 
-                # pad delta_L_ref with zeros to match delta_L (for the unindexed atoms)
+                delta_L_ref = (X_noisy_L_stripped - X_denoised_L_stripped) / t_hat
+
+                # Pad delta_L_ref with zeros to match delta_L
                 if delta_L_ref.shape[1] < delta_L.shape[1]:
                     delta_L_ref = torch.cat(
                         [
@@ -292,30 +496,31 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                         dim=1,
                     )
 
-                # apply CFG
+                # Apply CFG
                 delta_L = delta_L + (self.cfg_scale - 1) * (delta_L - delta_L_ref)
 
+            # ================================================================
+            # Sequence entropy tracking
+            # ================================================================
             if exists(outs.get("sequence_logits_I")):
-                # Compute confidence
-                p = torch.softmax(
-                    outs["sequence_logits_I"], dim=-1
-                ).cpu()  # shape (D, L, 32)
-                seq_entropy = -torch.sum(
-                    p * torch.log(p + 1e-10), dim=-1
-                )  # shape (D, L,)
+                p = torch.softmax(outs["sequence_logits_I"], dim=-1).cpu()  # [D, I, vocab]
+                seq_entropy = -torch.sum(p * torch.log(p + 1e-10), dim=-1)  # [D, I]
                 sequence_entropy_traj.append(seq_entropy)
 
             # Update the coordinates, scaled by the step size
-            X_L = X_noisy_L + step_scale * d_t * delta_L
+            X_L = X_noisy_L + step_scale * d_t * delta_L   # [D, L, 3]
 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (
                 self.sigma_data * X_noisy_L / torch.sqrt(t_hat**2 + self.sigma_data**2)
-            )  # Save noisy traj as scaled inputs
+            )                                              # [D, L, 3]
             X_noisy_L_traj.append(X_noisy_L_scaled)
             X_denoised_L_traj.append(X_denoised_L)
             t_hats.append(t_hat)
 
+        # ================================================================
+        # Post-processing: motif alignment
+        # ================================================================
         if torch.any(is_motif_atom_with_fixed_coord) and self.allow_realignment:
             # Insert the gt motif at the end
             X_L, _ = centre_random_augment_around_motif(
@@ -333,13 +538,13 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             )
 
         return dict(
-            X_L=X_L,  # (D, L, 3)
-            X_noisy_L_traj=X_noisy_L_traj,  # list[Tensor[D, L, 3]]
-            X_denoised_L_traj=X_denoised_L_traj,  # list[Tensor[D, L, 3]]
-            t_hats=t_hats,  # list[Tensor[D]], where D is shared across all diffusion batches
-            sequence_logits_I=outs.get("sequence_logits_I"),  # (D, I, 32)
-            sequence_indices_I=outs.get("sequence_indices_I"),  # (D, I, 32)
-            sequence_entropy_traj=sequence_entropy_traj,  # list[Tensor[D, I]]
+            X_L=X_L,                                       # [D, L, 3]
+            X_noisy_L_traj=X_noisy_L_traj,                 # list[[D, L, 3]]
+            X_denoised_L_traj=X_denoised_L_traj,           # list[[D, L, 3]]
+            t_hats=t_hats,                                 # list[Tensor]
+            sequence_logits_I=outs.get("sequence_logits_I"),   # [D, I, vocab]
+            sequence_indices_I=outs.get("sequence_indices_I"), # [D, I]
+            sequence_entropy_traj=sequence_entropy_traj,   # list[[D, I]]
         )
 
 
@@ -383,30 +588,59 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         f_ref: dict[str, Any] | None,
         **_,
     ) -> dict[str, Any]:
+        """
+        Symmetry-aware diffusion sampling with optional multi-GPU parallel processing.
+        
+        Same as parent class but applies symmetry constraints during denoising.
+        
+        Args:
+            f: Feature dictionary (must contain sym_transform)
+            diffusion_module: The diffusion model
+            diffusion_batch_size: Number of parallel diffusion samples (D)
+            coord_atom_lvl_to_be_noised: [D, L, 3] coordinates to denoise
+            initializer_outputs: Outputs from TokenInitializer
+            ref_initializer_outputs: Not used (CFG disabled for symmetry)
+            f_ref: Not used
+            
+        Returns:
+            dict with X_L, trajectories, sequence predictions
+        """
+        # Check for streaming/parallel mode
+        streaming_mode = initializer_outputs.get("streaming_mode", False)
+        n_parallel = _get_n_parallel()
+        gpu_rank, world_size = _get_gpu_rank_and_world_size()
+        
+        if streaming_mode and world_size > 1:
+            ranked_logger.info(
+                f"Parallel symmetry diffusion: GPU {gpu_rank}/{world_size}, n_parallel={n_parallel}"
+            )
+        
         # Motif setup to recenter the motif at every step
         is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
+        
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(
             device=coord_atom_lvl_to_be_noised.device,
             partial_t=f.get("partial_t", None),
         )
 
-        L = f["ref_element"].shape[0]
-        D = diffusion_batch_size
+        L = f["ref_element"].shape[0]                      # Number of atoms
+        D = diffusion_batch_size                           # Diffusion batch size
+        
         X_L = self._get_initial_structure(
             c0=noise_schedule[0],
             D=D,
             L=L,
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
-        )  # (D, L, 3)
+        )                                                  # [D, L, 3]
 
         X_noisy_L_traj = []
         X_denoised_L_traj = []
         sequence_entropy_traj = []
         t_hats = []
 
-        # symmetrize X_L until the step gamma = gamma_min_sym
+        # Symmetrize X_L until the step gamma = gamma_min_sym
         gamma_min_sym_idx = min(
             int(len(noise_schedule) * self.sym_step_frac), len(noise_schedule) - 1
         )
@@ -414,6 +648,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
         ranked_logger.info(f"gamma_min_sym: {gamma_min_sym}")
         ranked_logger.info(f"gamma_min: {self.gamma_min}")
+        
         for step_num, (c_t_minus_1, c_t) in enumerate(
             zip(noise_schedule, noise_schedule[1:])
         ):
@@ -441,83 +676,94 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 self.noise_scale
                 * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
                 * torch.normal(mean=0.0, std=1.0, size=X_L.shape, device=X_L.device)
-            )
-            epsilon_L[..., is_motif_atom_with_fixed_coord, :] = (
-                0  # No noise injection for fixed atoms
-            )
+            )                                              # [D, L, 3]
+            epsilon_L[..., is_motif_atom_with_fixed_coord, :] = 0  # No noise for fixed atoms
 
             # NOTE: no symmetry applied to the noisy structure
-            X_noisy_L = X_L + epsilon_L
+            X_noisy_L = X_L + epsilon_L                    # [D, L, 3]
 
-            # Denoise the coordinates
-            # Handle chunked mode vs standard mode (same as default sampler)
-            if "chunked_pairwise_embedder" in initializer_outputs:
-                # Chunked mode: explicitly provide P_LL=None
-                tic = time.time()
-                chunked_embedder = initializer_outputs[
-                    "chunked_pairwise_embedder"
-                ]  # Don't pop, just get
+            # ================================================================
+            # Denoise the coordinates - handle chunked/streaming mode
+            # ================================================================
+            tic = time.time()
+            
+            chunked_embedder = initializer_outputs.get("chunked_pairwise_embedder", None)
+            
+            if chunked_embedder is not None or streaming_mode:
+                # Chunked/streaming mode: explicitly provide P_LL=None
                 other_outputs = {
                     k: v
                     for k, v in initializer_outputs.items()
-                    if k != "chunked_pairwise_embedder"
+                    if k not in ("chunked_pairwise_embedder", "streaming_mode")
                 }
+                
                 outs = diffusion_module(
-                    X_noisy_L=X_noisy_L,
-                    t=t_hat.tile(D),
+                    X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                    t=t_hat.tile(D),                       # [D]
                     f=f,
-                    P_LL=None,  # Not used in chunked mode
+                    P_LL=None,
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
+                    streaming_mode=streaming_mode,         # Pass streaming flag!
                     **other_outputs,
                 )
+                
                 toc = time.time()
-                ranked_logger.info(f"Chunked mode time: {toc - tic} seconds")
+                if step_num == 0:
+                    ranked_logger.info(
+                        f"{'Streaming' if streaming_mode else 'Chunked'} symmetry mode step time: {toc - tic:.2f}s"
+                    )
             else:
                 # Standard mode: P_LL is included in initializer_outputs
                 outs = diffusion_module(
-                    X_noisy_L=X_noisy_L,
-                    t=t_hat.tile(D),
+                    X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                    t=t_hat.tile(D),                       # [D]
                     f=f,
                     **initializer_outputs,
                 )
-            # apply symmetry to X_denoised_L
+
+            # ================================================================
+            # Multi-GPU synchronization
+            # ================================================================
+            if streaming_mode and world_size > 1:
+                dist.barrier()
+                if "X_L" in outs:
+                    _broadcast_tensor(outs["X_L"], src=0)
+                if "sequence_logits_I" in outs and outs["sequence_logits_I"] is not None:
+                    _broadcast_tensor(outs["sequence_logits_I"], src=0)
+
+            # Apply symmetry to X_denoised_L
             if "X_L" in outs and c_t > gamma_min_sym:
-                # outs["original_X_L"] = outs["X_L"].clone()
                 outs["X_L"] = self.apply_symmetry_to_X_L(outs["X_L"], f)
 
-            X_denoised_L = outs["X_L"] if "X_L" in outs else outs
+            X_denoised_L = outs["X_L"] if "X_L" in outs else outs  # [D, L, 3]
 
-            # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
-            delta_L = (
-                X_noisy_L - X_denoised_L
-            ) / t_hat  # gradient of x wrt. t at x_t_hat
+            # Compute the delta between the noisy and denoised coordinates
+            delta_L = (X_noisy_L - X_denoised_L) / t_hat   # [D, L, 3]
             d_t = c_t - t_hat
 
             # NOTE: no classifier-free guidance for symmetry
 
+            # Sequence entropy tracking
             if exists(outs.get("sequence_logits_I")):
-                # Compute confidence
-                p = torch.softmax(
-                    outs["sequence_logits_I"], dim=-1
-                ).cpu()  # shape (D, L, 32)
-                seq_entropy = -torch.sum(
-                    p * torch.log(p + 1e-10), dim=-1
-                )  # shape (D, L,)
+                p = torch.softmax(outs["sequence_logits_I"], dim=-1).cpu()  # [D, I, vocab]
+                seq_entropy = -torch.sum(p * torch.log(p + 1e-10), dim=-1)  # [D, I]
                 sequence_entropy_traj.append(seq_entropy)
 
             # Update the coordinates, scaled by the step size
-            # delta_L should be symmetric
-            X_L = X_noisy_L + step_scale * d_t * delta_L
+            X_L = X_noisy_L + step_scale * d_t * delta_L   # [D, L, 3]
 
-            # Append the results to the trajectory (for visualization of the diffusion process)
+            # Append the results to the trajectory
             X_noisy_L_scaled = (
                 self.sigma_data * X_noisy_L / torch.sqrt(t_hat**2 + self.sigma_data**2)
-            )  # Save noisy traj as scaled inputs
+            )                                              # [D, L, 3]
             X_noisy_L_traj.append(X_noisy_L_scaled)
             X_denoised_L_traj.append(X_denoised_L)
             t_hats.append(t_hat)
 
+        # ================================================================
+        # Post-processing: motif alignment with symmetry
+        # ================================================================
         if torch.any(is_motif_atom_with_fixed_coord) and self.allow_realignment:
             # Insert the gt motif at the end
             X_L, R = centre_random_augment_around_motif(
@@ -527,7 +773,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 reinsert_motif=self.insert_motif_at_end,
             )
 
-            # apply symmetry frame shift to X_L
+            # Apply symmetry frame shift to X_L
             X_L = self.apply_symmetry_to_X_L(X_L, f)
 
             # Align prediction to original motif
@@ -538,13 +784,13 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             )
 
         return dict(
-            X_L=X_L,  # (D, L, 3)
-            X_noisy_L_traj=X_noisy_L_traj,  # list[Tensor[D, L, 3]]
-            X_denoised_L_traj=X_denoised_L_traj,  # list[Tensor[D, L, 3]]
-            t_hats=t_hats,  # list[Tensor[D]], where D is shared across all diffusion batches
-            sequence_logits_I=outs.get("sequence_logits_I"),  # (D, I, 32)
-            sequence_indices_I=outs.get("sequence_indices_I"),  # (D, I, 32)
-            sequence_entropy_traj=sequence_entropy_traj,  # list[Tensor[D, I]]
+            X_L=X_L,                                       # [D, L, 3]
+            X_noisy_L_traj=X_noisy_L_traj,                 # list[[D, L, 3]]
+            X_denoised_L_traj=X_denoised_L_traj,           # list[[D, L, 3]]
+            t_hats=t_hats,                                 # list[Tensor]
+            sequence_logits_I=outs.get("sequence_logits_I"),   # [D, I, vocab]
+            sequence_indices_I=outs.get("sequence_indices_I"), # [D, I]
+            sequence_entropy_traj=sequence_entropy_traj,   # list[[D, I]]
         )
 
 

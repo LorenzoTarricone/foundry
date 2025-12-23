@@ -77,6 +77,9 @@ class RFD3InferenceConfig:
     devices_per_node: int = 1
     verbose: bool = False
     seed: Optional[int] = None
+    # Parallel attention mode to avoid materializing full LxL tensors
+    attention_parallel: bool = False
+    attention_parallel_factor: Optional[int] = None
 
     # For use as mapping:
     def keys(self):
@@ -137,6 +140,103 @@ class RFD3Output:
 
 class RFD3InferenceEngine(BaseInferenceEngine):
     """Inference engine for RFdiffusion3"""
+
+    def _init_distributed(self, n_gpus: int):
+        """
+        Initialize PyTorch distributed processing for multi-GPU parallel inference.
+        
+        This enables true parallel processing where:
+        - Each GPU runs as a separate process
+        - Each process computes only its assigned chunk (L/n_gpus or I/n_gpus)
+        - Chunks are synchronized via all_gather after each attention layer
+        
+        Multi-GPU Setup:
+        ================
+        
+        Option 1: Launch with torchrun (recommended)
+        -------------------------------------------
+        torchrun --nproc_per_node=4 design_annotate.py --attention_parallel
+        
+        This automatically sets:
+          - LOCAL_RANK: GPU index for this process (0, 1, 2, 3)
+          - WORLD_SIZE: Total number of processes (4)
+          - RANK: Global rank
+          - MASTER_ADDR, MASTER_PORT: For process communication
+        
+        Option 2: SLURM with srun
+        -------------------------
+        srun --ntasks-per-node=4 python design_annotate.py --attention_parallel
+        
+        SLURM sets similar environment variables.
+        
+        Data Flow:
+        ==========
+        Input tensors are replicated on all GPUs. Each GPU:
+        1. Extracts its chunk based on rank (e.g., GPU 1 gets tokens [250:500])
+        2. Computes attention for its chunk only
+        3. Calls all_gather to collect results from all GPUs
+        4. Continues with reconstructed full tensor
+        
+        Args:
+            n_gpus: Number of GPUs to use for parallel processing
+        """
+        import torch.distributed as dist
+        
+        # Check if already initialized (e.g., by torchrun or SLURM)
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            ranked_logger.info(
+                f"Distributed already initialized: rank={rank}, world_size={world_size}"
+            )
+            self._distributed_initialized = True
+            return
+        
+        # Check for environment variables set by distributed launchers
+        local_rank = int(os.environ.get("LOCAL_RANK", -1))
+        world_size = int(os.environ.get("WORLD_SIZE", -1))
+        rank = int(os.environ.get("RANK", -1))
+        
+        if local_rank >= 0 and world_size > 1:
+            # Launched with torchrun or similar - initialize process group
+            ranked_logger.info(
+                f"Initializing distributed from environment: "
+                f"LOCAL_RANK={local_rank}, RANK={rank}, WORLD_SIZE={world_size}"
+            )
+            
+            # Set device for this process
+            torch.cuda.set_device(local_rank)
+            
+            # Initialize process group (NCCL is fastest for GPU communication)
+            dist.init_process_group(
+                backend="nccl",
+                init_method="env://",
+                world_size=world_size,
+                rank=rank,
+            )
+            
+            ranked_logger.info(
+                f"Distributed initialized: GPU {local_rank} handles queries "
+                f"[{local_rank * (100 // world_size)}%, {(local_rank + 1) * (100 // world_size)}%)"
+            )
+            self._distributed_initialized = True
+        else:
+            # Not launched with distributed launcher
+            ranked_logger.warning(
+                f"Multi-GPU parallel mode requested ({n_gpus} GPUs detected) but not "
+                f"launched with a distributed launcher.\n\n"
+                f"To enable TRUE multi-GPU parallel inference, launch with:\n"
+                f"  torchrun --nproc_per_node={n_gpus} design_annotate.py --attention_parallel\n\n"
+                f"Without torchrun, falling back to SEQUENTIAL chunk processing on single GPU.\n"
+                f"This still saves memory (no L×L or I×I tensors) but doesn't parallelize."
+            )
+            self._distributed_initialized = False
+    
+    def _cleanup_distributed(self):
+        """Clean up distributed process group on exit."""
+        import torch.distributed as dist
+        if self._distributed_initialized and dist.is_initialized():
+            dist.destroy_process_group()
 
     def __init__(
         self,
@@ -200,6 +300,40 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             ranked_logger.info("Low memory mode enabled.")
             # HACK: Set attribute to the diffusion module
             os.environ["RFD3_LOW_MEMORY_MODE"] = "1"
+
+        # Enable attention parallel streaming mode to avoid full LxL/IxI allocations
+        # This mode requires multiple GPUs; if only 1 GPU, fall back to LOW_MEMORY_MODE
+        self._distributed_initialized = False
+        if kwargs.get("attention_parallel", False):
+            try:
+                n_gpus = torch.cuda.device_count()
+            except Exception:
+                n_gpus = 0
+            
+            factor = kwargs.get("attention_parallel_factor")
+            if factor is not None and factor > 0:
+                # Explicit factor provided
+                n_par = int(factor)
+            else:
+                # Use number of GPUs as parallelism factor
+                n_par = n_gpus
+            
+            if n_par <= 1:
+                # Not enough GPUs for parallel mode - fall back to LOW_MEMORY_MODE
+                ranked_logger.warning(
+                    f"Attention parallel mode requested but only {n_gpus} GPU(s) available. "
+                    f"Falling back to LOW_MEMORY_MODE (chunked processing on single GPU)."
+                )
+                os.environ["RFD3_LOW_MEMORY_MODE"] = "1"
+            else:
+                # Initialize distributed processing for multi-GPU parallel inference
+                self._init_distributed(n_par)
+                # Enable full parallel streaming mode
+                os.environ["RFD3_ATTENTION_PARALLEL"] = str(n_par)
+                ranked_logger.info(
+                    f"Attention parallel streaming mode enabled with n_parallel={n_par}. "
+                    f"No L×L or I×I tensors will be materialized."
+                )
 
     def run(
         self,

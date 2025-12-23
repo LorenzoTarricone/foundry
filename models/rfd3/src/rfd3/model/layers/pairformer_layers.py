@@ -1,3 +1,4 @@
+import os
 import torch
 from rfd3.model.layers.layer_utils import (
     MultiDimLinear,
@@ -37,6 +38,8 @@ class AttentionPairBiasPairformerDeepspeed(nn.Module):
         self.ln_1 = RMSNorm((c_a,))
         self.use_deepspeed_evo = False
         self.force_bfloat16 = True
+        # Optional streaming mode: split queries into chunks to avoid full I×I materialization
+        self.attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
 
     def forward(
         self,
@@ -64,15 +67,29 @@ class AttentionPairBiasPairformerDeepspeed(nn.Module):
             Q_IH = Q_IH / torch.sqrt(
                 torch.tensor(self.c).to(Q_IH.device, torch.bfloat16)
             )
-            # Attention
-            A_IIH = torch.softmax(
-                torch.einsum("...ihd,...jhd->...ijh", Q_IH, K_IH) + B_IIH, dim=-2
-            )  # softmax over j
-            ## G_IH: [I, H, C]
-            ## A_IIH: [I, I, H]
-            ## V_IH: [I, H, C]
-            A_I = torch.einsum("...ijh,...jhc->...ihc", A_IIH, V_IH)
-            A_I = G_IH * A_I  # [B, I, H, C]
+
+            # Streaming attention over queries to avoid full I×I
+            if self.attn_parallel is not None:
+                n_par = max(int(self.attn_parallel), 1)
+                chunk = max(1, (L + n_par - 1) // n_par)
+            else:
+                chunk = L  # original behavior
+
+            outputs = []
+            for i_start in range(0, L, chunk):
+                i_end = min(i_start + chunk, L)
+                Q_chunk = Q_IH[..., i_start:i_end, :, :]  # [..., Q, H, C]
+                B_chunk = B_IIH[..., i_start:i_end, :, :]  # [..., Q, L, H]
+
+                attn = torch.softmax(
+                    torch.einsum("...qhd,...jhd->...qjh", Q_chunk, K_IH) + B_chunk,
+                    dim=-2,
+                )  # [..., Q, L, H]
+                out = torch.einsum("...qjh,...jhc->...qhc", attn, V_IH)
+                out = G_IH[..., i_start:i_end, :, :] * out
+                outputs.append(out)
+
+            A_I = torch.cat(outputs, dim=-3)  # [..., I, H, C]
             A_I = A_I.flatten(start_dim=-2)  # [B, I, Ca]
         else:
             raise NotImplementedError
@@ -80,6 +97,83 @@ class AttentionPairBiasPairformerDeepspeed(nn.Module):
         A_I = self.to_a(A_I)
 
         return A_I
+
+    def forward_chunked(
+        self,
+        A_I_query: torch.Tensor,   # [I_par, C_a] - this GPU's query tokens
+        A_I_key: torch.Tensor,     # [I, C_a] - all key tokens
+        Z_chunk: torch.Tensor,     # [I_par, I, C_z] - this GPU's Z rows
+        Beta_II: torch.Tensor = None,
+    ) -> torch.Tensor:
+        """
+        Chunked attention for multi-GPU parallel inference.
+        
+        Each GPU computes attention for its query chunk against ALL keys.
+        This produces [I_par, C_a] output without ever materializing [I, I, C_z].
+        
+        Cross-attention pattern:
+        - Queries: [I_par, H, C] (this GPU's tokens)
+        - Keys/Values: [I, H, C] (all tokens)
+        - Bias: [I_par, I, H] from Z_chunk
+        - Output: [I_par, C_a]
+        
+        Args:
+            A_I_query: [I_par, C_a] - query tokens for this GPU
+            A_I_key: [I, C_a] - all key tokens
+            Z_chunk: [I_par, I, C_z] - pair bias for this GPU's query rows
+            Beta_II: Optional additional bias (scalar or chunk-compatible)
+            
+        Returns:
+            A_I_out: [I_par, C_a] - updated query tokens
+        """
+        I_par = A_I_query.shape[0]
+        I = A_I_key.shape[0]
+        
+        # Normalize inputs
+        A_I_query_normed = self.ln_1(A_I_query)            # [I_par, C_a]
+        A_I_key_normed = self.ln_1(A_I_key)                # [I, C_a]
+        
+        if self.force_bfloat16:
+            A_I_query_normed = A_I_query_normed.to(torch.bfloat16)
+            A_I_key_normed = A_I_key_normed.to(torch.bfloat16)
+        
+        # Project queries from this GPU's chunk
+        Q_chunk = self.to_q(A_I_query_normed)              # [I_par, H, C]
+        G_chunk = self.to_g(A_I_query_normed)              # [I_par, H, C]
+        
+        # Project keys and values from ALL tokens
+        K_all = self.to_k(A_I_key_normed)                  # [I, H, C]
+        V_all = self.to_v(A_I_key_normed)                  # [I, H, C]
+        
+        # Pair bias from this GPU's Z chunk
+        B_chunk = self.to_b(self.ln_0(Z_chunk))            # [I_par, I, H]
+        if Beta_II is not None:
+            if Beta_II.dim() == 0 or Beta_II.numel() == 1:
+                B_chunk = B_chunk + Beta_II
+            else:
+                # Beta_II should be [I_par, I] if provided as chunk
+                B_chunk = B_chunk + Beta_II[..., None]
+        
+        # Scale queries
+        Q_chunk = Q_chunk / torch.sqrt(
+            torch.tensor(self.c, device=Q_chunk.device, dtype=torch.bfloat16)
+        )
+        
+        # Attention: [I_par, H, C] @ [I, H, C]^T + [I_par, I, H] -> [I_par, I, H]
+        attn_logits = torch.einsum("qhd,khd->qkh", Q_chunk, K_all) + B_chunk
+        attn_weights = torch.softmax(attn_logits, dim=1)   # [I_par, I, H] softmax over keys
+        
+        # Apply attention to values: [I_par, I, H] @ [I, H, C] -> [I_par, H, C]
+        out = torch.einsum("qkh,khc->qhc", attn_weights, V_all)
+        
+        # Gating
+        out = G_chunk * out                                # [I_par, H, C]
+        
+        # Flatten heads and project
+        out = out.flatten(start_dim=-2)                    # [I_par, C_a]
+        out = self.to_a(out)                               # [I_par, C_a]
+        
+        return out
 
 
 class PairformerBlock(nn.Module):

@@ -1,0 +1,32 @@
+# Design + Annotate Configuration
+# ================================
+# Standard single-GPU inference
+#
+# Usage:
+#   python scripts/design_annotate.py --config config/design_annotate.yaml
+
+# Output settings
+out_dir: "inference_outputs/design_demo"
+
+# Protein design parameters
+length: 50
+num_designs: 1
+
+# Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
+symmetry: I
+
+# MPNN settings
+mpnn_batch_size: 5
+
+# Memory optimization
+# - low_memory_mode: Sequential chunked processing (single GPU)
+# - attention_parallel: Multi-GPU parallel processing (requires srun allocation)
+low_memory_mode: true
+attention_parallel: false
+attention_parallel_factor: null  # null = auto-detect from allocated GPUs
+
+# Weights & Biases logging
+wandb:
+  enabled: false
+  project: "fast-rfd3"
+  run_name: null  # null = auto-generated

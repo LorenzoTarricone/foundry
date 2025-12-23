@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Tuple
 
 import torch
@@ -28,6 +29,50 @@ def bucketize_scaled_distogram(R_L, min_dist=1, max_dist=30, sigma_data=16, n_bi
     bins = torch.linspace(min_dist, max_dist, n_bins - 1, device=D_LL.device)
     bin_idxs = torch.bucketize(D_LL, bins)
     return F.one_hot(bin_idxs, num_classes=len(bins) + 1).float()
+
+
+def bucketize_scaled_distogram_chunked(
+    R_L, 
+    query_start, 
+    query_end, 
+    min_dist=1, 
+    max_dist=30, 
+    sigma_data=16, 
+    n_bins=65
+):
+    """
+    Chunked version of bucketize_scaled_distogram for multi-GPU parallel inference.
+    
+    Computes pairwise distances only for a CHUNK of query atoms (query_start:query_end)
+    against ALL atoms. This produces [B, I_par, I, n_bins] instead of [B, I, I, n_bins],
+    avoiding full I×I tensor materialization.
+    
+    Args:
+        R_L: [B, N, 3] atom positions
+        query_start: Start index of query atoms
+        query_end: End index of query atoms
+        min_dist, max_dist, sigma_data, n_bins: Same as bucketize_scaled_distogram
+        
+    Returns:
+        D_LL_binned: [B, I_par, I, n_bins] where I_par = query_end - query_start
+    """
+    # R_query: [B, I_par, 3], R_all: [B, I, 3]
+    R_query = R_L[:, query_start:query_end, :]               # [B, I_par, 3]
+    
+    # Compute pairwise distances: query chunk vs all atoms
+    # [B, I_par, 1, 3] - [B, 1, I, 3] = [B, I_par, I, 3]
+    D_chunk = R_query.unsqueeze(-2) - R_L.unsqueeze(-3)[:, query_start:query_end, :, :]
+    # Wait, this is wrong. Let me fix:
+    D_chunk = R_query.unsqueeze(-2) - R_L.unsqueeze(1)        # [B, I_par, I, 3]
+    D_chunk = torch.linalg.norm(D_chunk, dim=-1)              # [B, I_par, I]
+
+    # normalize
+    min_dist_norm = min_dist / sigma_data
+    max_dist_norm = max_dist / sigma_data
+
+    bins = torch.linspace(min_dist_norm, max_dist_norm, n_bins - 1, device=D_chunk.device)
+    bin_idxs = torch.bucketize(D_chunk, bins)
+    return F.one_hot(bin_idxs, num_classes=len(bins) + 1).float()  # [B, I_par, I, n_bins]
 
 
 def build_valid_mask(
@@ -189,6 +234,17 @@ def create_attention_indices(
     """
 
     tok_idx = f["atom_to_token_map"] if tok_idx is None else tok_idx
+    # Toggleable streaming mode to avoid materializing full LxL tensors
+    n_parallel_env = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
+    if n_parallel_env is not None and int(n_parallel_env) > 1:
+        return create_attention_indices_parallel(
+            f=f,
+            n_attn_keys=n_attn_keys,
+            n_attn_seq_neighbours=n_attn_seq_neighbours,
+            X_L=X_L,
+            tok_idx=tok_idx,
+            n_parallel=max(int(n_parallel_env), 1),
+        )
     device = X_L.device if X_L is not None else tok_idx.device
     L = len(tok_idx)
 
@@ -234,6 +290,119 @@ def create_attention_indices(
         )  # [B, L, k] | indices[b, i, j] = atom index for atom i to j-th attn query
 
     return attn_indices
+
+
+@torch.no_grad()
+def _topk_with_mask(dist: torch.Tensor, mask: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    Utility to select k nearest neighbors with a boolean mask.
+
+    dist: (Q, L)
+    mask: (Q, L) bool
+    returns: (Q, k) long
+    """
+    if k <= 0:
+        return torch.empty(dist.shape[0], 0, device=dist.device, dtype=torch.long)
+    # Mask out invalid positions
+    masked_dist = torch.where(mask, dist, torch.full_like(dist, float("inf")))
+    # Handle rows with no valid entries by falling back to argmin on original dist
+    no_valid = ~mask.any(dim=-1)
+    # topk expects finite values; replace inf with max finite for stability
+    max_val = torch.where(torch.isfinite(masked_dist), masked_dist, torch.zeros_like(masked_dist)).amax(dim=-1, keepdim=True)
+    safe_dist = torch.where(torch.isfinite(masked_dist), masked_dist, max_val + 1.0)
+    topk = torch.topk(safe_dist, k=k, dim=-1, largest=False).indices
+    # If no valid entries, pick the absolute nearest (unmasked) to avoid duplicates of inf
+    fallback = dist.argmin(dim=-1, keepdim=True).expand(-1, k)
+    return torch.where(no_valid.unsqueeze(-1), fallback, topk)
+
+
+@torch.no_grad()
+def create_attention_indices_parallel(
+    f,
+    n_attn_keys: int,
+    n_attn_seq_neighbours: int,
+    X_L: torch.Tensor | None = None,
+    tok_idx: torch.Tensor | None = None,
+    n_parallel: int = 1,
+):
+    """
+    Streaming attention index builder that never materializes full LxL tensors.
+    Splits queries into L/n_parallel chunks; each chunk attends over all atoms.
+    """
+    tok_idx = f["atom_to_token_map"] if tok_idx is None else tok_idx
+    device = X_L.device if X_L is not None else tok_idx.device
+    L = len(tok_idx)
+
+    # Prepare coordinates
+    if X_L is None:
+        X_L = torch.randn((1, L, 3), device=device, dtype=torch.float)
+    if X_L.dim() == 2:
+        X_L = X_L.unsqueeze(0)
+    B = X_L.shape[0]
+
+    k_total = min(n_attn_keys, L)
+
+    # Chain handling (match original heuristic)
+    chain_ids = f["asym_id"][tok_idx] if "asym_id" in f else None
+    multi_chain = chain_ids is not None and len(torch.unique(chain_ids)) > 3
+    if multi_chain:
+        k_inter = max(32, k_total // 4)
+        k_intra = max(k_total - k_inter, 0)
+    else:
+        k_inter = 0
+        k_intra = 0
+
+    # Chunk size: ceil(L / n_parallel)
+    chunk_size = max(1, (L + n_parallel - 1) // n_parallel)
+
+    # Output tensor
+    indices_out = torch.zeros(B, L, k_total, device=device, dtype=torch.long)
+
+    for b in range(B):
+        X_all = X_L[b]  # (L, 3)
+        # Precompute per-atom views
+        base_unindex_mask = f["unindexing_pair_mask"]  # token-level [I, I]
+        all_tok = tok_idx
+        all_chain = chain_ids if chain_ids is not None else None
+
+        for i_start in range(0, L, chunk_size):
+            i_end = min(i_start + chunk_size, L)
+            i_slice = slice(i_start, i_end)
+
+            X_q = X_all[i_slice]  # (Q, 3)
+            # Distance for this chunk only: (Q, L)
+            D_chunk = torch.cdist(X_q.unsqueeze(0), X_all.unsqueeze(0), p=2).squeeze(0)
+
+            tok_q = all_tok[i_slice]
+            # Base mask derived per-chunk to avoid full LxL
+            base_mask_chunk = ~base_unindex_mask[tok_q[:, None], all_tok[None, :]]
+            seq_mask = (tok_q[:, None] - all_tok[None, :]).abs() <= n_attn_seq_neighbours
+            allowed = base_mask_chunk & seq_mask
+
+            if multi_chain:
+                chain_q = all_chain[i_slice]
+                same_chain = chain_q[:, None] == all_chain[None, :]
+                diff_chain = ~same_chain
+
+                allowed_intra = allowed & same_chain
+                allowed_inter = allowed & diff_chain
+
+                intra_idx = _topk_with_mask(D_chunk, allowed_intra, k_intra)
+                inter_idx = _topk_with_mask(D_chunk, allowed_inter, k_inter)
+                idx_chunk = torch.cat([intra_idx, inter_idx], dim=-1)
+            else:
+                idx_chunk = _topk_with_mask(D_chunk, allowed, k_total)
+
+            # Ensure we fill exactly k_total (pad/truncate)
+            if idx_chunk.shape[-1] < k_total:
+                pad = torch.zeros(idx_chunk.shape[0], k_total - idx_chunk.shape[-1], device=device, dtype=torch.long)
+                idx_chunk = torch.cat([idx_chunk, pad], dim=-1)
+            elif idx_chunk.shape[-1] > k_total:
+                idx_chunk = idx_chunk[:, :k_total]
+
+            indices_out[b, i_slice, :] = idx_chunk
+
+    return indices_out
 
 
 @torch.no_grad()

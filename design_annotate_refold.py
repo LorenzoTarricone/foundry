@@ -200,6 +200,8 @@ def run_design_validate(
     mpnn_batch_size=8,
     write_combined=True,
     low_memory_mode=False,
+    attention_parallel=False,
+    attention_parallel_factor=None,
     use_wandb=False,
     wandb_project="fast-rfd3",
     wandb_run_name=None
@@ -225,6 +227,9 @@ def run_design_validate(
                     "symmetry_id": symmetry_id,
                     "mpnn_batch_size": mpnn_batch_size,
                     "low_memory_mode": low_memory_mode,
+                    "attention_parallel": attention_parallel,
+                    "attention_parallel_factor": attention_parallel_factor,
+                    "n_gpus": torch.cuda.device_count() if torch.cuda.is_available() else 0,
                     "write_combined": write_combined,
                     "pipeline": "design_annotate_refold",
                 }
@@ -268,13 +273,22 @@ def run_design_validate(
     
     if low_memory_mode:
         print(f"  Low memory mode enabled (memory efficient tokenization)")
+    
+    if attention_parallel:
+        n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        factor = attention_parallel_factor or n_gpus
+        print(f"  Attention parallel mode enabled (n_gpus={n_gpus}, factor={factor})")
+        if n_gpus <= 1:
+            print(f"    -> Will fall back to LOW_MEMORY_MODE (only {n_gpus} GPU available)")
 
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
         diffusion_batch_size=num_designs,
         inference_sampler=rfd3_inference_sampler,
         ckpt_path=ckpt_path,
-        low_memory_mode=low_memory_mode
+        low_memory_mode=low_memory_mode,
+        attention_parallel=attention_parallel,
+        attention_parallel_factor=attention_parallel_factor,
     )
     
     rfd3_engine = RFD3InferenceEngine(**rfd3_config)
@@ -606,6 +620,10 @@ def main():
     parser.add_argument("--mpnn_batch_size", type=int, default=5) # Reduced default for validation speed
     parser.add_argument("--designed_folded_file", type=bool, default=True, help="Generate a combined CIF of designed and refolded structures")
     parser.add_argument("--low_memory_mode", action="store_true", help="Enable low memory mode for RFD3 (memory efficient tokenization)")
+    parser.add_argument("--attention_parallel", action="store_true", 
+                        help="Enable multi-GPU parallel attention mode. Splits queries across GPUs to avoid full L×L/I×I tensors. Falls back to low_memory_mode if only 1 GPU.")
+    parser.add_argument("--attention_parallel_factor", type=int, default=None,
+                        help="Override parallelism factor (default: number of GPUs)")
     # W&B arguments
     parser.add_argument("--wandb", action="store_true", help="Enable W&B logging for memory tracking")
     parser.add_argument("--wandb_project", type=str, default="fast-rfd3", help="W&B project name")
@@ -620,6 +638,8 @@ def main():
         mpnn_batch_size=args.mpnn_batch_size,
         write_combined=args.designed_folded_file,
         low_memory_mode=args.low_memory_mode,
+        attention_parallel=args.attention_parallel,
+        attention_parallel_factor=args.attention_parallel_factor,
         use_wandb=args.wandb,
         wandb_project=args.wandb_project,
         wandb_run_name=args.wandb_run_name

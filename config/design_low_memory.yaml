@@ -1,0 +1,31 @@
+# Low Memory Mode Configuration
+# ==============================
+# Single-GPU with sequential chunked processing
+# Useful when you have only 1 GPU but need to process large proteins
+#
+# Usage:
+#   python scripts/design_annotate.py --config config/design_low_memory.yaml
+
+# Output settings
+out_dir: "inference_outputs/design_demo"
+
+# Protein design parameters
+length: 100
+num_designs: 1
+
+# Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
+symmetry: null
+
+# MPNN settings
+mpnn_batch_size: 5
+
+# Memory optimization - LOW MEMORY MODE ENABLED
+low_memory_mode: true
+attention_parallel: false
+attention_parallel_factor: null
+
+# Weights & Biases logging
+wandb:
+  enabled: false
+  project: "fast-rfd3"
+  run_name: null

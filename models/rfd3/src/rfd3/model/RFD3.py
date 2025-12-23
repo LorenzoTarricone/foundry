@@ -39,9 +39,39 @@ class RFD3(nn.Module):
         **_,
     ):
         super().__init__()
-        # Check for chunked P_LL mode via environment variable
-        use_chunked_pll = os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1"
-        ranked_logger.info(f"RFD3 initialized with chunked_pll={use_chunked_pll}")
+        # Check for memory optimization modes via environment variables
+        # These two modes are ORTHOGONAL and can be combined:
+        #
+        # LOW_MEMORY_MODE: Sparse P_LL via chunked_pairwise_embedder
+        #   - Computes P_LL only for k sparse neighbors per atom
+        #   - Reduces memory from O(L²) to O(L·k)
+        #
+        # ATTENTION_PARALLEL: Multi-GPU parallel cross-attention
+        #   - Splits queries across GPUs (each GPU handles L/n atoms)
+        #   - Z_II is [I_par, I] per GPU instead of [I, I]
+        #   - P_LL computation is split across GPUs
+        #
+        # Combinations:
+        #   - Neither: Full O(L² + I²) tensors
+        #   - LOW_MEM only: Sparse P_LL, full Z_II
+        #   - PARALLEL only: Cross-attention with full P_chunk [L_par, L]
+        #   - Both: Sparse P_LL split across GPUs (most memory efficient)
+        #
+        low_mem = os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1"
+        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", None) is not None
+        
+        # chunked_pll is INDEPENDENT of attn_parallel
+        use_chunked_pll = low_mem
+        
+        ranked_logger.info(
+            f"RFD3 memory modes: LOW_MEMORY={low_mem}, ATTENTION_PARALLEL={attn_parallel}"
+        )
+        if low_mem:
+            ranked_logger.info("  -> Sparse P_LL via chunked_pairwise_embedder")
+        if attn_parallel:
+            ranked_logger.info("  -> Multi-GPU cross-attention (no full I×I tensors)")
+        if low_mem and attn_parallel:
+            ranked_logger.info("  -> Combined: Sparse P_LL split across GPUs (maximum memory savings)")
 
         # Simple constant-feature initializer
         self.token_initializer = TokenInitializer(
