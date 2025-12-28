@@ -321,39 +321,66 @@ class ChunkedPairwiseEmbedder(nn.Module):
         tok_keys = torch.gather(tok_queries, 1, valid_indices)  # [B, L, k]
 
         # Gather Z_init_II[tok_queries, tok_keys] with safe indexing
-        # Z_init_II shape is [I, I, c_z] (3D), not 4D
+        # Z_init_II shape is [I, I, c_z] (3D), not 4D (or StreamingZContainer)
         # tok_queries shape: [B, L, k] - each value is a token index
         # We want: Z_init_II[tok_queries[d,l,k], tok_keys[d,l,k], :] for all d,l,k
 
-        I_z, I_z2, c_z = Z_init_II.shape
+        # Import here to avoid circular import
+        from rfd3.model.layers.encoders import StreamingZContainer
+        
+        # Handle StreamingZContainer (parallel mode) vs tensor (standard mode)
+        if isinstance(Z_init_II, StreamingZContainer):
+            # Streaming mode: compute sparse Z values directly without full Z tensor
+            I_z = Z_init_II.I
+            
+            Z_pairs_processed = torch.zeros(
+                B, L, k, self.c_atompair, device=device, dtype=C_L.dtype
+            )
+            
+            for b in range(B):
+                tq = tok_queries[b]  # [L, k]
+                tk = tok_keys[b]    # [L, k]
+                
+                # Clamp indices to valid range
+                tq = torch.clamp(tq, 0, I_z - 1)
+                tk = torch.clamp(tk, 0, I_z - 1)
+                
+                # Get base Z at sparse pairs (Z_i + Z_j only)
+                Z_pairs_base = Z_init_II.get_base_z_at_pairs(tq, tk)  # [L, k, c_z]
+                
+                # Process through linear layer
+                Z_pairs_processed[b] = self.process_z(Z_pairs_base)  # [L, k, c_atompair]
+        else:
+            # Standard mode: full Z tensor available
+            I_z, I_z2, c_z = Z_init_II.shape
 
-        # CRITICAL: Match standard implementation exactly!
-        # Standard does: self.process_z(Z_init_II)[..., tok_idx, :, :][..., tok_idx, :]
-        # This means: 1) Process Z_init_II first, 2) Then do double token indexing
+            # CRITICAL: Match standard implementation exactly!
+            # Standard does: self.process_z(Z_init_II)[..., tok_idx, :, :][..., tok_idx, :]
+            # This means: 1) Process Z_init_II first, 2) Then do double token indexing
 
-        # Step 1: Process Z_init_II to get processed token pair features
-        Z_processed = self.process_z(Z_init_II)  # [I, I, c_atompair]
+            # Step 1: Process Z_init_II to get processed token pair features
+            Z_processed = self.process_z(Z_init_II)  # [I, I, c_atompair]
 
-        # Step 2: Do the double indexing like the standard implementation
-        # Standard: Z_processed[..., tok_idx, :, :][..., tok_idx, :]
-        # This creates Z_processed[tok_idx, :][:, tok_idx] which is [L, L, c_atompair]
-        # Then we need to gather the sparse version
+            # Step 2: Do the double indexing like the standard implementation
+            # Standard: Z_processed[..., tok_idx, :, :][..., tok_idx, :]
+            # This creates Z_processed[tok_idx, :][:, tok_idx] which is [L, L, c_atompair]
+            # Then we need to gather the sparse version
 
-        Z_pairs_processed = torch.zeros(
-            B, L, k, self.c_atompair, device=device, dtype=Z_processed.dtype
-        )
+            Z_pairs_processed = torch.zeros(
+                B, L, k, self.c_atompair, device=device, dtype=Z_processed.dtype
+            )
 
-        for b in range(B):
-            # For this batch, get the token queries and keys
-            tq = tok_queries[b]  # [L, k]
-            tk = tok_keys[b]  # [L, k]
+            for b in range(B):
+                # For this batch, get the token queries and keys
+                tq = tok_queries[b]  # [L, k]
+                tk = tok_keys[b]  # [L, k]
 
-            # Ensure indices are within bounds
-            tq = torch.clamp(tq, 0, I_z - 1)
-            tk = torch.clamp(tk, 0, I_z2 - 1)
+                # Ensure indices are within bounds
+                tq = torch.clamp(tq, 0, I_z - 1)
+                tk = torch.clamp(tk, 0, I_z2 - 1)
 
-            # Apply the double token indexing like standard implementation
-            Z_pairs_processed[b] = Z_processed[tq, tk]  # [L, k, c_atompair]
+                # Apply the double token indexing like standard implementation
+                Z_pairs_processed[b] = Z_processed[tq, tk]  # [L, k, c_atompair]
 
         P_LL_sparse += Z_pairs_processed
 
@@ -361,6 +388,123 @@ class ChunkedPairwiseEmbedder(nn.Module):
         P_LL_sparse = P_LL_sparse + self.pair_mlp(P_LL_sparse)
 
         return P_LL_sparse.contiguous()
+    
+    def forward_chunked_parallel(
+        self,
+        indices_chunk,              # [B, L_par, k] - THIS GPU's sparse indices
+        query_start,                # int - start atom index for this GPU
+        query_end,                  # int - end atom index for this GPU
+        f,                          # feature dict
+        initializer_outputs,        # dict with embedder state
+    ):
+        """
+        Compute P_LL_sparse for a CHUNK of queries only.
+        
+        For multi-GPU parallelization:
+        - Only computes [L_par, k, c_atompair] instead of [L, k, c_atompair]
+        - Memory: O(L_par * k) instead of O(L * k) per GPU
+        - Each GPU calls this with its query_start:query_end range
+        
+        Args:
+            indices_chunk: [B, L_par, k] - sparse neighbor indices for this chunk
+            query_start: Start index of this GPU's queries
+            query_end: End index of this GPU's queries
+            f: Feature dict with atom positions, masks, etc.
+            initializer_outputs: Dict with tok_idx, Z_init_II, etc.
+            
+        Returns:
+            P_LL_sparse_chunk: [B, L_par, k, c_atompair]
+        """
+        B = indices_chunk.shape[0]
+        L_par = query_end - query_start
+        k = indices_chunk.shape[2]
+        device = indices_chunk.device
+        
+        # Get full data from initializer_outputs
+        tok_idx = f.get("atom_to_token_map", initializer_outputs.get("tok_idx"))
+        Z_init_II = initializer_outputs.get("Z_II", initializer_outputs.get("Z_init_II"))
+        C_L = initializer_outputs.get("C_L")
+        
+        # Get dtype from available tensor
+        dtype = C_L.dtype if C_L is not None else torch.bfloat16
+        
+        # Initialize output for this chunk
+        P_LL_sparse_chunk = torch.zeros(
+            B, L_par, k, self.c_atompair, device=device, dtype=dtype
+        )
+        
+        # Ensure indices_chunk is properly batched
+        if indices_chunk.dim() == 2:
+            indices_chunk = indices_chunk.unsqueeze(0).expand(B, -1, -1)
+        
+        # SKIP motif/ref position embeddings in parallel mode for now
+        # They use slow for loops that cause rank desynchronization
+        # The single embeddings and Z features are the main contributors
+        
+        # 1. Single embeddings for chunk (VECTORIZED - no for loops)
+        if C_L is not None:
+            if C_L.dim() == 2:
+                C_L = C_L.unsqueeze(0)
+            if C_L.shape[0] != B:
+                C_L = C_L.expand(B, -1, -1)
+            
+            C_L_chunk = C_L[:, query_start:query_end, :]  # [B, L_par, c]
+            C_L_queries = C_L_chunk.unsqueeze(2).expand(-1, -1, k, -1)  # [B, L_par, k, c]
+            
+            # Gather key features - VECTORIZED
+            indices_for_gather = indices_chunk.unsqueeze(-1).expand(-1, -1, -1, C_L.shape[-1])
+            indices_clamped = torch.clamp(indices_for_gather, 0, C_L.shape[1] - 1)
+            C_L_keys = torch.gather(C_L.unsqueeze(2).expand(-1, -1, k, -1), 1, indices_clamped)  # [B, L_par, k, c]
+            
+            single_l = self.process_single_l(C_L_queries)  # [B, L_par, k, c_atompair]
+            single_m = self.process_single_m(C_L_keys)     # [B, L_par, k, c_atompair]
+            P_LL_sparse_chunk = P_LL_sparse_chunk + single_l + single_m
+        
+        # 2. Token pair features Z for chunk (VECTORIZED - no for loops)
+        if tok_idx is not None and Z_init_II is not None:
+            if tok_idx.dim() == 1:
+                tok_idx_expanded = tok_idx.unsqueeze(0).expand(B, -1)
+            else:
+                tok_idx_expanded = tok_idx
+                if tok_idx_expanded.shape[0] != B:
+                    tok_idx_expanded = tok_idx_expanded.expand(B, -1)
+            
+            # Token indices for this chunk's queries
+            tok_queries_chunk = tok_idx_expanded[:, query_start:query_end].unsqueeze(2).expand(-1, -1, k)  # [B, L_par, k]
+            
+            # Get token indices for keys via gather - VECTORIZED
+            tok_idx_for_keys = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)  # [B, L, k]
+            indices_clamped = torch.clamp(indices_chunk, 0, tok_idx_expanded.shape[1] - 1)
+            tok_keys_chunk = torch.gather(tok_idx_for_keys, 1, indices_clamped)  # [B, L_par, k]
+            
+            # Import StreamingZContainer check
+            from rfd3.model.layers.encoders import StreamingZContainer
+            
+            if isinstance(Z_init_II, StreamingZContainer):
+                I_z = Z_init_II.I
+                # VECTORIZED: process all batches at once
+                tq = torch.clamp(tok_queries_chunk[0], 0, I_z - 1)  # [L_par, k] - B=1 typical
+                tk = torch.clamp(tok_keys_chunk[0], 0, I_z - 1)      # [L_par, k]
+                Z_pairs_base = Z_init_II.get_base_z_at_pairs(tq, tk)  # [L_par, k, c_z]
+                Z_pairs_processed = self.process_z(Z_pairs_base)      # [L_par, k, c_atompair]
+                Z_pairs_processed_chunk = Z_pairs_processed.unsqueeze(0).expand(B, -1, -1, -1)
+            else:
+                I_z = Z_init_II.shape[0]
+                Z_processed = self.process_z(Z_init_II)  # [I, I, c_atompair]
+                
+                # VECTORIZED gather for Z pairs
+                tq_flat = torch.clamp(tok_queries_chunk.reshape(-1), 0, I_z - 1)  # [B*L_par*k]
+                tk_flat = torch.clamp(tok_keys_chunk.reshape(-1), 0, I_z - 1)      # [B*L_par*k]
+                Z_pairs_flat = Z_processed[tq_flat, tk_flat, :]  # [B*L_par*k, c_atompair]
+                Z_pairs_processed_chunk = Z_pairs_flat.reshape(B, L_par, k, -1)
+            
+            # Add Z_pairs to P_LL (matching original: P_LL_sparse += Z_pairs_processed)
+            P_LL_sparse_chunk = P_LL_sparse_chunk + Z_pairs_processed_chunk
+        
+        # Final MLP (matching original: P_LL_sparse + self.pair_mlp(P_LL_sparse))
+        P_LL_sparse_chunk = P_LL_sparse_chunk + self.pair_mlp(P_LL_sparse_chunk)
+        
+        return P_LL_sparse_chunk.contiguous()
 
 
 def create_chunked_embedders(

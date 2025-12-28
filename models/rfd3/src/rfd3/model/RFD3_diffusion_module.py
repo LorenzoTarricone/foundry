@@ -77,7 +77,10 @@ def _all_gather_along_dim(
     if world_size == 1:
         return tensor
     
-    # Gather from all ranks - handle variable sizes
+    # Ensure tensor is contiguous (required for NCCL)
+    tensor = tensor.contiguous()
+    
+    # Gather from all ranks
     gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
     dist.all_gather(gathered, tensor)
     return torch.cat(gathered, dim=dim)
@@ -652,20 +655,49 @@ class RFD3DiffusionModule(nn.Module):
         C_L = C_L + self.process_c(C_L)                          # [B, L, c_atom]
 
         # ... Run Local-Atom Self Attention and Pool
-        if chunked_pairwise_embedder is not None:
-            # Chunked mode: pass chunked embedder and feature dict
-            Q_L = self.encoder(
-                Q_L,
-                C_L,
-                P_LL=None,
+        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
+        
+        if attn_parallel is not None and dist.is_initialized() and dist.get_world_size() > 1:
+            # PARALLEL MODE: Split L atoms across GPUs
+            # Each GPU processes L_par = L / n_gpus atom queries
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            L = Q_L.shape[1]
+            L_par = (L + world_size - 1) // world_size
+            query_start = rank * L_par
+            query_end = min(query_start + L_par, L)
+            
+            def all_gather_concat(tensor, ws, dim):
+                # Ensure tensor is contiguous (required for NCCL)
+                tensor = tensor.contiguous()
+                gathered = [torch.zeros_like(tensor) for _ in range(ws)]
+                dist.all_gather(gathered, tensor)
+                return torch.cat(gathered, dim=dim)
+            
+            # Use parallel encoder - each GPU handles L_par atoms
+            Q_L = self.encoder.forward_parallel(
+                Q_L=Q_L,
+                C_L=C_L,
                 indices=f["attn_indices"],
+                query_start=query_start,
+                query_end=query_end,
                 f=f,
                 chunked_pairwise_embedder=chunked_pairwise_embedder,
+                initializer_outputs=initializer_outputs,
+                all_gather_fn=all_gather_concat,
+                world_size=world_size,
+            )                                              # [B, L, c_atom]
+        elif chunked_pairwise_embedder is not None:
+            # Low-memory mode: sparse P_LL but single GPU
+            Q_L = self.encoder(
+                Q_L, C_L, P_LL=None, indices=f["attn_indices"],
+                f=f, chunked_pairwise_embedder=chunked_pairwise_embedder,
                 initializer_outputs=initializer_outputs,
             )                                              # [B, L, c_atom]
         else:
             # Standard mode: use full P_LL
             Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])  # [B, L, c_atom]
+        
         A_I = self.downcast_q(Q_L, A_I=A_I, S_I=S_I, tok_idx=tok_idx)  # [B, I, c_token]
 
         # ... Run forward with recycling

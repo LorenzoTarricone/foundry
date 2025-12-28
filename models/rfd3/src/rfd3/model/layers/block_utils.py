@@ -61,10 +61,8 @@ def bucketize_scaled_distogram_chunked(
     
     # Compute pairwise distances: query chunk vs all atoms
     # [B, I_par, 1, 3] - [B, 1, I, 3] = [B, I_par, I, 3]
-    D_chunk = R_query.unsqueeze(-2) - R_L.unsqueeze(-3)[:, query_start:query_end, :, :]
-    # Wait, this is wrong. Let me fix:
-    D_chunk = R_query.unsqueeze(-2) - R_L.unsqueeze(1)        # [B, I_par, I, 3]
-    D_chunk = torch.linalg.norm(D_chunk, dim=-1)              # [B, I_par, I]
+    D_chunk = R_query.unsqueeze(-2) - R_L.unsqueeze(1)       # [B, I_par, I, 3]
+    D_chunk = torch.linalg.norm(D_chunk, dim=-1)             # [B, I_par, I]
 
     # normalize
     min_dist_norm = min_dist / sigma_data
@@ -324,10 +322,19 @@ def create_attention_indices_parallel(
     X_L: torch.Tensor | None = None,
     tok_idx: torch.Tensor | None = None,
     n_parallel: int = 1,
+    max_chunk_size: int = 2048,  # Cap chunk size to avoid OOM on [chunk, L] tensors
 ):
     """
-    Streaming attention index builder that never materializes full LxL tensors.
-    Splits queries into L/n_parallel chunks; each chunk attends over all atoms.
+    Memory-efficient attention index builder that avoids full LxL tensors.
+    
+    Processes queries in small chunks (capped at max_chunk_size) to avoid OOM.
+    Each chunk computes distances [chunk, L] which is manageable.
+    
+    For 84k atoms with max_chunk_size=2048:
+    - Creates ~41 chunks
+    - Each chunk: [2048, 84k] = 172M entries = ~1.4GB per intermediate tensor
+    
+    Returns FULL indices [B, L, k] for encoder compatibility.
     """
     tok_idx = f["atom_to_token_map"] if tok_idx is None else tok_idx
     device = X_L.device if X_L is not None else tok_idx.device
@@ -352,15 +359,14 @@ def create_attention_indices_parallel(
         k_inter = 0
         k_intra = 0
 
-    # Chunk size: ceil(L / n_parallel)
-    chunk_size = max(1, (L + n_parallel - 1) // n_parallel)
+    # Chunk size: cap at max_chunk_size to avoid OOM on [chunk, L] intermediates
+    chunk_size = min(max(1, (L + n_parallel - 1) // n_parallel), max_chunk_size)
 
-    # Output tensor
+    # Output tensor - FULL indices [B, L, k] for encoder compatibility
     indices_out = torch.zeros(B, L, k_total, device=device, dtype=torch.long)
 
     for b in range(B):
         X_all = X_L[b]  # (L, 3)
-        # Precompute per-atom views
         base_unindex_mask = f["unindexing_pair_mask"]  # token-level [I, I]
         all_tok = tok_idx
         all_chain = chain_ids if chain_ids is not None else None

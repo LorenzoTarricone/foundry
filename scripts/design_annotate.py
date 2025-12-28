@@ -182,11 +182,19 @@ def run_design(
     """
     Run RFD3 design + MPNN annotation pipeline.
     """
-    # Import here to allow env vars to be set first
+    # Add paths for local imports
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+    sys.path.insert(0, str(project_root / "models/rfd3/src"))
+    sys.path.insert(0, str(project_root / "models/mpnn/src"))
+    sys.path.insert(0, str(project_root / "models/rf3/src"))
+    sys.path.insert(0, str(project_root / "src"))
+    
+    # Import here to allow env vars and paths to be set first
     from atomworks.io.utils.io_utils import to_cif_file
     from biotite.structure import get_chains
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
-    from foundry.inference_engines.mpnn_engine import MPNNInferenceEngine
+    from mpnn.inference_engines.mpnn import MPNNInferenceEngine
     
     # Setup output
     out_path = Path(out_dir)
@@ -242,7 +250,10 @@ def run_design(
     
     # Configure RFD3
     rfd3_batch_size = num_designs
-    rfd3_spec = {'length': {'backbone': length}}
+    rfd3_spec = {
+        'length': length,
+        'extra': {}  # Avoid KeyError in engine
+    }
     rfd3_inference_sampler = {}
     
     if symmetry:
@@ -252,10 +263,19 @@ def run_design(
         }
         rfd3_inference_sampler = {"kind": "symmetry"}
     
+    # Path to local checkpoint
+    ckpt_path = project_root / "ckpt" / "rfd3_latest.ckpt"
+    if not ckpt_path.exists():
+        print(f"Warning: Checkpoint not found at {ckpt_path}. Falling back to default 'rfd3' lookup.")
+        ckpt_path = "rfd3"
+    else:
+        ckpt_path = str(ckpt_path)
+    
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
         diffusion_batch_size=rfd3_batch_size,
         inference_sampler=rfd3_inference_sampler,
+        ckpt_path=ckpt_path,
         low_memory_mode=low_memory_mode,
         attention_parallel=attention_parallel,
         attention_parallel_factor=attention_parallel_factor,
@@ -282,7 +302,7 @@ def run_design(
     # Configure MPNN
     print(f"\nInitializing MPNN Engine...")
     
-    mpnn_ckpt_path = Path("ckpt") / "ligandmpnn_v_32_010_25.pt"
+    mpnn_ckpt_path = project_root / "ckpt" / "ligandmpnn_v_32_010_25.pt"
     if not mpnn_ckpt_path.exists():
         mpnn_ckpt_path = None
     else:

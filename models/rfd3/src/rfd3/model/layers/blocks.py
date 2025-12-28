@@ -998,6 +998,108 @@ class LocalAtomTransformer(nn.Module):
         for block in self.blocks:
             Q_L = block(Q_L, C_L, P_LL, **kwargs)
         return Q_L
+    
+    def forward_parallel(
+        self,
+        Q_L,                        # [B, L, c_atom] - full atom features
+        C_L,                        # [B, L, c_atom] - conditioned features
+        indices,                    # [B, L, k] - sparse attention indices
+        query_start,                # int - this GPU's query start
+        query_end,                  # int - this GPU's query end  
+        f,                          # feature dict
+        chunked_pairwise_embedder,  # computes P_LL_sparse on-the-fly
+        initializer_outputs,        # embedder state
+        all_gather_fn,              # gather function
+        world_size,                 # number of GPUs
+    ):
+        """
+        Parallel forward: each GPU processes L_par = L/n_par atom queries.
+        
+        No L×L tensor is materialized:
+        - P_LL_sparse computed on-the-fly for L_par queries only
+        - Each GPU computes [L_par, k, c] instead of full [L, k, c]
+        - Q_L chunks gathered after each block
+        
+        Args:
+            Q_L: Full atom features [B, L, c_atom] (for K/V)
+            C_L: Conditioned features [B, L, c_atom]
+            indices: Full attention indices [B, L, k]
+            query_start, query_end: This GPU's query range
+            f, chunked_pairwise_embedder, initializer_outputs: For P_LL computation
+            all_gather_fn: Function to gather Q_L chunks across GPUs
+            world_size: Number of GPUs
+            
+        Returns:
+            Q_L: Updated atom features [B, L, c_atom]
+        """
+        B = Q_L.shape[0]
+        L = Q_L.shape[1]
+        c_atom = Q_L.shape[2]
+        L_par = query_end - query_start
+        
+        # Compute max chunk size (for padding to ensure equal sizes for all_gather)
+        max_L_par = (L + world_size - 1) // world_size  # Ceiling division
+        
+        # This GPU's indices
+        indices_chunk = indices[:, query_start:query_end, :]  # [B, L_par, k]
+        
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+        
+        # Ensure all tensors are on the correct device for this rank
+        Q_L = Q_L.to(device)
+        C_L = C_L.to(device)
+        indices = indices.to(device)
+        
+        for block_idx, block in enumerate(self.blocks):
+            print(f"[Rank {rank}] Encoder block {block_idx}: starting", flush=True)
+            
+            # Extract this GPU's query chunk
+            Q_L_chunk = Q_L[:, query_start:query_end, :]      # [B, L_par, c_atom]
+            C_L_chunk = C_L[:, query_start:query_end, :]      # [B, L_par, c_atom]
+            
+            print(f"[Rank {rank}] Encoder block {block_idx}: computing P_sparse_chunk", flush=True)
+            
+            # Compute P_LL_sparse for THIS GPU's queries only
+            # This is the key: [L_par, k, c] not [L, k, c]
+            P_sparse_chunk = chunked_pairwise_embedder.forward_chunked_parallel(
+                indices_chunk=indices_chunk,                   # [B, L_par, k]
+                query_start=query_start,
+                query_end=query_end,
+                f=f,
+                initializer_outputs=initializer_outputs,
+            )                                                  # [B, L_par, k, c_pair]
+            
+            print(f"[Rank {rank}] Encoder block {block_idx}: running cross-attention", flush=True)
+            
+            # Sparse cross-attention: Q_L_chunk attends to sparse neighbors
+            Q_L_chunk = block.forward_sparse_cross_attn(
+                Q_chunk=Q_L_chunk,                              # [B, L_par, c_atom]
+                C_Q_chunk=C_L_chunk,                            # [B, L_par, c_atom]
+                K_V_full=Q_L,                                   # [B, L, c_atom]
+                C_KV_full=C_L,                                  # [B, L, c_atom]
+                P_sparse_chunk=P_sparse_chunk,                  # [B, L_par, k, c_pair]
+                indices_chunk=indices_chunk,                    # [B, L_par, k]
+            )                                                  # [B, L_par, c_atom]
+            
+            print(f"[Rank {rank}] Encoder block {block_idx}: all_gather", flush=True)
+            
+            # Pad to max_L_par for all_gather (NCCL requires equal sizes)
+            if L_par < max_L_par:
+                pad_size = max_L_par - L_par
+                Q_L_chunk = torch.nn.functional.pad(Q_L_chunk, (0, 0, 0, pad_size))  # [B, max_L_par, c_atom]
+            
+            # All-gather padded chunks
+            Q_L_gathered = all_gather_fn(Q_L_chunk, world_size, dim=1)  # [B, max_L_par*world_size, c_atom]
+            
+            # Trim back to actual L (remove padding) and ensure on correct device
+            Q_L = Q_L_gathered[:, :L, :].to(device)  # [B, L, c_atom]
+            
+            print(f"[Rank {rank}] Encoder block {block_idx}: done", flush=True)
+        
+        return Q_L
 
 
 class StructureLocalAtomTransformerBlock(nn.Module):

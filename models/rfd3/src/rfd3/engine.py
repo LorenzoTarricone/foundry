@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.distributed as dist
 import yaml
 from atomworks.io.utils.io_utils import to_cif_file
 from biotite.structure import AtomArray, AtomArrayStack
@@ -258,7 +259,10 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         dump_prediction_metadata_json: bool,
         dump_trajectories: bool,
         align_trajectory_structures: bool,
+        # Memory optimization modes (orthogonal)
         low_memory_mode: bool,
+        attention_parallel: bool = False,
+        attention_parallel_factor: int | None = None,
         **kwargs,
     ):
         super().__init__(
@@ -304,24 +308,25 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         # Enable attention parallel streaming mode to avoid full LxL/IxI allocations
         # This mode requires multiple GPUs; if only 1 GPU, fall back to LOW_MEMORY_MODE
         self._distributed_initialized = False
-        if kwargs.get("attention_parallel", False):
-            try:
-                n_gpus = torch.cuda.device_count()
-            except Exception:
-                n_gpus = 0
-            
-            factor = kwargs.get("attention_parallel_factor")
-            if factor is not None and factor > 0:
+        if attention_parallel:
+            # Determine parallelism factor
+            if attention_parallel_factor is not None and attention_parallel_factor > 0:
                 # Explicit factor provided
-                n_par = int(factor)
+                n_par = int(attention_parallel_factor)
+            elif dist.is_initialized():
+                # Distributed already initialized (e.g., by torchrun) - use world_size
+                n_par = dist.get_world_size()
             else:
-                # Use number of GPUs as parallelism factor
-                n_par = n_gpus
+                # Standalone mode - use device count
+                try:
+                    n_par = torch.cuda.device_count()
+                except Exception:
+                    n_par = 0
             
             if n_par <= 1:
                 # Not enough GPUs for parallel mode - fall back to LOW_MEMORY_MODE
                 ranked_logger.warning(
-                    f"Attention parallel mode requested but only {n_gpus} GPU(s) available. "
+                    f"Attention parallel mode requested but n_parallel={n_par}. "
                     f"Falling back to LOW_MEMORY_MODE (chunked processing on single GPU)."
                 )
                 os.environ["RFD3_LOW_MEMORY_MODE"] = "1"

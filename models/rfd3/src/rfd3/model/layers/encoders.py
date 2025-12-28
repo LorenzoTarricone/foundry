@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from rfd3.model.layers.block_utils import (
     bucketize_scaled_distogram,
+    bucketize_scaled_distogram_chunked,
     pairwise_mean_pool,
 )
 from rfd3.model.layers.blocks import (
@@ -56,6 +57,43 @@ def _compute_chunk_ranges(total: int, n_par: int) -> List[Tuple[int, int]]:
         if start < total:
             ranges.append((start, end))
     return ranges
+
+
+def _z_transition_chunked(Z: torch.Tensor, transition_fn, key_chunk: int = 512) -> torch.Tensor:
+    """
+    Apply z_transition in sub-chunks along key dimension to reduce peak memory.
+    
+    SwiGLU creates 4x intermediate: [I_par, I, c] -> [I_par, I, 4*c] -> [I_par, I, c]
+    By chunking keys: [I_par, chunk, c] -> [I_par, chunk, 4*c] reduces memory 4x.
+    
+    Args:
+        Z: [I_par, I, c_z] or [B, I_par, I, c_z]
+        transition_fn: z_transition module
+        key_chunk: chunk size along key dimension
+    
+    Returns:
+        Z + transition_fn(Z), computed memory-efficiently
+    """
+    if Z.dim() == 3:
+        # [I_par, I, c_z]
+        I = Z.shape[1]
+        out_chunks = []
+        for k_start in range(0, I, key_chunk):
+            k_end = min(k_start + key_chunk, I)
+            Z_sub = Z[:, k_start:k_end, :]
+            out_chunks.append(Z_sub + transition_fn(Z_sub))
+        return torch.cat(out_chunks, dim=1)
+    elif Z.dim() == 4:
+        # [B, I_par, I, c_z]
+        I = Z.shape[2]
+        out_chunks = []
+        for k_start in range(0, I, key_chunk):
+            k_end = min(k_start + key_chunk, I)
+            Z_sub = Z[:, :, k_start:k_end, :]
+            out_chunks.append(Z_sub + transition_fn(Z_sub))
+        return torch.cat(out_chunks, dim=2)
+    else:
+        return Z + transition_fn(Z)
 
 
 def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
@@ -214,10 +252,14 @@ class StreamingZContainer:
         Z_j = self.Z_j.unsqueeze(0)                       # [1, I, c_z]
         Z_chunk = Z_i + Z_j                               # [I_par, I, c_z]
         
+        # Debug: track dimensions
+        _dims = {"step1": Z_chunk.shape[-1]}
+        
         # Step 2: Add RPE (chunked)
         Z_chunk = Z_chunk + self.rpe_module.forward_chunk(
             self.f, start_i, end_i
         )  # [I_par, I, c_z]
+        _dims["step2_rpe"] = Z_chunk.shape[-1]
         
         # Step 3: Add token bonds (slice query rows, all key columns)
         token_bonds_chunk = self.token_bonds[qs, :]       # [I_par, I]
@@ -239,21 +281,46 @@ class StreamingZContainer:
         )  # [I_par, I, c_z]
         Z_chunk = Z_chunk + ref_pos_embed
         
-        # Step 5: Pairformer Z transitions (chunked)
+        # Step 5: Pairformer Z transitions (chunked along keys to save memory)
         for block in self.transformer_stack:
-            Z_chunk = Z_chunk + block.z_transition(Z_chunk)  # [I_par, I, c_z]
+            Z_chunk = _z_transition_chunked(Z_chunk, block.z_transition)  # [I_par, I, c_z]
         
         # Step 6: Concatenate with second RPE and process
         rpe2_chunk = self.rpe_module2.forward_chunk(
             self.f, start_i, end_i
         )  # [I_par, I, c_z]
+        _dims["step5_pre_cat"] = Z_chunk.shape[-1]
+        _dims["rpe2_dim"] = rpe2_chunk.shape[-1]
         
         Z_chunk = torch.cat([Z_chunk, rpe2_chunk], dim=-1)  # [I_par, I, 2*c_z]
-        Z_chunk = self.process_z_init(Z_chunk)              # [I_par, I, c_z]
+        _dims["step6_post_cat"] = Z_chunk.shape[-1]
         
-        # Step 7: Apply transitions
+        Z_chunk = self.process_z_init(Z_chunk)              # [I_par, I, c_z]
+        _dims["step6_post_process"] = Z_chunk.shape[-1]
+        
+        # Step 7: Apply transitions (chunked along keys to save memory)
         for transition in self.transition_modules:
-            Z_chunk = Z_chunk + transition(Z_chunk)         # [I_par, I, c_z]
+            Z_chunk = _z_transition_chunked(Z_chunk, transition)  # [I_par, I, c_z]
+        
+        # Debug check: verify dimensions match expected c_z
+        actual_dim = Z_chunk.shape[-1]
+        _dims["final"] = actual_dim
+        
+        if actual_dim != self.c_z:
+            # Check where the mismatch originates
+            z_i_dim = self.to_z_init_i(self.S_I[:1]).shape[-1]
+            z_j_dim = self.Z_j.shape[-1]
+            
+            raise RuntimeError(
+                f"StreamingZContainer.get_chunk dimension mismatch:\n"
+                f"  Expected c_z={self.c_z}\n"
+                f"  Got: {actual_dim}\n"
+                f"  Dimension trace: {_dims}\n"
+                f"  Z_i (to_z_init_i output) dim: {z_i_dim}\n"
+                f"  Z_j dim: {z_j_dim}\n"
+                f"  process_z_init expects: {2*self.c_z} -> {self.c_z}\n"
+                f"  Note: process_z_init should output {self.c_z} dims"
+            )
         
         return Z_chunk  # [I_par, I, c_z]
     
@@ -301,6 +368,55 @@ class StreamingZContainer:
             n_par = 4  # Default chunking for assembly
         chunks = self.get_all_chunks(n_par)
         return torch.cat(chunks, dim=0)  # [I, I, c_z]
+    
+    @property
+    def shape(self) -> Tuple[int, int, int]:
+        """Return virtual shape [I, I, c_z] for compatibility."""
+        return (self.I, self.I, self.c_z)
+    
+    def get_base_z_at_pairs(
+        self, 
+        tok_queries: torch.Tensor,  # [L, k] or similar token indices for queries
+        tok_keys: torch.Tensor,      # [L, k] or similar token indices for keys (same shape)
+        chunk_size: int = 512,       # Process in chunks to avoid OOM
+    ) -> torch.Tensor:
+        """
+        Compute BASE Z values at sparse (query, key) token pairs.
+        
+        This computes Z_i + Z_j WITHOUT the full RPE/token_bonds/etc processing.
+        Used by ChunkedPairwiseEmbedder when Z_II is streaming.
+        Processes in chunks to avoid OOM on large inputs.
+        
+        Args:
+            tok_queries: Token indices for query positions [L, k]
+            tok_keys: Token indices for key positions [L, k]
+            chunk_size: Number of L rows to process at once
+            
+        Returns:
+            Z_pairs: [L, k, c_z] Z values at the sparse pairs
+        """
+        L = tok_queries.shape[0]
+        k = tok_queries.shape[1] if tok_queries.dim() > 1 else 1
+        
+        # Process in chunks to avoid OOM
+        Z_pairs_list = []
+        for start in range(0, L, chunk_size):
+            end = min(start + chunk_size, L)
+            tq_chunk = tok_queries[start:end]            # [chunk, k]
+            tk_chunk = tok_keys[start:end]               # [chunk, k]
+            
+            # Z_i: query projection at tok_queries
+            S_queries = self.S_I[tq_chunk]               # [chunk, k, c_s]
+            Z_i = self.to_z_init_i(S_queries)            # [chunk, k, c_z]
+            
+            # Z_j: key projection at tok_keys  
+            Z_j = self.Z_j[tk_chunk]                     # [chunk, k, c_z]
+            
+            # Base Z = Z_i + Z_j
+            Z_chunk = Z_i + Z_j                          # [chunk, k, c_z]
+            Z_pairs_list.append(Z_chunk)
+        
+        return torch.cat(Z_pairs_list, dim=0)            # [L, k, c_z]
 
 
 class TokenInitializer(nn.Module):
@@ -818,9 +934,11 @@ class DiffusionTokenEncoder(nn.Module):
         world_size = Z_streaming.world_size
         
         # Step 1: Update S_I (operates on full I, no I×I)
-        S_I = S_init_I                                     # [I, c_s]
+        # S_init_I may have batch dim [B, I, c_s] or not [I, c_s]
+        S_I = S_init_I
+        has_batch_S = S_I.dim() == 3
         for b in range(2):
-            S_I = S_I + self.transition_1[b](S_I)          # [I, c_s]
+            S_I = S_I + self.transition_1[b](S_I)
         
         # Step 2: Get THIS GPU's Z chunk (never materializes full I×I)
         Z_chunk = Z_streaming.get_gpu_chunk()              # [I_par, I, c_z]
@@ -828,9 +946,9 @@ class DiffusionTokenEncoder(nn.Module):
         
         # Step 3: Add distogram for this GPU's query chunk
         if self.use_distogram:
+            R_ca = R_L[..., f["is_ca"], :]                 # [B, I, 3]
+            
             if self.use_sinusoidal_distogram_embedder:
-                # Compute pairwise distances: query chunk [I_par] vs all keys [I]
-                R_ca = R_L[..., f["is_ca"], :]             # [B, I, 3]
                 R_ca_query = R_ca[:, gpu_start:gpu_end, :] # [B, I_par, 3]
                 
                 # Mask: [I_par, I, 1] - query chunk vs all keys
@@ -842,9 +960,31 @@ class DiffusionTokenEncoder(nn.Module):
                 D_chunk = self.dist_embedder.forward_chunk(
                     R_ca_query, R_ca, ~mask_chunk
                 )                                          # [B, I_par, I, c_z]
-                Z_chunk = torch.cat([Z_chunk, D_chunk], dim=-1)
+            else:
+                # Bucketized distogram - compute for query chunk vs all atoms
+                D_chunk = bucketize_scaled_distogram_chunked(
+                    R_ca, gpu_start, gpu_end,
+                    min_dist=1, max_dist=30, sigma_data=16,  # default sigma_data
+                    n_bins=self.n_bins_distogram
+                )                                          # [B, I_par, I, n_bins]
+            Z_chunk = torch.cat([Z_chunk, D_chunk], dim=-1)
         
         # Step 4: Add self-conditioning for this GPU's chunk
+        #
+        # IMPORTANT: Base Z comes from TokenInitializer (Z_streaming.c_z), NOT self.c_z!
+        # The expected dimension for process_z is calculated at init time using self.c_z,
+        # so we MUST ensure TokenInitializer.c_z == DiffusionTokenEncoder.c_z.
+        #
+        base_z_dim = Z_streaming.c_z  # TokenInitializer's c_z
+        expected_dim = base_z_dim
+        if self.use_distogram:
+            if self.use_sinusoidal_distogram_embedder:
+                expected_dim += self.c_z  # sinusoidal uses DiffusionTokenEncoder.c_z
+            else:
+                expected_dim += self.n_bins_distogram
+        if self.use_self:
+            expected_dim += self.n_bins_distogram
+        
         if self.use_self:
             D_II_self = kwargs.get("D_II_self")
             if D_II_self is not None:
@@ -857,29 +997,67 @@ class DiffusionTokenEncoder(nn.Module):
                 )                                          # [B, I_par, I, n_bins]
             Z_chunk = torch.cat([Z_chunk, D_self_chunk], dim=-1)
         
-        # Step 5: Process concatenated Z features (still [B, I_par, I, ...])
-        Z_chunk = self.process_z(Z_chunk)                  # [B, I_par, I, c_z]
+        # Verify dimensions before process_z (diagnostic)
+        actual_dim = Z_chunk.shape[-1]
         
+        # CRITICAL: process_z expects cat_c_z = self.c_z + distogram + self_cond
+        # If TokenInitializer.c_z != DiffusionTokenEncoder.c_z, dimensions won't match
+        process_z_expected = self.c_z
+        if self.use_distogram:
+            if self.use_sinusoidal_distogram_embedder:
+                process_z_expected += self.c_z
+            else:
+                process_z_expected += self.n_bins_distogram
+        if self.use_self:
+            process_z_expected += self.n_bins_distogram
+        
+        if actual_dim != process_z_expected:
+            raise RuntimeError(
+                f"DiffusionTokenEncoder._forward_streaming: dimension mismatch!\n"
+                f"  process_z expects: {process_z_expected} (based on DiffusionTokenEncoder.c_z={self.c_z})\n"
+                f"  Z_chunk actual: {actual_dim}\n"
+                f"  Z_chunk shape: {Z_chunk.shape}\n"
+                f"  TokenInitializer.c_z (Z_streaming): {base_z_dim}\n"
+                f"  use_distogram={self.use_distogram}, use_sinusoidal={self.use_sinusoidal_distogram_embedder}, "
+                f"use_self={self.use_self}, n_bins={self.n_bins_distogram}\n"
+                f"  Streaming mode requires TokenInitializer.c_z == DiffusionTokenEncoder.c_z"
+            )
+        
+        # Step 5: Process concatenated Z features
+        # Match standard: Z_II = self.process_z(Z_II)
+        Z_chunk = self.process_z(Z_chunk)                # [B, I_par, I, c_z]
+        
+        # Match standard: Z_II = Z_II + self.transition_2[b](Z_II)
+        # Use key-chunking to reduce peak memory from SwiGLU 4x expansion
         for b in range(2):
-            Z_chunk = Z_chunk + self.transition_2[b](Z_chunk)
+            Z_chunk = _z_transition_chunked(Z_chunk, self.transition_2[b])  # [B, I_par, I, c_z]
         
         # Step 6: Pairformer with chunked attention
         # S_I attention: this GPU's query chunk [I_par] attends to all keys [I]
         # Output is [I_par, c_s] per GPU, then all_gathered to [I, c_s]
         
-        S_I_chunk = S_I[gpu_start:gpu_end]                 # [I_par, c_s]
+        # Handle batch dimension in S_I
+        if has_batch_S:
+            # S_I is [B, I, c_s] - slice along dim 1, squeeze batch for attention
+            S_I_chunk = S_I[:, gpu_start:gpu_end, :].squeeze(0)  # [I_par, c_s]
+            S_I_unbatched = S_I.squeeze(0)                        # [I, c_s]
+        else:
+            # S_I is [I, c_s] - slice directly
+            S_I_chunk = S_I[gpu_start:gpu_end]                    # [I_par, c_s]
+            S_I_unbatched = S_I                                   # [I, c_s]
         
         for block in self.pairformer_stack:
-            # Z transition on this GPU's chunk
-            Z_chunk = Z_chunk + block.z_transition(Z_chunk)  # [B, I_par, I, c_z]
+            # Z transition (key-chunked to reduce memory)
+            Z_chunk = _z_transition_chunked(Z_chunk, block.z_transition)  # [B, I_par, I, c_z]
             
             # Attention: queries [I_par] attend to all keys [I] using Z_chunk as bias
             if hasattr(block, 'attention_pair_bias'):
                 # Chunked attention: S_I_chunk queries, S_I keys, Z_chunk bias
+                # forward_chunked expects 2D inputs [I_par, c_s] and [I, c_s]
                 S_I_chunk = S_I_chunk + block.attention_pair_bias.forward_chunked(
-                    A_I_query=S_I_chunk,                   # [I_par, c_s] - this GPU's queries
-                    A_I_key=S_I,                           # [I, c_s] - all keys
-                    Z_chunk=Z_chunk[0],                    # [I_par, I, c_z] - this GPU's Z rows
+                    A_I_query=S_I_chunk,                   # [I_par, c_s]
+                    A_I_key=S_I_unbatched,                 # [I, c_s]
+                    Z_chunk=Z_chunk[0],                    # [I_par, I, c_z]
                     Beta_II=torch.tensor([0.0], device=device),
                 )                                          # [I_par, c_s]
                 S_I_chunk = S_I_chunk + block.s_transition(S_I_chunk)

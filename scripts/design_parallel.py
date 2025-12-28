@@ -109,11 +109,33 @@ def setup_distributed():
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     rank = int(os.environ.get("RANK", 0))
     
+    # Debug: show CUDA environment
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "not set")
+    device_count = torch.cuda.device_count()
+    print(f"[Rank {rank}] CUDA env: CUDA_VISIBLE_DEVICES={cuda_visible}, "
+          f"device_count={device_count}, local_rank={local_rank}")
+    
     if local_rank >= 0 and world_size > 1:
-        print(f"[Rank {rank}] Initializing: LOCAL_RANK={local_rank}, WORLD_SIZE={world_size}")
+        if local_rank >= device_count:
+            raise RuntimeError(
+                f"local_rank={local_rank} but only {device_count} GPUs visible! "
+                f"CUDA_VISIBLE_DEVICES={cuda_visible}"
+            )
+        
+        print(f"[Rank {rank}] Setting CUDA device to local_rank={local_rank}")
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
-        dist.barrier()
+        
+        # Verify the device was set correctly
+        current = torch.cuda.current_device()
+        print(f"[Rank {rank}] Current CUDA device after set_device: {current}")
+        
+        # Initialize with explicit device_id to avoid NCCL communicator issues
+        dist.init_process_group(
+            backend="nccl", 
+            init_method="env://",
+            device_id=torch.device(f"cuda:{local_rank}")
+        )
+        dist.barrier(device_ids=[local_rank])
         
         if is_main_process():
             print(f"Distributed initialized: {world_size} GPUs")
@@ -176,17 +198,30 @@ def run_worker(
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
     
-    # Set attention parallel mode
+    # Debug: verify GPU assignment
+    current_device = torch.cuda.current_device()
+    print(f"[Rank {rank}] GPU assignment: local_rank={local_rank}, current_device={current_device}, "
+          f"device_count={torch.cuda.device_count()}")
+    
+    # Set env vars BEFORE imports (modules check at import time)
+    # In parallel mode, we also need LOW_MEMORY_MODE for encoder's chunked P_LL
+    os.environ["RFD3_LOW_MEMORY_MODE"] = "1"
     if world_size > 1:
         os.environ["RFD3_ATTENTION_PARALLEL"] = str(world_size)
-    else:
-        os.environ["RFD3_LOW_MEMORY_MODE"] = "1"
     
-    # Import after env vars are set
+    # Add paths for local imports
+    script_dir = Path(__file__).resolve().parent
+    project_root = script_dir.parent
+    sys.path.insert(0, str(project_root / "models/rfd3/src"))
+    sys.path.insert(0, str(project_root / "models/mpnn/src"))
+    sys.path.insert(0, str(project_root / "models/rf3/src"))
+    sys.path.insert(0, str(project_root / "src"))
+    
+    # Import after env vars and paths are set
     from atomworks.io.utils.io_utils import to_cif_file
     from biotite.structure import get_chains
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
-    from foundry.inference_engines.mpnn_engine import MPNNInferenceEngine
+    from mpnn.inference_engines.mpnn import MPNNInferenceEngine
     
     # Optional W&B
     try:
@@ -230,19 +265,34 @@ def run_worker(
         print_rank0(f"  Symmetry: {symmetry}")
     
     # Configure RFD3
-    rfd3_spec = {'length': {'backbone': length}}
+    rfd3_spec = {
+        'length': length,
+        'extra': {}  # Avoid KeyError in engine
+    }
     rfd3_inference_sampler = {}
     
     if symmetry:
         rfd3_spec['symmetry'] = {'id': symmetry, 'is_symmetric_motif': False}
         rfd3_inference_sampler = {"kind": "symmetry"}
     
+    # Path to local checkpoint
+    ckpt_path = project_root / "ckpt" / "rfd3_latest.ckpt"
+    if not ckpt_path.exists():
+        print_rank0(f"Warning: Checkpoint not found at {ckpt_path}. Falling back to default 'rfd3' lookup.")
+        ckpt_path = "rfd3"
+    else:
+        ckpt_path = str(ckpt_path)
+    
+    # In parallel mode, also enable low_memory_mode for chunked P_LL in encoder
+    # (decoder has parallel path, but encoder still needs chunked embedder)
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
         diffusion_batch_size=num_designs,
         inference_sampler=rfd3_inference_sampler,
-        low_memory_mode=False,
-        attention_parallel=False,  # Set via env var
+        ckpt_path=ckpt_path,
+        low_memory_mode=True,   # Required for encoder chunked P_LL
+        attention_parallel=True,
+        attention_parallel_factor=attention_parallel_factor,
     )
     
     # Initialize and run RFD3
@@ -272,7 +322,7 @@ def run_worker(
     if is_main_process():
         print("\nInitializing MPNN Engine...")
         
-        mpnn_ckpt = Path("ckpt") / "ligandmpnn_v_32_010_25.pt"
+        mpnn_ckpt = project_root / "ckpt" / "ligandmpnn_v_32_010_25.pt"
         mpnn_ckpt = str(mpnn_ckpt) if mpnn_ckpt.exists() else None
         
         mpnn_engine = MPNNInferenceEngine(

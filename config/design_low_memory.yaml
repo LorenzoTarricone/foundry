@@ -14,7 +14,7 @@ length: 100
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
-symmetry: null
+symmetry: I
 
 # MPNN settings
 mpnn_batch_size: 5

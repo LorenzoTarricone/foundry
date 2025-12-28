@@ -13,7 +13,7 @@
 out_dir: "inference_outputs/design_demo_parallel"
 
 # Protein design parameters
-length: 100
+length: 70
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
@@ -26,6 +26,7 @@ mpnn_batch_size: 5
 # The script auto-detects allocated GPUs from CUDA_VISIBLE_DEVICES
 # Set attention_parallel_factor to override (e.g., 2 to use only 2 of 4 allocated GPUs)
 attention_parallel_factor: null
+low_memory_mode: true
 
 # Weights & Biases logging
 wandb:
