@@ -232,3 +232,6 @@ logs/
 # Others 
 **/models/rfd3/docs/c5_symmetry.json
 submit_example_vscode_code_tunnel.sh
+
+# Core dumps
+core
