@@ -5,12 +5,43 @@ This module provides memory-optimized versions of pairwise embedders that comput
 only the pairs needed for sparse attention, reducing memory usage from O(L²) to O(L×k).
 """
 
+import logging
 import math
+import os
 from typing import Optional
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
+
+logger = logging.getLogger(__name__)
+
+# Diagnostic flag
+PARALLEL_DEBUG = os.environ.get("RFD3_PARALLEL_DEBUG", "0") == "1"
+
+
+def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
+    """Log tensor statistics for debugging."""
+    if not PARALLEL_DEBUG:
+        return
+    if dist.is_initialized() and dist.get_rank() != rank:
+        return
+    
+    if tensor is None:
+        logger.info(f"[DEBUG-PAIRWISE] {name}: None")
+        return
+    
+    with torch.no_grad():
+        t = tensor.float()
+        stats = {
+            "shape": list(tensor.shape),
+            "mean": t.mean().item(),
+            "std": t.std().item(),
+            "min": t.min().item(),
+            "max": t.max().item(),
+        }
+    logger.info(f"[DEBUG-PAIRWISE] {name}: {stats}")
 
 
 class ChunkedPositionPairDistEmbedder(nn.Module):
@@ -419,6 +450,9 @@ class ChunkedPairwiseEmbedder(nn.Module):
         # 5. Final MLP - ADD the result, don't replace (to match standard implementation)
         P_LL_sparse = P_LL_sparse + self.pair_mlp(P_LL_sparse)
 
+        # DIAGNOSTIC: Log P_LL_sparse output
+        _log_tensor_stats("P_LL_sparse_forward_chunked", P_LL_sparse)
+        
         return P_LL_sparse.contiguous()
     
     def forward_chunked_parallel(

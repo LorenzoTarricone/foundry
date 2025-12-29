@@ -33,6 +33,33 @@ from foundry.model.layers.blocks import (
 
 logger = logging.getLogger(__name__)
 
+# Diagnostic flag - set to True to enable detailed parallel debugging
+PARALLEL_DEBUG = os.environ.get("RFD3_PARALLEL_DEBUG", "0") == "1"
+
+
+def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
+    """Log tensor statistics for debugging parallel vs non-parallel differences."""
+    if not PARALLEL_DEBUG:
+        return
+    if dist.is_initialized() and dist.get_rank() != rank:
+        return  # Only log from specified rank
+    
+    if tensor is None:
+        logger.info(f"[DEBUG] {name}: None")
+        return
+    
+    with torch.no_grad():
+        t = tensor.float()
+        stats = {
+            "shape": list(tensor.shape),
+            "mean": t.mean().item(),
+            "std": t.std().item(),
+            "min": t.min().item(),
+            "max": t.max().item(),
+            "abs_mean": t.abs().mean().item(),
+        }
+    logger.info(f"[DEBUG] {name}: {stats}")
+
 
 def _get_n_parallel() -> int:
     """Get parallelism factor from environment, or 0 if not set."""
@@ -739,7 +766,13 @@ class RFD3DiffusionModule(nn.Module):
             # Standard mode: use full P_LL
             Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])  # [B, L, c_atom]
         
+        # DIAGNOSTIC: Log Q_L after encoder
+        _log_tensor_stats("Q_L_after_encoder", Q_L)
+        
         A_I = self.downcast_q(Q_L, A_I=A_I, S_I=S_I, tok_idx=tok_idx)  # [B, I, c_token]
+        
+        # DIAGNOSTIC: Log A_I after downcast_q
+        _log_tensor_stats("A_I_after_downcast_q", A_I)
 
         # ... Run forward with recycling
         recycled_features = self.forward_with_recycle(
@@ -907,6 +940,9 @@ class RFD3DiffusionModule(nn.Module):
                 full=use_full_attention,
             )                                              # [B, I, c_token]
 
+        # DIAGNOSTIC: Log A_I after diffusion transformer
+        _log_tensor_stats("A_I_after_transformer", A_I)
+        
         # ... Decoder readout
         # Handle all combinations of LOW_MEMORY_MODE and ATTENTION_PARALLEL:
         #
@@ -972,9 +1008,19 @@ class RFD3DiffusionModule(nn.Module):
                 indices=f["attn_indices"],
             )
 
+        # DIAGNOSTIC: Log Q_L after decoder
+        _log_tensor_stats("Q_L_after_decoder", Q_L)
+        
         # ... Process outputs to positions update
         R_update_L = self.to_r_update(Q_L)                 # [B, L, 3]
+        
+        # DIAGNOSTIC: Log R_update_L (the model's prediction)
+        _log_tensor_stats("R_update_L", R_update_L)
+        
         X_out_L = self.scale_positions_out(R_update_L, X_noisy_L, t_L)  # [B, L, 3]
+        
+        # DIAGNOSTIC: Log X_out_L (final denoised positions)
+        _log_tensor_stats("X_out_L", X_out_L)
 
         sequence_logits_I, sequence_indices_I = self.sequence_head(A_I=A_I)
         

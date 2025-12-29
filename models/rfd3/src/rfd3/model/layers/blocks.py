@@ -5,6 +5,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from atomworks.ml.encoding_definitions import AF3SequenceEncoding
 from einops import rearrange
 from rfd3.model.layers.attention import (
@@ -28,6 +29,34 @@ from rfd3.model.layers.layer_utils import (
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
 from torch.nn.functional import one_hot
+
+logger = logging.getLogger(__name__)
+
+# Diagnostic flag
+PARALLEL_DEBUG = os.environ.get("RFD3_PARALLEL_DEBUG", "0") == "1"
+
+
+def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
+    """Log tensor statistics for debugging."""
+    if not PARALLEL_DEBUG:
+        return
+    if dist.is_initialized() and dist.get_rank() != rank:
+        return
+    
+    if tensor is None:
+        logger.info(f"[DEBUG-BLOCKS] {name}: None")
+        return
+    
+    with torch.no_grad():
+        t = tensor.float()
+        stats = {
+            "shape": list(tensor.shape),
+            "mean": t.mean().item(),
+            "std": t.std().item(),
+            "min": t.min().item(),
+            "max": t.max().item(),
+        }
+    logger.info(f"[DEBUG-BLOCKS] {name}: {stats}")
 
 from foundry import DISABLE_CHECKPOINTING
 from foundry.common import exists
@@ -1085,6 +1114,10 @@ class LocalAtomTransformer(nn.Module):
                 indices_chunk=indices_chunk,                    # [B, L_par, k]
             )                                                  # [B, L_par, c_atom]
             
+            # DIAGNOSTIC: Log Q_L_chunk after attention for first block
+            if block_idx == 0:
+                _log_tensor_stats(f"encoder_Q_L_chunk_after_attn_block{block_idx}", Q_L_chunk)
+            
             # Pad to max_L_par for all_gather (NCCL requires equal sizes)
             if L_par < max_L_par:
                 pad_size = max_L_par - L_par
@@ -1095,6 +1128,10 @@ class LocalAtomTransformer(nn.Module):
             
             # Trim back to actual L (remove padding) and ensure on correct device
             Q_L = Q_L_gathered[:, :L, :].to(device)  # [B, L, c_atom]
+            
+            # DIAGNOSTIC: Log Q_L after all_gather for first block
+            if block_idx == 0:
+                _log_tensor_stats(f"encoder_Q_L_after_gather_block{block_idx}", Q_L)
         
         return Q_L
 
@@ -1482,6 +1519,10 @@ class CompactStreamingDecoder(nn.Module):
                 query_start=query_start,                    # Offset for parallel mode
             )                                              # [B, L_par, k, c_atompair]
             
+            # DIAGNOSTIC: Log P_sparse_chunk for first block
+            if i == 0:
+                _log_tensor_stats(f"decoder_P_sparse_chunk_block{i}", P_sparse_chunk)
+            
             # Sparse cross-attention: Q_L_chunk queries attend to sparse K/V
             # Uses indices_chunk to gather sparse keys/values
             Q_L_chunk = self.atom_transformer[i].forward_sparse_cross_attn(
@@ -1493,8 +1534,16 @@ class CompactStreamingDecoder(nn.Module):
                 indices_chunk=indices_chunk,                # [B, L_par, k]
             )                                              # [B, L_par, c_atom]
             
+            # DIAGNOSTIC: Log Q_L_chunk after attention for first block
+            if i == 0:
+                _log_tensor_stats(f"decoder_Q_L_chunk_after_attn_block{i}", Q_L_chunk)
+            
             # All-gather Q_L chunks to reconstruct full Q_L
             Q_L = all_gather_fn(Q_L_chunk, world_size, dim=1)  # [B, L, c_atom]
+            
+            # DIAGNOSTIC: Log Q_L after all_gather for first block
+            if i == 0:
+                _log_tensor_stats(f"decoder_Q_L_after_gather_block{i}", Q_L)
 
         # Downcast to sequence (operates on full Q_L, no L×L)
         A_I = self.downcast(Q_L.detach(), A_I.detach(), S_I.detach(), tok_idx=tok_idx)
