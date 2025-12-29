@@ -18,7 +18,7 @@ from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
 logger = logging.getLogger(__name__)
 
 # Diagnostic flag
-PARALLEL_DEBUG = os.environ.get("RFD3_PARALLEL_DEBUG", "0") == "1"
+PARALLEL_DEBUG = True  # Hardcoded for debugging
 
 
 def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
@@ -29,19 +29,19 @@ def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
         return
     
     if tensor is None:
-        logger.info(f"[DEBUG-PAIRWISE] {name}: None")
+        print(f"[DEBUG-PAIRWISE] {name}: None", flush=True)
         return
     
     with torch.no_grad():
         t = tensor.float()
         stats = {
             "shape": list(tensor.shape),
-            "mean": t.mean().item(),
-            "std": t.std().item(),
-            "min": t.min().item(),
-            "max": t.max().item(),
+            "mean": f"{t.mean().item():.6f}",
+            "std": f"{t.std().item():.6f}",
+            "min": f"{t.min().item():.6f}",
+            "max": f"{t.max().item():.6f}",
         }
-    logger.info(f"[DEBUG-PAIRWISE] {name}: {stats}")
+    print(f"[DEBUG-PAIRWISE] {name}: {stats}", flush=True)
 
 
 class ChunkedPositionPairDistEmbedder(nn.Module):
@@ -393,7 +393,9 @@ class ChunkedPairwiseEmbedder(nn.Module):
         
         # Handle StreamingZContainer (parallel mode) vs tensor (standard mode)
         if isinstance(Z_init_II, StreamingZContainer):
-            # Streaming mode: compute sparse Z values directly without full Z tensor
+            print(f"[DEBUG-PAIRWISE] Z_init_II is StreamingZContainer", flush=True)
+            # Streaming mode: compute FULLY PROCESSED Z at sparse pairs
+            # This includes RPE, token bonds, transformer stack, etc.
             I_z = Z_init_II.I
             
             Z_pairs_processed = torch.zeros(
@@ -408,12 +410,13 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 tq = torch.clamp(tq, 0, I_z - 1)
                 tk = torch.clamp(tk, 0, I_z - 1)
                 
-                # Get base Z at sparse pairs (Z_i + Z_j only)
-                Z_pairs_base = Z_init_II.get_base_z_at_pairs(tq, tk)  # [L_par, k, c_z]
+                # Get FULLY PROCESSED Z at sparse pairs (includes RPE, token bonds, etc.)
+                Z_pairs_full = Z_init_II.get_fully_processed_z_at_pairs(tq, tk)  # [L_par, k, c_z]
                 
                 # Process through linear layer
-                Z_pairs_processed[b] = self.process_z(Z_pairs_base)  # [L_par, k, c_atompair]
+                Z_pairs_processed[b] = self.process_z(Z_pairs_full)  # [L_par, k, c_atompair]
         else:
+            print(f"[DEBUG-PAIRWISE] Z_init_II is TENSOR with shape {Z_init_II.shape}", flush=True)
             # Standard mode: full Z tensor available
             I_z, I_z2, c_z = Z_init_II.shape
 
@@ -450,8 +453,14 @@ class ChunkedPairwiseEmbedder(nn.Module):
         # 5. Final MLP - ADD the result, don't replace (to match standard implementation)
         P_LL_sparse = P_LL_sparse + self.pair_mlp(P_LL_sparse)
 
-        # DIAGNOSTIC: Log P_LL_sparse output
+        # DIAGNOSTIC: Log detailed intermediate values
         _log_tensor_stats("P_LL_sparse_forward_chunked", P_LL_sparse)
+        _log_tensor_stats("forward_chunked_C_L_queries", C_L_queries)
+        _log_tensor_stats("forward_chunked_C_L_keys", C_L_keys)
+        _log_tensor_stats("forward_chunked_single_l", single_l)
+        _log_tensor_stats("forward_chunked_single_m", single_m)
+        _log_tensor_stats("forward_chunked_Z_pairs_processed", Z_pairs_processed)
+        print(f"[DEBUG-PAIRWISE] forward_chunked query_start={query_start}, L_par={L_par}, L_full={L_full}", flush=True)
         
         return P_LL_sparse.contiguous()
     
@@ -561,8 +570,9 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 # VECTORIZED: process all batches at once
                 tq = torch.clamp(tok_queries_chunk[0], 0, I_z - 1)  # [L_par, k] - B=1 typical
                 tk = torch.clamp(tok_keys_chunk[0], 0, I_z - 1)      # [L_par, k]
-                Z_pairs_base = Z_init_II.get_base_z_at_pairs(tq, tk)  # [L_par, k, c_z]
-                Z_pairs_processed = self.process_z(Z_pairs_base)      # [L_par, k, c_atompair]
+                # Use FULLY PROCESSED Z (includes RPE, token bonds, etc.)
+                Z_pairs_full = Z_init_II.get_fully_processed_z_at_pairs(tq, tk)  # [L_par, k, c_z]
+                Z_pairs_processed = self.process_z(Z_pairs_full)      # [L_par, k, c_atompair]
                 Z_pairs_processed_chunk = Z_pairs_processed.unsqueeze(0).expand(B, -1, -1, -1)
             else:
                 I_z = Z_init_II.shape[0]

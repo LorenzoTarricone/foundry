@@ -34,7 +34,7 @@ from foundry.model.layers.blocks import (
 logger = logging.getLogger(__name__)
 
 # Diagnostic flag - set to True to enable detailed parallel debugging
-PARALLEL_DEBUG = os.environ.get("RFD3_PARALLEL_DEBUG", "0") == "1"
+PARALLEL_DEBUG = True  # Hardcoded for debugging
 
 
 def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
@@ -45,20 +45,20 @@ def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
         return  # Only log from specified rank
     
     if tensor is None:
-        logger.info(f"[DEBUG] {name}: None")
+        print(f"[DEBUG] {name}: None", flush=True)
         return
     
     with torch.no_grad():
         t = tensor.float()
         stats = {
             "shape": list(tensor.shape),
-            "mean": t.mean().item(),
-            "std": t.std().item(),
-            "min": t.min().item(),
-            "max": t.max().item(),
-            "abs_mean": t.abs().mean().item(),
+            "mean": f"{t.mean().item():.6f}",
+            "std": f"{t.std().item():.6f}",
+            "min": f"{t.min().item():.6f}",
+            "max": f"{t.max().item():.6f}",
+            "abs_mean": f"{t.abs().mean().item():.6f}",
         }
-    logger.info(f"[DEBUG] {name}: {stats}")
+    print(f"[DEBUG] {name}: {stats}", flush=True)
 
 
 def _get_n_parallel() -> int:
@@ -352,6 +352,19 @@ class RFD3DiffusionModule(nn.Module):
         
         # Run cross-attention transformer
         # Queries from A_I_chunk, Keys/Values from A_I, Bias from Z_II_chunk
+        if gpu_rank == 0:
+            with torch.no_grad():
+                print(
+                    "[DEBUG-DIFF] xattn input shapes:",
+                    {
+                        "A_I_full": list(A_I.shape),
+                        "A_I_chunk": list(A_I_chunk.shape),
+                        "Z_II_chunk": list(Z_II_chunk.shape),
+                        "world_size": world_size,
+                        "chunk_range": [start_i, end_i],
+                    },
+                    flush=True,
+                )
         A_I_chunk = self.diffusion_transformer.forward_cross_attn(
             A_I_chunk=A_I_chunk,                           # [B, I_par, c_token]
             S_I_chunk=S_I_chunk,                           # [I_par, c_s]
@@ -361,6 +374,7 @@ class RFD3DiffusionModule(nn.Module):
             f=f,
             X_L=X_L,                                       # [B, I, 3]
             query_start=start_i,                           # Global query start index
+            world_size=world_size,
         )                                                  # [B, I_par, c_token]
         
         # Gather chunks from all GPUs along token dimension (dim=1)
@@ -598,13 +612,35 @@ class RFD3DiffusionModule(nn.Module):
         
         # === Z_II contribution (if available) ===
         if Z_II is not None:
-            # Z_II is [I, I, c_z], need to gather for atom pairs
-            # tok_idx_q: [L_par], tok_idx_all: [L]
-            tok_idx_q = tok_idx[query_start:query_end]
-            processed_Z = self.diffusion_token_encoder.process_z(Z_II) if hasattr(self.diffusion_token_encoder, 'process_z') else Z_II
+            # Z_II may be [I, I, c_z] tensor OR StreamingZContainer
+            tok_idx_q = tok_idx[query_start:query_end]  # [L_par]
             
-            # Gather: Z_II[tok_idx_q, tok_idx_all, :] → [L_par, L, c_z]
-            Z_chunk = processed_Z[tok_idx_q][:, tok_idx]   # [L_par, L, c_z]
+            if isinstance(Z_II, StreamingZContainer):
+                # Streaming mode: compute Z chunk for these atoms' tokens
+                # Map atom indices to token indices
+                tok_q = tok_idx_q  # [L_par]
+                tok_all = tok_idx  # [L]
+                
+                # Get unique query tokens and their positions
+                unique_toks, inverse_idx = torch.unique(tok_q, return_inverse=True)
+                tok_start = unique_toks.min().item()
+                tok_end = unique_toks.max().item() + 1
+                
+                # Get fully processed Z for the token range
+                Z_tok_chunk = Z_II.get_chunk(tok_start, tok_end)  # [tok_range, I, c_z]
+                
+                # Map back to atom level: Z_chunk[l, m, :] = Z_tok_chunk[tok_q[l] - tok_start, tok_all[m], :]
+                tok_q_offset = tok_q - tok_start  # [L_par]
+                Z_chunk = Z_tok_chunk[tok_q_offset][:, tok_all]  # [L_par, L, c_z]
+                
+                # Process through linear layer
+                if hasattr(self.diffusion_token_encoder, 'process_z'):
+                    Z_chunk = self.diffusion_token_encoder.process_z(Z_chunk)
+            else:
+                # Standard mode: Z_II is [I, I, c_z] tensor
+                processed_Z = self.diffusion_token_encoder.process_z(Z_II) if hasattr(self.diffusion_token_encoder, 'process_z') else Z_II
+                # Gather: Z_II[tok_idx_q, tok_idx_all, :] → [L_par, L, c_z]
+                Z_chunk = processed_Z[tok_idx_q][:, tok_idx]   # [L_par, L, c_z]
             
             # Project to c_atompair if dimensions differ
             if Z_chunk.shape[-1] != c_atompair:

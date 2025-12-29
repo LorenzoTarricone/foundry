@@ -445,7 +445,78 @@ class StreamingZContainer:
             Z_chunk = Z_i + Z_j_chunk                    # [chunk, k, c_z]
             Z_pairs_list.append(Z_chunk)
         
-        return torch.cat(Z_pairs_list, dim=0)            # [L, k, c_z]
+        result = torch.cat(Z_pairs_list, dim=0)          # [L, k, c_z]
+        
+        # DIAGNOSTIC
+        import os
+        if os.environ.get("RFD3_PARALLEL_DEBUG", "0") == "1" or True:  # Hardcoded for now
+            print(f"[DEBUG-ENCODER] get_base_z_at_pairs output shape={list(result.shape)}, mean={result.mean().item():.6f}, std={result.std().item():.6f}", flush=True)
+        
+        return result
+    
+    def get_fully_processed_z_at_pairs(
+        self,
+        tok_queries: torch.Tensor,  # [L_par, k] token indices for queries
+        tok_keys: torch.Tensor,     # [L_par, k] token indices for keys
+    ) -> torch.Tensor:
+        """
+        Compute FULLY PROCESSED Z values at sparse (query, key) token pairs.
+        
+        Unlike get_base_z_at_pairs which only computes Z_i + Z_j, this method
+        computes the complete Z including RPE, token bonds, ref_pos, transformer
+        stack, and transitions - matching what get_chunk() returns.
+        
+        Strategy:
+        1. Find unique query token indices in tok_queries
+        2. Compute full Z chunk for those token rows via get_chunk()
+        3. Build a mapping from token index -> local row index
+        4. Use sparse indexing to extract Z[tok_queries, tok_keys]
+        
+        Args:
+            tok_queries: [L_par, k] token indices for query positions
+            tok_keys: [L_par, k] token indices for key positions
+            
+        Returns:
+            Z_pairs: [L_par, k, c_z] fully processed Z at sparse pairs
+        """
+        L_par, k = tok_queries.shape
+        device = tok_queries.device
+        
+        # Find unique query tokens and build mapping
+        unique_query_toks, inverse_indices = torch.unique(
+            tok_queries.flatten(), return_inverse=True
+        )
+        inverse_indices = inverse_indices.view(L_par, k)  # [L_par, k]
+        
+        # Find the range of unique tokens to compute chunk
+        tok_min = unique_query_toks.min().item()
+        tok_max = unique_query_toks.max().item()
+        
+        # Compute full Z chunk for this token range
+        # Z_chunk: [tok_max - tok_min + 1, I, c_z]
+        Z_chunk = self.get_chunk(tok_min, tok_max + 1)
+        
+        # Map query tokens to local chunk indices
+        local_query_indices = tok_queries - tok_min  # [L_par, k]
+        
+        # Gather Z values: Z_chunk[local_query_indices, tok_keys]
+        # Z_chunk shape: [I_par_chunk, I, c_z]
+        # We need: Z_pairs[l, n] = Z_chunk[local_query_indices[l,n], tok_keys[l,n], :]
+        
+        # Clamp indices to valid range
+        local_query_indices = torch.clamp(local_query_indices, 0, Z_chunk.shape[0] - 1)
+        tok_keys_clamped = torch.clamp(tok_keys, 0, Z_chunk.shape[1] - 1)
+        
+        # Vectorized gather using advanced indexing
+        # Flatten for easier indexing, then reshape
+        Z_pairs = Z_chunk[
+            local_query_indices.flatten(),
+            tok_keys_clamped.flatten()
+        ].view(L_par, k, self.c_z)
+        
+        print(f"[DEBUG-ENCODER] get_fully_processed_z_at_pairs output shape={list(Z_pairs.shape)}, mean={Z_pairs.mean().item():.6f}, std={Z_pairs.std().item():.6f}", flush=True)
+        
+        return Z_pairs
 
 
 class TokenInitializer(nn.Module):
@@ -1096,8 +1167,16 @@ class DiffusionTokenEncoder(nn.Module):
                     Beta_II=torch.tensor([0.0], device=device),
                 )                                          # [I_par, c_s]
                 S_I_chunk = S_I_chunk + block.s_transition(S_I_chunk)
+            
+            # CRITICAL: All-gather S_I_chunk to update keys for next block!
+            # In standard mode, S_I is updated in each iteration and used as both
+            # queries and keys in the next block. We must do the same here.
+            if world_size > 1:
+                S_I_unbatched = _all_gather_concat(S_I_chunk, dim=0)  # [I, c_s]
+            else:
+                S_I_unbatched = S_I_chunk
         
-        # Step 7: All-gather S_I chunks from all GPUs
+        # Step 7: All-gather S_I chunks from all GPUs (final)
         # Each GPU has [I_par, c_s], gather to get full [I, c_s]
         if world_size > 1:
             S_I = _all_gather_concat(S_I_chunk, dim=0)     # [I, c_s]

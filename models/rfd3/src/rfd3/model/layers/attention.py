@@ -4,6 +4,7 @@ from math import sqrt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from einops import rearrange
 from opt_einsum import contract as einsum
 from rfd3.model.layers.block_utils import (
@@ -668,6 +669,39 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
         raise ValueError(f"B must have 3 or 4 dims, got {B.ndim}")
     B_gathered = B_gathered.contiguous()
     
+    # Debug (rank 0 only, once per call site)
+    do_debug = (not dist.is_initialized()) or dist.get_rank() == 0
+    if do_debug:
+        with torch.no_grad():
+            def _stat(t):
+                return {
+                    "shape": list(t.shape),
+                    "mean": float(t.float().mean()),
+                    "std": float(t.float().std()),
+                    "min": float(t.float().min()),
+                    "max": float(t.float().max()),
+                }
+            def _pct(t):
+                try:
+                    qs = torch.tensor([0.01, 0.5, 0.99], device=t.device, dtype=torch.float32)
+                    vals = torch.quantile(t.float().flatten(), qs)
+                    return [float(v) for v in vals]
+                except Exception:
+                    return None
+            print(
+                "[DEBUG-ATTN] sparse_xattn inputs:",
+                {
+                    "Q": _stat(Q),
+                    "K_gathered": _stat(K_gathered),
+                    "V_gathered": _stat(V_gathered),
+                    "B_gathered": {
+                        **_stat(B_gathered),
+                        "pct_1_50_99": _pct(B_gathered),
+                    },
+                },
+                flush=True,
+            )
+    
     # Split into heads
     Q = Q.reshape(D, L_par, H, c // H)                           # [D, L_par, H, c//H]
     K_gathered = K_gathered.reshape(D, L_par, k, H, c // H)      # [D, L_par, k, H, c//H]
@@ -685,7 +719,31 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
     attn = torch.einsum("...ld,...lkd->...lk", Q, K_gathered)    # [D, H, L_par, k]
     attn = attn / sqrt(c // H)                                   # scale
     attn = attn + B_gathered                                     # add bias
+    if do_debug:
+        with torch.no_grad():
+            print(
+                "[DEBUG-ATTN] logits:",
+                {
+                    "mean": float(attn.float().mean()),
+                    "std": float(attn.float().std()),
+                    "min": float(attn.float().min()),
+                    "max": float(attn.float().max()),
+                },
+                flush=True,
+            )
     attn = torch.softmax(attn, dim=-1)                           # [D, H, L_par, k]
+    if do_debug:
+        with torch.no_grad():
+            print(
+                "[DEBUG-ATTN] softmax:",
+                {
+                    "mean": float(attn.float().mean()),
+                    "std": float(attn.float().std()),
+                    "min": float(attn.float().min()),
+                    "max": float(attn.float().max()),
+                },
+                flush=True,
+            )
     
     # Apply attention to values
     # attn: [D, H, L_par, k], V: [D, H, L_par, k, c//H]
@@ -699,6 +757,19 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
     # Merge heads
     attn_out = attn_out.permute(0, 2, 1, 3)                      # [D, L_par, H, c//H]
     attn_out = attn_out.reshape(D, L_par, c).contiguous()        # [D, L_par, c]
+    
+    if do_debug:
+        with torch.no_grad():
+            print(
+                "[DEBUG-ATTN] attn_out:",
+                {
+                    "mean": float(attn_out.float().mean()),
+                    "std": float(attn_out.float().std()),
+                    "min": float(attn_out.float().min()),
+                    "max": float(attn_out.float().max()),
+                },
+                flush=True,
+            )
     
     return attn_out
 

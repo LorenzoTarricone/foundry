@@ -13,7 +13,7 @@
 out_dir: "inference_outputs/design_demo_parallel"
 
 # Protein design parameters
-length: 70
+length: 30
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
