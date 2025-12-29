@@ -303,6 +303,10 @@ class RFD3DiffusionModule(nn.Module):
         """
         B = A_I.shape[0]
         I = A_I.shape[1]
+        device = A_I.device
+        
+        # Ensure diffusion transformer is on the correct device for this rank
+        self.diffusion_transformer.to(device)
         
         # Compute chunk ranges for all GPUs
         chunk_ranges = compute_chunk_ranges(I, world_size)
@@ -377,7 +381,11 @@ class RFD3DiffusionModule(nn.Module):
         """
         B = A_I.shape[0]
         L = Q_L.shape[1]
+        device = A_I.device
         tok_idx = f["atom_to_token_map"]                   # [L]
+        
+        # Ensure decoder is on the correct device for this rank
+        self.decoder.to(device)
         
         # Compute chunk ranges for atoms
         chunk_ranges = compute_chunk_ranges(L, world_size)
@@ -455,7 +463,13 @@ class RFD3DiffusionModule(nn.Module):
             o: Empty dict
         """
         L = Q_L.shape[1]
+        device = A_I.device
         tok_idx = f["atom_to_token_map"]                   # [L]
+        
+        # Ensure decoder and embedder are on the correct device for this rank
+        self.decoder.to(device)
+        if chunked_pairwise_embedder is not None:
+            chunked_pairwise_embedder.to(device)
         
         # Compute chunk range for this GPU
         chunk_ranges = compute_chunk_ranges(L, world_size)
@@ -617,6 +631,21 @@ class RFD3DiffusionModule(nn.Module):
             dict with X_L, sequence_indices_I, sequence_logits_I
         """
         # ... Collect inputs
+        # Ensure module and all inputs are on the same device for distributed processing
+        device = X_noisy_L.device
+        self.to(device)
+        
+        # Move input tensors to correct device
+        C_L = C_L.to(device)
+        S_I = S_I.to(device)
+        Q_L_init = Q_L_init.to(device)
+        t = t.to(device)
+        
+        # Move feature dict tensors to correct device
+        for key, val in f.items():
+            if isinstance(val, torch.Tensor):
+                f[key] = val.to(device)
+        
         tok_idx = f["atom_to_token_map"]                   # [L]
         L = len(tok_idx)
         I = tok_idx.max() + 1                              # Number of tokens
@@ -687,6 +716,18 @@ class RFD3DiffusionModule(nn.Module):
                 all_gather_fn=all_gather_concat,
                 world_size=world_size,
             )                                              # [B, L, c_atom]
+            
+            # Move all tensors and modules to this rank's device (Q_L is now on LOCAL_RANK's device)
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            local_device = torch.device(f"cuda:{local_rank}")
+            self.to(local_device)  # Move all sub-modules (downcast_q, etc.) to local device
+            tok_idx = tok_idx.to(local_device)
+            A_I = A_I.to(local_device)
+            S_I = S_I.to(local_device)
+            C_L = C_L.to(local_device)
+            X_noisy_L = X_noisy_L.to(local_device)
+            R_L_uniform = R_L_uniform.to(local_device)
+            t_L = t_L.to(local_device)
         elif chunked_pairwise_embedder is not None:
             # Low-memory mode: sparse P_LL but single GPU
             Q_L = self.encoder(

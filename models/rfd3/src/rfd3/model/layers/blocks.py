@@ -942,6 +942,9 @@ class LocalTokenTransformer(nn.Module):
         I = A_I_full.shape[1]
         device = A_I_chunk.device
         
+        # Ensure transformer blocks are on the correct device for this rank
+        self.to(device)
+        
         # Compute attention indices for the query chunk
         # indices specify which keys (from 0..I-1) each query should attend to
         indices_full = create_attention_indices(
@@ -1040,27 +1043,27 @@ class LocalAtomTransformer(nn.Module):
         # Compute max chunk size (for padding to ensure equal sizes for all_gather)
         max_L_par = (L + world_size - 1) // world_size  # Ceiling division
         
-        # This GPU's indices
-        indices_chunk = indices[:, query_start:query_end, :]  # [B, L_par, k]
-        
         import torch.distributed as dist
-        rank = dist.get_rank() if dist.is_initialized() else 0
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         device = torch.device(f"cuda:{local_rank}")
         
-        # Ensure all tensors are on the correct device for this rank
+        # Ensure all tensors are on the correct device for this rank BEFORE slicing
         Q_L = Q_L.to(device)
         C_L = C_L.to(device)
         indices = indices.to(device)
         
+        # This GPU's indices (slice AFTER moving to device)
+        indices_chunk = indices[:, query_start:query_end, :]  # [B, L_par, k]
+        
+        # Ensure encoder blocks and embedder are on the correct device for this rank
+        self.to(device)
+        if chunked_pairwise_embedder is not None:
+            chunked_pairwise_embedder.to(device)
+        
         for block_idx, block in enumerate(self.blocks):
-            print(f"[Rank {rank}] Encoder block {block_idx}: starting", flush=True)
-            
             # Extract this GPU's query chunk
             Q_L_chunk = Q_L[:, query_start:query_end, :]      # [B, L_par, c_atom]
             C_L_chunk = C_L[:, query_start:query_end, :]      # [B, L_par, c_atom]
-            
-            print(f"[Rank {rank}] Encoder block {block_idx}: computing P_sparse_chunk", flush=True)
             
             # Compute P_LL_sparse for THIS GPU's queries only
             # This is the key: [L_par, k, c] not [L, k, c]
@@ -1072,8 +1075,6 @@ class LocalAtomTransformer(nn.Module):
                 initializer_outputs=initializer_outputs,
             )                                                  # [B, L_par, k, c_pair]
             
-            print(f"[Rank {rank}] Encoder block {block_idx}: running cross-attention", flush=True)
-            
             # Sparse cross-attention: Q_L_chunk attends to sparse neighbors
             Q_L_chunk = block.forward_sparse_cross_attn(
                 Q_chunk=Q_L_chunk,                              # [B, L_par, c_atom]
@@ -1083,8 +1084,6 @@ class LocalAtomTransformer(nn.Module):
                 P_sparse_chunk=P_sparse_chunk,                  # [B, L_par, k, c_pair]
                 indices_chunk=indices_chunk,                    # [B, L_par, k]
             )                                                  # [B, L_par, c_atom]
-            
-            print(f"[Rank {rank}] Encoder block {block_idx}: all_gather", flush=True)
             
             # Pad to max_L_par for all_gather (NCCL requires equal sizes)
             if L_par < max_L_par:
@@ -1096,8 +1095,6 @@ class LocalAtomTransformer(nn.Module):
             
             # Trim back to actual L (remove padding) and ensure on correct device
             Q_L = Q_L_gathered[:, :L, :].to(device)  # [B, L, c_atom]
-            
-            print(f"[Rank {rank}] Encoder block {block_idx}: done", flush=True)
         
         return Q_L
 
@@ -1360,6 +1357,13 @@ class CompactStreamingDecoder(nn.Module):
         L = Q_L.shape[1]
         L_par = query_end - query_start                    # This GPU's chunk size
         
+        # Get the correct device for this rank
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+        
+        # Ensure decoder modules are on the correct device for this rank
+        self.to(device)
+        
         # Slice indices for this GPU's queries
         indices_chunk = indices[:, query_start:query_end, :]  # [B, L_par, k]
         
@@ -1447,6 +1451,15 @@ class CompactStreamingDecoder(nn.Module):
         L = Q_L.shape[1]
         L_par = query_end - query_start                    # This GPU's chunk size
         
+        # Get the correct device for this rank
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+        
+        # Ensure decoder modules and embedder are on the correct device for this rank
+        self.to(device)
+        if chunked_pairwise_embedder is not None:
+            chunked_pairwise_embedder.to(device)
+        
         # Run blocks
         for i in range(self.n_blocks):
             # Upcast: token → atom (operates on full, no L×L)
@@ -1459,11 +1472,14 @@ class CompactStreamingDecoder(nn.Module):
             # Compute SPARSE P_LL for this GPU's chunk only
             # Uses chunked_pairwise_embedder which computes P only for (L_par, k) pairs
             # indices_chunk tells which k neighbors each of the L_par atoms attends to
+            # NOTE: Pass FULL C_L (not chunked) because forward_chunked gathers keys from any atom
             P_sparse_chunk = chunked_pairwise_embedder.forward_chunked(
-                indices=indices_chunk,                      # [B, L_par, k]
                 f=f,
-                initializer_outputs=initializer_outputs,
-                query_start=query_start,                    # Offset for feature indexing
+                indices=indices_chunk,                      # [B, L_par, k]
+                C_L=initializer_outputs["C_L"],             # [L, c_atom] - FULL, not chunked
+                Z_init_II=initializer_outputs["Z_II"],      # [I, I, c_z] or StreamingZContainer
+                tok_idx=f["atom_to_token_map"],             # [L]
+                query_start=query_start,                    # Offset for parallel mode
             )                                              # [B, L_par, k, c_atompair]
             
             # Sparse cross-attention: Q_L_chunk queries attend to sparse K/V

@@ -191,10 +191,11 @@ class ChunkedPairwiseEmbedder(nn.Module):
     def forward_chunked(
         self,
         f: dict,
-        indices: torch.Tensor,  # [B, L, k] - sparse attention indices
-        C_L: torch.Tensor,  # [B, L, c_token] - atom features
+        indices: torch.Tensor,  # [B, L, k] or [B, L_par, k] - sparse attention indices
+        C_L: torch.Tensor,  # [L, c_token] or [B, L, c_token] - atom features (FULL)
         Z_init_II: torch.Tensor,  # [I, I, c_z] - token pair features
-        tok_idx: torch.Tensor,  # [L] - atom to token mapping
+        tok_idx: torch.Tensor,  # [L] - atom to token mapping (FULL)
+        query_start: int = 0,  # Offset for parallel mode: which atoms indices correspond to
     ) -> torch.Tensor:
         # Add logging for chunked P_LL computation
         import logging
@@ -208,47 +209,65 @@ class ChunkedPairwiseEmbedder(nn.Module):
         
         Args:
             f: Feature dictionary
-            indices: Sparse attention indices [B, L, k]
-            C_L: Atom-level features [B, L, c_token]
-            Z_init_II: Token-level pair features [I, I, c_z]
-            tok_idx: Atom to token mapping [L]
+            indices: Sparse attention indices [B, L_par, k] (may be chunked in parallel mode)
+            C_L: Atom-level features [L, c_token] (FULL - needed for key gathering)
+            Z_init_II: Token-level pair features [I, I, c_z] or StreamingZContainer
+            tok_idx: Atom to token mapping [L] (FULL)
+            query_start: Offset for query positions (0 for non-parallel, query_start for parallel)
             
         Returns:
-            P_LL_sparse: Sparse pairwise features [B, L, k, c_atompair]
+            P_LL_sparse: Sparse pairwise features [B, L_par, k, c_atompair]
         """
-        B, L, k = indices.shape
+        B, L_par, k = indices.shape  # L_par may be < L in parallel mode
         device = indices.device
+        
+        # Ensure embedder modules are on the correct device
+        self.to(device)
+        
+        # Move input tensors to correct device
+        C_L = C_L.to(device)
+        tok_idx = tok_idx.to(device)
+        # Move feature dict tensors to correct device
+        for key, val in f.items():
+            if isinstance(val, torch.Tensor):
+                f[key] = val.to(device)
 
-        # Initialize sparse P_LL
+        # Initialize sparse P_LL for this chunk
         P_LL_sparse = torch.zeros(
-            B, L, k, self.c_atompair, device=device, dtype=C_L.dtype
+            B, L_par, k, self.c_atompair, device=device, dtype=C_L.dtype
         )
+        
+        # Compute query end for this chunk
+        query_end = query_start + L_par
 
         # Handle both batched and non-batched C_L
         if C_L.dim() == 2:  # [L, c_token] - add batch dimension
             C_L = C_L.unsqueeze(0)  # [1, L, c_token]
         # Add bounds checking to prevent index errors
-        L_max = C_L.shape[1]
+        L_full = C_L.shape[1]  # Full length (may differ from L_par in parallel mode)
         valid_indices = torch.clamp(
-            indices, 0, L_max - 1
+            indices, 0, L_full - 1
         )  # Clamp indices to valid range
 
         # Ensure indices have the right shape for gathering
-        if valid_indices.dim() == 2:  # [L, k] - add batch dimension
+        if valid_indices.dim() == 2:  # [L_par, k] - add batch dimension
             valid_indices = valid_indices.unsqueeze(0).expand(
                 C_L.shape[0], -1, -1
-            )  # [B, L, k]
+            )  # [B, L_par, k]
 
         # 1. Motif position embedding (if exists)
         if self.motif_pos_embedder is not None and "motif_pos" in f:
-            motif_pos = f["motif_pos"]  # [L, 3]
-            is_motif = f["is_motif_atom_with_fixed_coord"]  # [L]
+            motif_pos = f["motif_pos"]  # [L_full, 3]
+            is_motif = f["is_motif_atom_with_fixed_coord"]  # [L_full]
             is_motif_idx = torch.where(is_motif)[0]
-            # For each query position
-            for l in is_motif_idx:
-                key_indices = valid_indices[:, l, :]  # [B, k] - use clamped indices
+            # Filter to only query positions in this chunk
+            is_motif_idx = is_motif_idx[(is_motif_idx >= query_start) & (is_motif_idx < query_end)]
+            # For each query position in this chunk
+            for l_global in is_motif_idx:
+                l_local = l_global - query_start  # Local index in chunk
+                key_indices = valid_indices[:, l_local, :]  # [B, k] - use clamped indices
                 key_pos = motif_pos[key_indices]  # [B, k, 3]
-                query_pos = motif_pos[l].unsqueeze(0).expand(B, -1)  # [B, 3]
+                query_pos = motif_pos[l_global].unsqueeze(0).expand(B, -1)  # [B, 3]
 
                 # Valid mask: both query and keys must be motif
                 key_is_motif = is_motif[key_indices]  # [B, k]
@@ -258,24 +277,27 @@ class ChunkedPairwiseEmbedder(nn.Module):
                     motif_pairs = self.motif_pos_embedder.compute_pairs_chunked(
                         query_pos, key_pos, valid_mask
                     )
-                    P_LL_sparse[:, l, :, :] += motif_pairs
+                    P_LL_sparse[:, l_local, :, :] += motif_pairs
 
         # 2. Reference position embedding (if exists)
         if self.ref_pos_embedder is not None and "ref_pos" in f:
-            ref_pos = f["ref_pos"]  # [L, 3]
-            ref_space_uid = f["ref_space_uid"]  # [L]
-            is_motif_seq = f["is_motif_atom_with_fixed_seq"]  # [L]
+            ref_pos = f["ref_pos"]  # [L_full, 3]
+            ref_space_uid = f["ref_space_uid"]  # [L_full]
+            is_motif_seq = f["is_motif_atom_with_fixed_seq"]  # [L_full]
             is_motif_seq_idx = torch.where(is_motif_seq)[0]
-            for l in is_motif_seq_idx:
-                key_indices = valid_indices[:, l, :]  # [B, k] - use clamped indices
+            # Filter to only query positions in this chunk
+            is_motif_seq_idx = is_motif_seq_idx[(is_motif_seq_idx >= query_start) & (is_motif_seq_idx < query_end)]
+            for l_global in is_motif_seq_idx:
+                l_local = l_global - query_start  # Local index in chunk
+                key_indices = valid_indices[:, l_local, :]  # [B, k] - use clamped indices
                 key_pos = ref_pos[key_indices]  # [B, k, 3]
-                query_pos = ref_pos[l].unsqueeze(0).expand(B, -1)  # [B, 3]
+                query_pos = ref_pos[l_global].unsqueeze(0).expand(B, -1)  # [B, 3]
 
                 # Valid mask: same token and both have sequence
                 key_space_uid = ref_space_uid[key_indices]  # [B, k]
                 key_is_motif_seq = is_motif_seq[key_indices]  # [B, k]
 
-                same_token = key_space_uid == ref_space_uid[l]  # [B, k]
+                same_token = key_space_uid == ref_space_uid[l_global]  # [B, k]
                 valid_mask = (
                     (same_token & key_is_motif_seq).unsqueeze(-1).float()
                 )  # [B, k, 1]
@@ -284,45 +306,55 @@ class ChunkedPairwiseEmbedder(nn.Module):
                     ref_pairs = self.ref_pos_embedder.compute_pairs_chunked(
                         query_pos, key_pos, valid_mask
                     )
-                    P_LL_sparse[:, l, :, :] += ref_pairs
+                    P_LL_sparse[:, l_local, :, :] += ref_pairs
 
         # 3. Single embedding terms (broadcasted)
-        # Expand C_L to match valid_indices batch dimension
+        # Expand C_L to match batch dimension
         if C_L.shape[0] != B:
-            C_L = C_L.expand(B, -1, -1)  # [B, L, c_token]
-        # Gather key features for each query
-        C_L_queries = C_L.unsqueeze(2).expand(-1, -1, k, -1)  # [B, L, k, c_token]
+            C_L = C_L.expand(B, -1, -1)  # [B, L_full, c_token]
+        
+        # Get C_L for query positions in this chunk
+        C_L_query_chunk = C_L[:, query_start:query_end, :]  # [B, L_par, c_token]
+        
+        # Expand for sparse attention: [B, L_par, k, c_token]
+        C_L_queries = C_L_query_chunk.unsqueeze(2).expand(-1, -1, k, -1)  # [B, L_par, k, c_token]
+        
+        # Gather key features using sparse indices (indices point into full C_L)
+        C_L_expanded = C_L.unsqueeze(2).expand(-1, -1, k, -1)  # [B, L_full, k, c_token]
         C_L_keys = torch.gather(
-            C_L_queries,
+            C_L_expanded,
             1,
             valid_indices.unsqueeze(-1).expand(-1, -1, -1, C_L.shape[-1]),
-        )  # [B, L, k, c_token]
+        )  # [B, L_par, k, c_token]
 
         # Add single embeddings - match standard implementation structure
-        # Standard does: self.process_single_l(C_L).unsqueeze(-2) + self.process_single_m(C_L).unsqueeze(-3)
-        # We need to broadcast from [B, L, k, c_atompair] to match this
-        single_l = self.process_single_l(C_L_queries)  # [B, L, k, c_atompair]
-        single_m = self.process_single_m(C_L_keys)  # [B, L, k, c_atompair]
+        single_l = self.process_single_l(C_L_queries)  # [B, L_par, k, c_atompair]
+        single_m = self.process_single_m(C_L_keys)  # [B, L_par, k, c_atompair]
         P_LL_sparse += single_l + single_m
 
         # 4. Token pair features Z_init_II
         # Map atoms to tokens and gather token pair features
         # Handle tok_idx dimensions properly
-        if tok_idx.dim() == 1:  # [L] - add batch dimension for consistency
-            tok_idx_expanded = tok_idx.unsqueeze(0)  # [1, L]
+        if tok_idx.dim() == 1:  # [L_full] - add batch dimension for consistency
+            tok_idx_expanded = tok_idx.unsqueeze(0)  # [1, L_full]
         else:
             tok_idx_expanded = tok_idx
 
-        # Expand tok_idx_expanded to match valid_indices batch dimension
+        # Expand tok_idx_expanded to match batch dimension
         if tok_idx_expanded.shape[0] != B:
-            tok_idx_expanded = tok_idx_expanded.expand(B, -1)  # [B, L]
-        tok_queries = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)  # [B, L, k]
-        # Use valid_indices for token mapping as well
-        tok_keys = torch.gather(tok_queries, 1, valid_indices)  # [B, L, k]
+            tok_idx_expanded = tok_idx_expanded.expand(B, -1)  # [B, L_full]
+        
+        # Get token indices for query positions in this chunk
+        tok_idx_query_chunk = tok_idx_expanded[:, query_start:query_end]  # [B, L_par]
+        tok_queries = tok_idx_query_chunk.unsqueeze(2).expand(-1, -1, k)  # [B, L_par, k]
+        
+        # Get token indices for key positions using sparse indices
+        tok_idx_full_expanded = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)  # [B, L_full, k]
+        tok_keys = torch.gather(tok_idx_full_expanded, 1, valid_indices)  # [B, L_par, k]
 
         # Gather Z_init_II[tok_queries, tok_keys] with safe indexing
         # Z_init_II shape is [I, I, c_z] (3D), not 4D (or StreamingZContainer)
-        # tok_queries shape: [B, L, k] - each value is a token index
+        # tok_queries shape: [B, L_par, k] - each value is a token index
         # We want: Z_init_II[tok_queries[d,l,k], tok_keys[d,l,k], :] for all d,l,k
 
         # Import here to avoid circular import
@@ -334,22 +366,22 @@ class ChunkedPairwiseEmbedder(nn.Module):
             I_z = Z_init_II.I
             
             Z_pairs_processed = torch.zeros(
-                B, L, k, self.c_atompair, device=device, dtype=C_L.dtype
+                B, L_par, k, self.c_atompair, device=device, dtype=C_L.dtype
             )
             
             for b in range(B):
-                tq = tok_queries[b]  # [L, k]
-                tk = tok_keys[b]    # [L, k]
+                tq = tok_queries[b]  # [L_par, k]
+                tk = tok_keys[b]    # [L_par, k]
                 
                 # Clamp indices to valid range
                 tq = torch.clamp(tq, 0, I_z - 1)
                 tk = torch.clamp(tk, 0, I_z - 1)
                 
                 # Get base Z at sparse pairs (Z_i + Z_j only)
-                Z_pairs_base = Z_init_II.get_base_z_at_pairs(tq, tk)  # [L, k, c_z]
+                Z_pairs_base = Z_init_II.get_base_z_at_pairs(tq, tk)  # [L_par, k, c_z]
                 
                 # Process through linear layer
-                Z_pairs_processed[b] = self.process_z(Z_pairs_base)  # [L, k, c_atompair]
+                Z_pairs_processed[b] = self.process_z(Z_pairs_base)  # [L_par, k, c_atompair]
         else:
             # Standard mode: full Z tensor available
             I_z, I_z2, c_z = Z_init_II.shape
@@ -367,13 +399,13 @@ class ChunkedPairwiseEmbedder(nn.Module):
             # Then we need to gather the sparse version
 
             Z_pairs_processed = torch.zeros(
-                B, L, k, self.c_atompair, device=device, dtype=Z_processed.dtype
+                B, L_par, k, self.c_atompair, device=device, dtype=Z_processed.dtype
             )
 
             for b in range(B):
                 # For this batch, get the token queries and keys
-                tq = tok_queries[b]  # [L, k]
-                tk = tok_keys[b]  # [L, k]
+                tq = tok_queries[b]  # [L_par, k]
+                tk = tok_keys[b]  # [L_par, k]
 
                 # Ensure indices are within bounds
                 tq = torch.clamp(tq, 0, I_z - 1)
@@ -420,10 +452,20 @@ class ChunkedPairwiseEmbedder(nn.Module):
         k = indices_chunk.shape[2]
         device = indices_chunk.device
         
-        # Get full data from initializer_outputs
+        # Ensure embedder modules are on the correct device for this rank
+        self.to(device)
+        
+        # Get full data from initializer_outputs and move to correct device
         tok_idx = f.get("atom_to_token_map", initializer_outputs.get("tok_idx"))
+        if tok_idx is not None:
+            tok_idx = tok_idx.to(device)
         Z_init_II = initializer_outputs.get("Z_II", initializer_outputs.get("Z_init_II"))
+        # Note: Z_init_II may be a StreamingZContainer, not a tensor
+        if Z_init_II is not None and hasattr(Z_init_II, 'to'):
+            Z_init_II = Z_init_II.to(device)
         C_L = initializer_outputs.get("C_L")
+        if C_L is not None:
+            C_L = C_L.to(device)
         
         # Get dtype from available tensor
         dtype = C_L.dtype if C_L is not None else torch.bfloat16

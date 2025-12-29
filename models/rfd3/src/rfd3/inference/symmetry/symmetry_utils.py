@@ -333,15 +333,18 @@ def apply_symmetry_to_xyz_atomwise(X_L, sym_feats, partial_diffusion=False):
     Returns:
         X_L: [B, L, 3] xyz coordinates with symmetry applied
     """
-    sym_entity_id = sym_feats["sym_entity_id"]
-    sym_transform_id = sym_feats["sym_transform_id"]
-    is_sym_asu = sym_feats["is_sym_asu"]
+    device = X_L.device
+    
+    # Move sym_feats tensors to the same device as X_L
+    sym_entity_id = sym_feats["sym_entity_id"].to(device)
+    sym_transform_id = sym_feats["sym_transform_id"].to(device)
+    is_sym_asu = sym_feats["is_sym_asu"].to(device)
     fixed_motif_mask = sym_entity_id == FIXED_ENTITY_ID
     sym_transforms = {
-        int(k): v
+        int(k): (v[0].to(device), v[1].to(device))
         for k, v in sym_feats["sym_transform"].items()
         if int(k) != FIXED_TRANSFORM_ID
-    }  # {str(id): tensor(3,3)} -> {int(id): tensor(3,3)}
+    }  # {str(id): (tensor(3,3), tensor(3,))} -> {int(id): (tensor(3,3), tensor(3,))}
     # COM correction (in case there is drift)
     if not partial_diffusion:
         X_L[:, ~fixed_motif_mask, :] = X_L[:, ~fixed_motif_mask, :] - X_L[

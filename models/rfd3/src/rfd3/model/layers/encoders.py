@@ -240,6 +240,29 @@ class StreamingZContainer:
         Returns:
             Z_chunk: [I_par, I, c_z] pair features for query chunk
         """
+        # Ensure all stored tensors/modules are on this rank's device
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+        self.S_I = self.S_I.to(device)
+        self.Z_j = self.Z_j.to(device)
+        self.to_z_init_i.to(device)
+        self.token_bonds = self.token_bonds.to(device)
+        self.ref_pos = self.ref_pos.to(device)
+        self.ref_space_uid = self.ref_space_uid.to(device)
+        self.process_token_bonds.to(device)
+        self.rpe_module.to(device)
+        self.rpe_module2.to(device)
+        self.ref_pos_embedder.to(device)
+        self.process_z_init.to(device)
+        for block in self.transformer_stack:
+            block.to(device)
+        for mod in self.transition_modules:
+            mod.to(device)
+        # Move feature dict tensors to correct device
+        for key, val in self.f.items():
+            if isinstance(val, torch.Tensor):
+                self.f[key] = val.to(device)
+        
         I_par = end_i - start_i
         I = self.I
         qs = slice(start_i, end_i)
@@ -397,6 +420,12 @@ class StreamingZContainer:
         """
         L = tok_queries.shape[0]
         k = tok_queries.shape[1] if tok_queries.dim() > 1 else 1
+        device = tok_queries.device
+        
+        # Ensure stored tensors and modules are on the correct device
+        S_I = self.S_I.to(device)
+        Z_j = self.Z_j.to(device)
+        self.to_z_init_i.to(device)
         
         # Process in chunks to avoid OOM
         Z_pairs_list = []
@@ -406,14 +435,14 @@ class StreamingZContainer:
             tk_chunk = tok_keys[start:end]               # [chunk, k]
             
             # Z_i: query projection at tok_queries
-            S_queries = self.S_I[tq_chunk]               # [chunk, k, c_s]
+            S_queries = S_I[tq_chunk]                    # [chunk, k, c_s]
             Z_i = self.to_z_init_i(S_queries)            # [chunk, k, c_z]
             
             # Z_j: key projection at tok_keys  
-            Z_j = self.Z_j[tk_chunk]                     # [chunk, k, c_z]
+            Z_j_chunk = Z_j[tk_chunk]                    # [chunk, k, c_z]
             
             # Base Z = Z_i + Z_j
-            Z_chunk = Z_i + Z_j                          # [chunk, k, c_z]
+            Z_chunk = Z_i + Z_j_chunk                    # [chunk, k, c_z]
             Z_pairs_list.append(Z_chunk)
         
         return torch.cat(Z_pairs_list, dim=0)            # [L, k, c_z]
@@ -605,6 +634,9 @@ class TokenInitializer(nn.Module):
         """
         device = tok_idx.device
         dtype = self.to_z_init_i.weight.dtype
+        
+        # Ensure TokenInitializer modules are on the correct device for this rank
+        self.to(device)
         
         # ============================================================
         # Step 1: Compute S_I (single token features) - no I×I here
@@ -927,6 +959,9 @@ class DiffusionTokenEncoder(nn.Module):
         I = Z_streaming.I
         device = R_L.device
         dtype = R_L.dtype
+        
+        # Ensure encoder modules are on the correct device for this rank
+        self.to(device)
         
         # Get this GPU's query range
         gpu_start, gpu_end = Z_streaming.get_gpu_query_range()

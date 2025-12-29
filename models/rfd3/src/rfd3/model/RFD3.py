@@ -104,6 +104,10 @@ class RFD3(nn.Module):
         n_cycle=None,
         **_,
     ) -> dict:
+        # Ensure model is on the same device as input (for distributed processing)
+        device = coord_atom_lvl_to_be_noised.device if coord_atom_lvl_to_be_noised is not None else input["f"]["restype"].device
+        self.to(device)
+        
         initializer_outputs = self.token_initializer(input["f"])
 
         if self.training:

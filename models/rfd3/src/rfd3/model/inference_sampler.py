@@ -7,6 +7,7 @@ from typing import Any, Literal, Optional, Tuple, List
 import torch
 import torch.distributed as dist
 from jaxtyping import Float
+from tqdm import tqdm
 from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 from rfd3.model.cfg_utils import strip_X
 
@@ -344,9 +345,17 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
         threshold_step = (len(noise_schedule) - 1) * self.fraction_of_steps_to_fix_motif
 
-        for step_num, (c_t_minus_1, c_t) in enumerate(
-            zip(noise_schedule, noise_schedule[1:])
-        ):
+        # Only show progress bar on rank 0 to avoid duplicate output
+        is_main_rank = not dist.is_initialized() or dist.get_rank() == 0
+        num_steps = len(noise_schedule) - 1
+        pbar = tqdm(
+            enumerate(zip(noise_schedule, noise_schedule[1:])),
+            total=num_steps,
+            desc="Sampling",
+            disable=not is_main_rank,
+        )
+        
+        for step_num, (c_t_minus_1, c_t) in pbar:
             # Assert no grads on X_L
             assert not torch.is_grad_enabled(), "Computation graph should not be active"
             assert not X_L.requires_grad, "X_L should not require gradients"
@@ -368,6 +377,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
             # Compute the value of t_hat
             t_hat = c_t_minus_1 * (gamma + 1)
+            
+            # Update progress bar with current noise level
+            if is_main_rank:
+                t_val = t_hat.item() if isinstance(t_hat, torch.Tensor) else t_hat
+                pbar.set_postfix({"t": f"{t_val:.3f}"})
 
             # Noise the coordinates with scaled Gaussian noise
             epsilon_L = (
@@ -649,12 +663,31 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         ranked_logger.info(f"gamma_min_sym: {gamma_min_sym}")
         ranked_logger.info(f"gamma_min: {self.gamma_min}")
         
-        for step_num, (c_t_minus_1, c_t) in enumerate(
-            zip(noise_schedule, noise_schedule[1:])
-        ):
+        # Only show progress bar on rank 0 to avoid duplicate output
+        is_main_rank = not dist.is_initialized() or dist.get_rank() == 0
+        num_steps = len(noise_schedule) - 1
+        pbar = tqdm(
+            enumerate(zip(noise_schedule, noise_schedule[1:])),
+            total=num_steps,
+            desc="Sampling",
+            disable=not is_main_rank,
+        )
+        
+        for step_num, (c_t_minus_1, c_t) in pbar:
             # Assert no grads on X_L
             assert not torch.is_grad_enabled(), "Computation graph should not be active"
             assert not X_L.requires_grad, "X_L should not require gradients"
+            
+            # Ensure all tensors are on the same device as X_L (for multi-GPU)
+            # In single-GPU mode, all tensors are already on cuda:0
+            # In multi-GPU mode, after parallel processing, X_L ends up on the local device
+            # but tensors computed at the start (noise_schedule, gamma_min_sym) remain on cuda:0
+            device = X_L.device
+            c_t_minus_1 = c_t_minus_1.to(device) if isinstance(c_t_minus_1, torch.Tensor) else torch.tensor(c_t_minus_1, device=device)
+            c_t = c_t.to(device) if isinstance(c_t, torch.Tensor) else torch.tensor(c_t, device=device)
+            gamma_min_sym = gamma_min_sym.to(device) if isinstance(gamma_min_sym, torch.Tensor) else torch.tensor(gamma_min_sym, device=device)
+            coord_atom_lvl_to_be_noised = coord_atom_lvl_to_be_noised.to(device)
+            is_motif_atom_with_fixed_coord = is_motif_atom_with_fixed_coord.to(device)
 
             # Apply a random rotation and translation to the structure
             if self.allow_realignment:
@@ -670,6 +703,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
             # Compute the value of t_hat
             t_hat = c_t_minus_1 * (gamma + 1)
+            
+            # Update progress bar with current noise level
+            if is_main_rank:
+                t_val = t_hat.item() if isinstance(t_hat, torch.Tensor) else t_hat
+                pbar.set_postfix({"t": f"{t_val:.3f}"})
 
             # Noise the coordinates with scaled Gaussian noise
             epsilon_L = (
@@ -737,6 +775,12 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 outs["X_L"] = self.apply_symmetry_to_X_L(outs["X_L"], f)
 
             X_denoised_L = outs["X_L"] if "X_L" in outs else outs  # [D, L, 3]
+
+            # Ensure all tensors are on the same device as X_denoised_L (for multi-GPU)
+            device = X_denoised_L.device
+            X_noisy_L = X_noisy_L.to(device)
+            t_hat = t_hat.to(device)
+            c_t = c_t.to(device) if isinstance(c_t, torch.Tensor) else torch.tensor(c_t, device=device)
 
             # Compute the delta between the noisy and denoised coordinates
             delta_L = (X_noisy_L - X_denoised_L) / t_hat   # [D, L, 3]
