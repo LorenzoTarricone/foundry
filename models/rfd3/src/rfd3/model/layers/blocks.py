@@ -29,6 +29,7 @@ from rfd3.model.layers.layer_utils import (
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
 from rfd3.model.layers.streaming import compute_chunk_ranges
+from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log
 from torch.nn.functional import one_hot
 
 logger = logging.getLogger(__name__)
@@ -41,23 +42,8 @@ def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
     """Log tensor statistics for debugging."""
     if not PARALLEL_DEBUG:
         return
-    if dist.is_initialized() and dist.get_rank() != rank:
-        return
-    
-    if tensor is None:
-        print(f"[DEBUG-BLOCKS] {name}: None", flush=True)
-        return
-    
-    with torch.no_grad():
-        t = tensor.float()
-        stats = {
-            "shape": list(tensor.shape),
-            "mean": f"{t.mean().item():.6f}",
-            "std": f"{t.std().item():.6f}",
-            "min": f"{t.min().item():.6f}",
-            "max": f"{t.max().item():.6f}",
-        }
-    print(f"[DEBUG-BLOCKS] {name}: {stats}", flush=True)
+    # Use centralized debug context for consistent formatting
+    debug_tensor("BLOCKS", name, tensor, rank)
 
 from foundry import DISABLE_CHECKPOINTING
 from foundry.common import exists
@@ -446,12 +432,12 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             2 * self.num_tok_pos_bins + (2 * self.s_max + 2) + 1, c_z
         )
         self.chunk_size = None
-        # If attention parallel is enabled, stream RPE computation to avoid full LxL materialization
-        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
-        if attn_parallel is not None:
-            n_parallel = max(int(attn_parallel), 1)
-            # will be set at runtime based on L to keep chunks ~L/n_parallel
-            self.chunk_size = n_parallel
+        # If attention parallel is enabled (=1), stream RPE computation to avoid full LxL materialization
+        # GPU count is auto-detected from dist.get_world_size() at runtime
+        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+        if attn_parallel == "1":
+            # Marker that chunking is enabled; actual chunk count determined at runtime
+            self.chunk_size = -1  # Will use dist.get_world_size() in _forward_chunked
 
     def forward(self, f):
         if self.chunk_size is None:
@@ -531,8 +517,10 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
 
     def _forward_chunked(self, f):
         # Stream over query dimension to avoid holding full LxL intermediates
+        import torch.distributed as dist
         L = f["asym_id"].shape[0]
-        n_parallel = max(self.chunk_size, 1)
+        # Get GPU count from distributed runtime (self.chunk_size=-1 is just a marker)
+        n_parallel = dist.get_world_size() if dist.is_initialized() else 1
         chunk = max(1, (L + n_parallel - 1) // n_parallel)
         device = f["asym_id"].device
 
@@ -1012,8 +1000,8 @@ class LocalTokenTransformer(nn.Module):
             # Debug: log gather layout once (block 0, rank 0)
             if block_idx == 0 and rank == 0:
                 lens_py = [int(l.item()) for l in lens]
-                print(f"[DEBUG-BLOCKS] gather lens={lens_py}, max_len={max_len}, "
-                      f"concat_len={sum(lens_py)}, chunk_ranges={chunk_ranges}", flush=True)
+                debug_log("BLOCKS", "gather",
+                          f"lens={lens_py}, max_len={max_len}, concat_len={sum(lens_py)}, chunk_ranges={chunk_ranges}")
             return torch.cat(trimmed, dim=1)
         
         def _compute_indices_chunk(start: int, end: int) -> torch.Tensor:
@@ -1031,9 +1019,7 @@ class LocalTokenTransformer(nn.Module):
             return chunk.unsqueeze(0).expand(B, -1, -1) if chunk.ndim == 2 else chunk
         
         def _slice_Z_chunk(z_source, start: int, end: int):
-            # Handles both tensor and StreamingZContainer
-            if hasattr(z_source, "get_chunk"):
-                return z_source.get_chunk(start, end)  # [I_par, I, c_z]
+            # Z_source is a tensor: either [I, I, c_z] (full) or [I_par, I, c_z] (chunked)
             if z_source.ndim == 3:
                 # If already chunked (e.g., [I_par, I, c_z]), return as-is
                 if z_source.shape[0] == (end - start):
@@ -1065,7 +1051,7 @@ class LocalTokenTransformer(nn.Module):
                             "max": float(t.float().max()),
                         }
                     print(
-                        f"[DEBUG-BLOCKS] block{block_idx} pre_attn:",
+                        f"{debug_ctx.prefix('BLOCKS')} block{block_idx} pre_attn:",
                         {
                             "A_I_chunk": _stat(A_I_chunk),
                             "A_I_full": _stat(A_I_full),
@@ -1096,10 +1082,9 @@ class LocalTokenTransformer(nn.Module):
             Z_local_chunk = _slice_Z_chunk(Z_chunk, query_start, query_end)
             
             if block_idx == 0 and rank == 0:
-                print(f"[DEBUG-BLOCKS] post-gather block0: A_I_full.shape={list(A_I_full.shape)}, "
-                      f"slice=({query_start},{query_end}), "
-                      f"indices_chunk.shape={list(indices_chunk.shape)}, "
-                      f"Z_local_chunk.shape={list(Z_local_chunk.shape)}", flush=True)
+                debug_log("BLOCKS", "post-gather block0",
+                          f"A_I_full.shape={list(A_I_full.shape)}, slice=({query_start},{query_end}), "
+                          f"indices_chunk.shape={list(indices_chunk.shape)}, Z_local_chunk.shape={list(Z_local_chunk.shape)}")
             if rank == 0:
                 with torch.no_grad():
                     def _stat(t):
@@ -1111,7 +1096,7 @@ class LocalTokenTransformer(nn.Module):
                             "max": float(t.float().max()),
                         }
                     print(
-                        f"[DEBUG-BLOCKS] block{block_idx} post_attn:",
+                        f"{debug_ctx.prefix('BLOCKS')} block{block_idx} post_attn:",
                         {
                             "A_I_chunk": _stat(A_I_chunk),
                             "A_I_full": _stat(A_I_full),
@@ -1625,7 +1610,7 @@ class CompactStreamingDecoder(nn.Module):
                 f=f,
                 indices=indices_chunk,                      # [B, L_par, k]
                 C_L=initializer_outputs["C_L"],             # [L, c_atom] - FULL, not chunked
-                Z_init_II=initializer_outputs["Z_II"],      # [I, I, c_z] or StreamingZContainer
+                Z_init_II=initializer_outputs["Z_II"],      # [I, I, c_z] (full) or [I_par, I, c_z] (chunked)
                 tok_idx=f["atom_to_token_map"],             # [L]
                 query_start=query_start,                    # Offset for parallel mode
             )                                              # [B, L_par, k, c_atompair]

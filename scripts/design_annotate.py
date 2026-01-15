@@ -37,6 +37,26 @@ import threading
 import yaml
 
 import torch
+import random
+import numpy as np
+
+
+def set_seed(seed: int = 42):
+    """
+    Set random seed for reproducibility across all random number generators.
+    
+    Args:
+        seed: Random seed value (default: 42)
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # For deterministic behavior (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    print(f"Random seed set to: {seed}")
 
 
 def load_config(config_path: str) -> dict:
@@ -177,11 +197,14 @@ def run_design(
     use_wandb: bool = False,
     wandb_project: str = "fast-rfd3",
     wandb_run_name: str = None,
+    seed: int = 42,
     **kwargs  # Ignore unknown config keys
 ):
     """
     Run RFD3 design + MPNN annotation pipeline.
     """
+    # Set random seed for reproducibility
+    set_seed(seed)
     # Add paths for local imports
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
@@ -409,12 +432,19 @@ python scripts/design_annotate.py --length 100 --num_designs 4
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
     
+    # Reproducibility
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility (default: 42, or from config file)")
+    
     args = parser.parse_args()
     
     # Load config and merge with CLI args
     if args.config:
         config = load_config(args.config)
         params = merge_config_with_args(config, args)
+        # Ensure seed has a default value (config takes precedence, then CLI, then 42)
+        if 'seed' not in params or params.get('seed') is None:
+            params['seed'] = args.seed if args.seed is not None else 42
     else:
         # Use CLI args only with defaults (matching design_annotate.py)
         params = {
@@ -429,6 +459,7 @@ python scripts/design_annotate.py --length 100 --num_designs 4
             'use_wandb': args.use_wandb or False,
             'wandb_project': args.wandb_project or "fast-rfd3",
             'wandb_run_name': args.wandb_run_name,
+            'seed': args.seed,
         }
     
     run_design(**params)

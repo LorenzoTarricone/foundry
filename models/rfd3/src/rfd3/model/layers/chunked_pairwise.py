@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.distributed as dist
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
+from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_elements, debug_tensor_all_ranks, debug_log_all_ranks
 
 logger = logging.getLogger(__name__)
 
@@ -25,23 +26,8 @@ def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
     """Log tensor statistics for debugging."""
     if not PARALLEL_DEBUG:
         return
-    if dist.is_initialized() and dist.get_rank() != rank:
-        return
-    
-    if tensor is None:
-        print(f"[DEBUG-PAIRWISE] {name}: None", flush=True)
-        return
-    
-    with torch.no_grad():
-        t = tensor.float()
-        stats = {
-            "shape": list(tensor.shape),
-            "mean": f"{t.mean().item():.6f}",
-            "std": f"{t.std().item():.6f}",
-            "min": f"{t.min().item():.6f}",
-            "max": f"{t.max().item():.6f}",
-        }
-    print(f"[DEBUG-PAIRWISE] {name}: {stats}", flush=True)
+    # Use centralized debug context for consistent formatting
+    debug_tensor("PAIRWISE", name, tensor, rank)
 
 
 class ChunkedPositionPairDistEmbedder(nn.Module):
@@ -187,28 +173,37 @@ class ChunkedPairwiseEmbedder(nn.Module):
         self.motif_pos_embedder = motif_pos_embedder
         self.ref_pos_embedder = ref_pos_embedder
 
+        # CRITICAL FIX: Store shared modules in a plain dict to prevent re-registration!
+        # When modules are passed from a parent (e.g., TokenInitializer), assigning them
+        # to self.xxx re-registers them under a new path (chunked_pairwise_embedder.xxx).
+        # The checkpoint only has weights at the original path (token_initializer.xxx),
+        # causing the re-registered modules to be reinitialized with random weights.
+        # Using a plain dict avoids this issue while still allowing access to the modules.
+        self._shared_modules = {}
+
         # Use shared trained MLPs if provided, otherwise create new ones
         if process_single_l is not None:
-            self.process_single_l = process_single_l
+            # Store in dict to avoid re-registration
+            self._shared_modules['process_single_l'] = process_single_l
         else:
             self.process_single_l = nn.Sequential(
                 nn.ReLU(), linearNoBias(128, c_atompair)
             )
 
         if process_single_m is not None:
-            self.process_single_m = process_single_m
+            self._shared_modules['process_single_m'] = process_single_m
         else:
             self.process_single_m = nn.Sequential(
                 nn.ReLU(), linearNoBias(128, c_atompair)
             )
 
         if process_z is not None:
-            self.process_z = process_z
+            self._shared_modules['process_z'] = process_z
         else:
             self.process_z = nn.Sequential(RMSNorm(128), linearNoBias(128, c_atompair))
 
         if pair_mlp is not None:
-            self.pair_mlp = pair_mlp
+            self._shared_modules['pair_mlp'] = pair_mlp
         else:
             self.pair_mlp = nn.Sequential(
                 nn.ReLU(),
@@ -219,6 +214,22 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 linearNoBias(c_atompair, c_atompair),
             )
 
+    def _get_process_single_l(self):
+        """Get process_single_l module (shared or owned)."""
+        return self._shared_modules.get('process_single_l', getattr(self, 'process_single_l', None))
+
+    def _get_process_single_m(self):
+        """Get process_single_m module (shared or owned)."""
+        return self._shared_modules.get('process_single_m', getattr(self, 'process_single_m', None))
+
+    def _get_process_z(self):
+        """Get process_z module (shared or owned)."""
+        return self._shared_modules.get('process_z', getattr(self, 'process_z', None))
+
+    def _get_pair_mlp(self):
+        """Get pair_mlp module (shared or owned)."""
+        return self._shared_modules.get('pair_mlp', getattr(self, 'pair_mlp', None))
+
     def forward_chunked(
         self,
         f: dict,
@@ -227,6 +238,7 @@ class ChunkedPairwiseEmbedder(nn.Module):
         Z_init_II: torch.Tensor,  # [I, I, c_z] - token pair features
         tok_idx: torch.Tensor,  # [L] - atom to token mapping (FULL)
         query_start: int = 0,  # Offset for parallel mode: which atoms indices correspond to
+        **kwargs,  # streaming_mode, z_chunk_range for parallel mode
     ) -> torch.Tensor:
         # Add logging for chunked P_LL computation
         import logging
@@ -242,7 +254,7 @@ class ChunkedPairwiseEmbedder(nn.Module):
             f: Feature dictionary
             indices: Sparse attention indices [B, L_par, k] (may be chunked in parallel mode)
             C_L: Atom-level features [L, c_token] (FULL - needed for key gathering)
-            Z_init_II: Token-level pair features [I, I, c_z] or StreamingZContainer
+            Z_init_II: Token-level pair features [I, I, c_z] (full) or [I_par, I, c_z] (chunked)
             tok_idx: Atom to token mapping [L] (FULL)
             query_start: Offset for query positions (0 for non-parallel, query_start for parallel)
             
@@ -359,8 +371,8 @@ class ChunkedPairwiseEmbedder(nn.Module):
         )  # [B, L_par, k, c_token]
 
         # Add single embeddings - match standard implementation structure
-        single_l = self.process_single_l(C_L_queries)  # [B, L_par, k, c_atompair]
-        single_m = self.process_single_m(C_L_keys)  # [B, L_par, k, c_atompair]
+        single_l = self._get_process_single_l()(C_L_queries)  # [B, L_par, k, c_atompair]
+        single_m = self._get_process_single_m()(C_L_keys)  # [B, L_par, k, c_atompair]
         P_LL_sparse += single_l + single_m
 
         # 4. Token pair features Z_init_II
@@ -384,48 +396,68 @@ class ChunkedPairwiseEmbedder(nn.Module):
         tok_keys = torch.gather(tok_idx_full_expanded, 1, valid_indices)  # [B, L_par, k]
 
         # Gather Z_init_II[tok_queries, tok_keys] with safe indexing
-        # Z_init_II shape is [I, I, c_z] (3D), not 4D (or StreamingZContainer)
+        # Z_init_II shape is [I, I, c_z] (3D full) or [I_par, I, c_z] (3D chunked in streaming mode)
         # tok_queries shape: [B, L_par, k] - each value is a token index
         # We want: Z_init_II[tok_queries[d,l,k], tok_keys[d,l,k], :] for all d,l,k
 
-        # Import here to avoid circular import
-        from rfd3.model.layers.encoders import StreamingZContainer
-        
-        # Handle StreamingZContainer (parallel mode) vs tensor (standard mode)
-        if isinstance(Z_init_II, StreamingZContainer):
-            print(f"[DEBUG-PAIRWISE] Z_init_II is StreamingZContainer", flush=True)
-            # Streaming mode: compute FULLY PROCESSED Z at sparse pairs
-            # This includes RPE, token bonds, transformer stack, etc.
-            I_z = Z_init_II.I
-            
+        # Check for streaming mode via kwargs (Z_init_II is a chunked tensor)
+        streaming_mode = kwargs.get("streaming_mode", False)
+        z_chunk_range = kwargs.get("z_chunk_range")
+
+        if streaming_mode and z_chunk_range is not None:
+            debug_log("PAIRWISE", "Z_init_II", f"CHUNKED TENSOR shape={list(Z_init_II.shape)}, range={z_chunk_range}")
+            # Streaming mode: Z_init_II is pre-computed [I_par, I, c_z] chunk
+            # z_chunk_range tells us which token rows this chunk covers
+            start_i, end_i = z_chunk_range
+            I_par_z = Z_init_II.shape[0]  # Chunk size
+            I_z = Z_init_II.shape[1]      # Full I (all keys)
+
             Z_pairs_processed = torch.zeros(
                 B, L_par, k, self.c_atompair, device=device, dtype=C_L.dtype
             )
-            
+
             for b in range(B):
-                tq = tok_queries[b]  # [L_par, k]
-                tk = tok_keys[b]    # [L_par, k]
-                
-                # Clamp indices to valid range
-                tq = torch.clamp(tq, 0, I_z - 1)
+                tq = tok_queries[b]  # [L_par, k] - token indices in [0, I)
+                tk = tok_keys[b]    # [L_par, k] - token indices in [0, I)
+
+                # Map tok_queries to local chunk indices
+                # Assumes tok_queries falls within [start_i, end_i) - alignment assumption
+                local_tq = tq - start_i  # [L_par, k] - now in [0, I_par_z)
+
+                # Clamp to valid ranges
+                local_tq = torch.clamp(local_tq, 0, I_par_z - 1)
                 tk = torch.clamp(tk, 0, I_z - 1)
-                
-                # Get FULLY PROCESSED Z at sparse pairs (includes RPE, token bonds, etc.)
-                Z_pairs_full = Z_init_II.get_fully_processed_z_at_pairs(tq, tk)  # [L_par, k, c_z]
-                
-                # Process through linear layer
-                Z_pairs_processed[b] = self.process_z(Z_pairs_full)  # [L_par, k, c_atompair]
+
+                # Index into chunked Z tensor
+                Z_pairs_full = Z_init_II[
+                    local_tq.flatten(),
+                    tk.flatten()
+                ].view(L_par, k, -1)  # [L_par, k, c_z]
+
+                if b == 0:
+                    debug_log("PAIRWISE", "Z_pairs_chunked_tensor",
+                              f"tq=[{tq.min().item()},{tq.max().item()}], "
+                              f"local_tq=[{local_tq.min().item()},{local_tq.max().item()}], "
+                              f"tk=[{tk.min().item()},{tk.max().item()}], "
+                              f"mean={Z_pairs_full.float().mean().item():.6f}")
+                    debug_elements("PAIRWISE", "Z_pairs_full", Z_pairs_full, [(0, 0), (100, 50)])
+
+                Z_pairs_processed[b] = self._get_process_z()(Z_pairs_full)  # [L_par, k, c_atompair]
         else:
-            print(f"[DEBUG-PAIRWISE] Z_init_II is TENSOR with shape {Z_init_II.shape}", flush=True)
+            debug_log("PAIRWISE", "Z_init_II", f"TENSOR shape={list(Z_init_II.shape)}")
             # Standard mode: full Z tensor available
             I_z, I_z2, c_z = Z_init_II.shape
+
+            # DEBUG: Print Z_init_II stats BEFORE process_z
+            debug_log("PAIRWISE", "Z_init_II_stats",
+                      f"mean={Z_init_II.float().mean().item():.6f}, std={Z_init_II.float().std().item():.6f}")
 
             # CRITICAL: Match standard implementation exactly!
             # Standard does: self.process_z(Z_init_II)[..., tok_idx, :, :][..., tok_idx, :]
             # This means: 1) Process Z_init_II first, 2) Then do double token indexing
 
             # Step 1: Process Z_init_II to get processed token pair features
-            Z_processed = self.process_z(Z_init_II)  # [I, I, c_atompair]
+            Z_processed = self._get_process_z()(Z_init_II)  # [I, I, c_atompair]
 
             # Step 2: Do the double indexing like the standard implementation
             # Standard: Z_processed[..., tok_idx, :, :][..., tok_idx, :]
@@ -445,13 +477,27 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 tq = torch.clamp(tq, 0, I_z - 1)
                 tk = torch.clamp(tk, 0, I_z2 - 1)
 
+                # DEBUG: Print Z_pairs at same sparse indices BEFORE process_z
+                if b == 0:
+                    Z_pairs_unprocessed = Z_init_II[tq, tk]  # [L, k, c_z]
+                    debug_log("PAIRWISE", "Z_pairs_tensor",
+                              f"tq=[{tq.min().item()},{tq.max().item()}], "
+                              f"tk=[{tk.min().item()},{tk.max().item()}], "
+                              f"mean={Z_pairs_unprocessed.float().mean().item():.6f}")
+                    debug_elements("PAIRWISE", "Z_pairs", Z_pairs_unprocessed, [(0, 0), (100, 50)])
+                    # DIAGNOSTIC: Print EXACT token indices at positions [0,0] and [100,50]
+                    if tq.shape[0] > 100 and tq.shape[1] > 50:
+                        debug_log("PAIRWISE", "TENSOR_TOKEN_INDICES",
+                                  f"[0,0] tq={tq[0,0].item()} tk={tk[0,0].item()} | "
+                                  f"[100,50] tq={tq[100,50].item()} tk={tk[100,50].item()}")
+
                 # Apply the double token indexing like standard implementation
                 Z_pairs_processed[b] = Z_processed[tq, tk]  # [L, k, c_atompair]
 
         P_LL_sparse += Z_pairs_processed
 
         # 5. Final MLP - ADD the result, don't replace (to match standard implementation)
-        P_LL_sparse = P_LL_sparse + self.pair_mlp(P_LL_sparse)
+        P_LL_sparse = P_LL_sparse + self._get_pair_mlp()(P_LL_sparse)
 
         # DIAGNOSTIC: Log detailed intermediate values
         _log_tensor_stats("P_LL_sparse_forward_chunked", P_LL_sparse)
@@ -460,7 +506,7 @@ class ChunkedPairwiseEmbedder(nn.Module):
         _log_tensor_stats("forward_chunked_single_l", single_l)
         _log_tensor_stats("forward_chunked_single_m", single_m)
         _log_tensor_stats("forward_chunked_Z_pairs_processed", Z_pairs_processed)
-        print(f"[DEBUG-PAIRWISE] forward_chunked query_start={query_start}, L_par={L_par}, L_full={L_full}", flush=True)
+        debug_log("PAIRWISE", "forward_chunked", f"query_start={query_start}, L_par={L_par}, L_full={L_full}")
         
         return P_LL_sparse.contiguous()
     
@@ -503,7 +549,7 @@ class ChunkedPairwiseEmbedder(nn.Module):
         if tok_idx is not None:
             tok_idx = tok_idx.to(device)
         Z_init_II = initializer_outputs.get("Z_II", initializer_outputs.get("Z_init_II"))
-        # Note: Z_init_II may be a StreamingZContainer, not a tensor
+        # Note: Z_init_II may be [I_par, I, c_z] (chunked) in streaming mode
         if Z_init_II is not None and hasattr(Z_init_II, 'to'):
             Z_init_II = Z_init_II.to(device)
         C_L = initializer_outputs.get("C_L")
@@ -541,10 +587,10 @@ class ChunkedPairwiseEmbedder(nn.Module):
             indices_clamped = torch.clamp(indices_for_gather, 0, C_L.shape[1] - 1)
             C_L_keys = torch.gather(C_L.unsqueeze(2).expand(-1, -1, k, -1), 1, indices_clamped)  # [B, L_par, k, c]
             
-            single_l = self.process_single_l(C_L_queries)  # [B, L_par, k, c_atompair]
-            single_m = self.process_single_m(C_L_keys)     # [B, L_par, k, c_atompair]
+            single_l = self._get_process_single_l()(C_L_queries)  # [B, L_par, k, c_atompair]
+            single_m = self._get_process_single_m()(C_L_keys)     # [B, L_par, k, c_atompair]
             P_LL_sparse_chunk = P_LL_sparse_chunk + single_l + single_m
-        
+
         # 2. Token pair features Z for chunk (VECTORIZED - no for loops)
         if tok_idx is not None and Z_init_II is not None:
             if tok_idx.dim() == 1:
@@ -553,43 +599,60 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 tok_idx_expanded = tok_idx
                 if tok_idx_expanded.shape[0] != B:
                     tok_idx_expanded = tok_idx_expanded.expand(B, -1)
-            
+
             # Token indices for this chunk's queries
             tok_queries_chunk = tok_idx_expanded[:, query_start:query_end].unsqueeze(2).expand(-1, -1, k)  # [B, L_par, k]
-            
+
             # Get token indices for keys via gather - VECTORIZED
             tok_idx_for_keys = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)  # [B, L, k]
             indices_clamped = torch.clamp(indices_chunk, 0, tok_idx_expanded.shape[1] - 1)
             tok_keys_chunk = torch.gather(tok_idx_for_keys, 1, indices_clamped)  # [B, L_par, k]
-            
-            # Import StreamingZContainer check
-            from rfd3.model.layers.encoders import StreamingZContainer
-            
-            if isinstance(Z_init_II, StreamingZContainer):
-                I_z = Z_init_II.I
-                # VECTORIZED: process all batches at once
-                tq = torch.clamp(tok_queries_chunk[0], 0, I_z - 1)  # [L_par, k] - B=1 typical
-                tk = torch.clamp(tok_keys_chunk[0], 0, I_z - 1)      # [L_par, k]
-                # Use FULLY PROCESSED Z (includes RPE, token bonds, etc.)
-                Z_pairs_full = Z_init_II.get_fully_processed_z_at_pairs(tq, tk)  # [L_par, k, c_z]
-                Z_pairs_processed = self.process_z(Z_pairs_full)      # [L_par, k, c_atompair]
+
+            # Check for streaming mode via initializer_outputs (Z_init_II is a chunked tensor)
+            streaming_mode = initializer_outputs.get("streaming_mode", False)
+            z_chunk_range = initializer_outputs.get("z_chunk_range")
+
+            if streaming_mode and z_chunk_range is not None:
+                # Streaming mode: Z_init_II is pre-computed [I_par, I, c_z] chunk
+                start_i, end_i = z_chunk_range
+                I_par_z = Z_init_II.shape[0]
+                I_z = Z_init_II.shape[1]
+
+                tq = tok_queries_chunk[0]  # [L_par, k]
+                tk = tok_keys_chunk[0]     # [L_par, k]
+
+                # Map to local chunk indices
+                local_tq = torch.clamp(tq - start_i, 0, I_par_z - 1)
+                tk = torch.clamp(tk, 0, I_z - 1)
+
+                # Index into chunked Z
+                Z_pairs_full = Z_init_II[
+                    local_tq.flatten(),
+                    tk.flatten()
+                ].view(L_par, k, -1)  # [L_par, k, c_z]
+
+                Z_pairs_processed = self._get_process_z()(Z_pairs_full)
                 Z_pairs_processed_chunk = Z_pairs_processed.unsqueeze(0).expand(B, -1, -1, -1)
             else:
+                # Standard mode: full Z tensor [I, I, c_z]
                 I_z = Z_init_II.shape[0]
-                Z_processed = self.process_z(Z_init_II)  # [I, I, c_atompair]
-                
+                Z_processed = self._get_process_z()(Z_init_II)  # [I, I, c_atompair]
+
                 # VECTORIZED gather for Z pairs
                 tq_flat = torch.clamp(tok_queries_chunk.reshape(-1), 0, I_z - 1)  # [B*L_par*k]
                 tk_flat = torch.clamp(tok_keys_chunk.reshape(-1), 0, I_z - 1)      # [B*L_par*k]
                 Z_pairs_flat = Z_processed[tq_flat, tk_flat, :]  # [B*L_par*k, c_atompair]
                 Z_pairs_processed_chunk = Z_pairs_flat.reshape(B, L_par, k, -1)
-            
+
             # Add Z_pairs to P_LL (matching original: P_LL_sparse += Z_pairs_processed)
             P_LL_sparse_chunk = P_LL_sparse_chunk + Z_pairs_processed_chunk
-        
+
         # Final MLP (matching original: P_LL_sparse + self.pair_mlp(P_LL_sparse))
-        P_LL_sparse_chunk = P_LL_sparse_chunk + self.pair_mlp(P_LL_sparse_chunk)
-        
+        P_LL_sparse_chunk = P_LL_sparse_chunk + self._get_pair_mlp()(P_LL_sparse_chunk)
+
+        # MULTI-GPU DIAGNOSTIC: Log P_LL_sparse_chunk stats from ALL ranks
+        debug_tensor_all_ranks("P_LL_SPARSE", f"forward_chunked_parallel_q{query_start}-{query_end}", P_LL_sparse_chunk)
+
         return P_LL_sparse_chunk.contiguous()
 
 

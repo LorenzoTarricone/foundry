@@ -69,9 +69,11 @@ class AttentionPairBiasPairformerDeepspeed(nn.Module):
             )
 
             # Streaming attention over queries to avoid full I×I
-            if self.attn_parallel is not None:
-                n_par = max(int(self.attn_parallel), 1)
-                chunk = max(1, (L + n_par - 1) // n_par)
+            # Parallel mode: =1 enables, GPU count from dist.get_world_size()
+            if self.attn_parallel == "1":
+                import torch.distributed as dist
+                n_par = dist.get_world_size() if dist.is_initialized() else 1
+                chunk = max(1, (L + n_par - 1) // n_par) if n_par > 1 else L
             else:
                 chunk = L  # original behavior
 

@@ -28,6 +28,9 @@ mpnn_batch_size: 5
 attention_parallel_factor: null
 low_memory_mode: true
 
+# Reproducibility
+seed: 42  # Random seed for reproducible results (same seed ensures identical outputs)
+
 # Weights & Biases logging
 wandb:
   enabled: false

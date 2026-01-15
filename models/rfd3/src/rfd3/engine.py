@@ -333,10 +333,10 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             else:
                 # Initialize distributed processing for multi-GPU parallel inference
                 self._init_distributed(n_par)
-                # Enable full parallel streaming mode
-                os.environ["RFD3_ATTENTION_PARALLEL"] = str(n_par)
+                # Enable parallel streaming mode (GPU count auto-detected from dist.get_world_size())
+                os.environ["RFD3_ATTENTION_PARALLEL"] = "1"
                 ranked_logger.info(
-                    f"Attention parallel streaming mode enabled with n_parallel={n_par}. "
+                    f"Attention parallel streaming mode enabled with {n_par} GPUs. "
                     f"No L×L or I×I tensors will be materialized."
                 )
 

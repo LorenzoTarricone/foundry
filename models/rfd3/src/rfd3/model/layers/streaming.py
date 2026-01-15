@@ -26,23 +26,24 @@ import torch.nn as nn
 logger = logging.getLogger(__name__)
 
 
-def get_n_parallel() -> int:
-    """
-    Get the parallelism factor from environment variable.
-    Returns 0 if not in streaming mode.
-    """
-    val = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
-    if val is None:
-        return 0
-    try:
-        return int(val)
-    except ValueError:
-        return 0
-
-
 def is_streaming_mode() -> bool:
-    """Check if streaming mode is enabled."""
-    return get_n_parallel() > 1
+    """
+    Check if streaming/parallel mode is enabled.
+
+    Env var scheme:
+      - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
+      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+    """
+    val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+    return val == "1"
+
+
+def get_world_size() -> int:
+    """Get actual GPU count from distributed runtime."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
 
 
 def compute_chunk_ranges(total: int, n_par: int) -> List[Tuple[int, int]]:

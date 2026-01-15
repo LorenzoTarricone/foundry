@@ -49,6 +49,36 @@ import yaml
 
 import torch
 import torch.distributed as dist
+import random
+import numpy as np
+
+
+def set_seed(seed: int = 42):
+    """
+    Set random seed for reproducibility across all random number generators.
+    Ensures consistent seeds across all distributed processes.
+    
+    Args:
+        seed: Random seed value (default: 42)
+    """
+    # Use the same seed for all processes (for reproducibility)
+    # In distributed mode, all ranks use the same base seed
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    # For deterministic behavior (may impact performance)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    # Only print on rank 0 (if distributed is initialized) or main process
+    try:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+    except:
+        rank = 0
+    if rank == 0:
+        print(f"Random seed set to: {seed}")
 
 
 def load_config(config_path: str) -> dict:
@@ -192,9 +222,13 @@ def run_worker(
     use_wandb: bool = False,
     wandb_project: str = "fast-rfd3-parallel",
     wandb_run_name: str = None,
+    seed: int = 42,
     **kwargs
 ):
     """Worker function that runs on each GPU."""
+    # Set random seed BEFORE any random operations (including distributed setup)
+    set_seed(seed)
+    
     # Setup distributed
     rank, world_size, local_rank = setup_distributed()
     
@@ -453,12 +487,19 @@ torchrun --nproc_per_node=4 scripts/design_parallel.py --config config/design_pa
     parser.add_argument("--wandb_project", type=str, default=None)
     parser.add_argument("--wandb_run_name", type=str, default=None)
     
+    # Reproducibility
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed for reproducibility (default: 42, or from config file)")
+    
     args = parser.parse_args()
     
     # Load config
     if args.config:
         config = load_config(args.config)
         params = merge_config_with_args(config, args)
+        # Ensure seed has a default value (config takes precedence, then CLI, then 42)
+        if 'seed' not in params or params.get('seed') is None:
+            params['seed'] = args.seed if args.seed is not None else 42
     else:
         # Defaults match design_annotate.py
         params = {
@@ -471,6 +512,7 @@ torchrun --nproc_per_node=4 scripts/design_parallel.py --config config/design_pa
             'use_wandb': args.use_wandb or False,
             'wandb_project': args.wandb_project or "fast-rfd3",
             'wandb_run_name': args.wandb_run_name,
+            'seed': args.seed,
         }
     
     # Check if we're already in distributed mode (launched by torchrun)

@@ -338,6 +338,19 @@ class AADesignTrainer(FabricTrainer):
         atom_array = example["atom_array"]
         f = example["feats"]
 
+        # DIAGNOSTIC: Log atom_array size at entry
+        import os
+        attn_par = os.environ.get("RFD3_ATTENTION_PARALLEL", "?")
+        print(f"[DIAG-BUILD] _build_predicted_atom_array_stack ENTRY: atom_array.shape={atom_array.array_length()}, attn_parallel={attn_par}", flush=True)
+        print(f"[DIAG-BUILD]   X_L.shape={list(network_output['X_L'].shape)}", flush=True)
+        # Log X_L statistics
+        X_L = network_output['X_L']
+        print(f"[DIAG-BUILD]   X_L stats: mean={X_L.mean().item():.6f}, std={X_L.std().item():.6f}, min={X_L.min().item():.6f}, max={X_L.max().item():.6f}", flush=True)
+        # Log sequence predictions if available
+        if 'sequence_indices_I' in network_output and network_output['sequence_indices_I'] is not None:
+            seq_idx = network_output['sequence_indices_I']
+            print(f"[DIAG-BUILD]   sequence_indices_I: shape={list(seq_idx.shape)}, unique={len(torch.unique(seq_idx))}, first10={seq_idx[0, :10].tolist()}", flush=True)
+
         # ... Cleanup atom array:
         atom_array.bonds = None
         atom_array.res_name[~atom_array.is_motif_atom_with_fixed_seq] = (
@@ -427,9 +440,11 @@ class AADesignTrainer(FabricTrainer):
 
             # ... Delete virtual atoms and assign atom names and elements
             if self.cleanup_virtual_atoms:
+                pre_cleanup_size = atom_array.array_length()
                 atom_array = _cleanup_virtual_atoms_and_assign_atom_name_elements(
                     atom_array, association_scheme=self.association_scheme
                 )
+                print(f"[DIAG-BUILD] After cleanup_virtual_atoms: {pre_cleanup_size} -> {atom_array.array_length()} atoms", flush=True)
 
                 # ... When cleaning up virtual atoms, we can also calculate native_array_metricsl
                 metadata_dict[i]["metrics"] |= get_all_backbone_metrics(

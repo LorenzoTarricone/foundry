@@ -233,15 +233,17 @@ def create_attention_indices(
 
     tok_idx = f["atom_to_token_map"] if tok_idx is None else tok_idx
     # Toggleable streaming mode to avoid materializing full LxL tensors
-    n_parallel_env = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
-    if n_parallel_env is not None and int(n_parallel_env) > 1:
+    # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
+    import torch.distributed as dist
+    n_parallel_env = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+    if n_parallel_env == "1" and dist.is_initialized() and dist.get_world_size() > 1:
         return create_attention_indices_parallel(
             f=f,
             n_attn_keys=n_attn_keys,
             n_attn_seq_neighbours=n_attn_seq_neighbours,
             X_L=X_L,
             tok_idx=tok_idx,
-            n_parallel=max(int(n_parallel_env), 1),
+            n_parallel=dist.get_world_size(),
         )
     device = X_L.device if X_L is not None else tok_idx.device
     L = len(tok_idx)

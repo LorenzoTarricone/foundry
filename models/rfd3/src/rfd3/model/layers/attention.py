@@ -21,6 +21,7 @@ from rfd3.model.layers.layer_utils import (
 from foundry.common import exists
 from foundry.training.checkpoint import activation_checkpointing
 from foundry.utils.ddp import RankedLogger
+from rfd3.model.debug_context import debug_ctx, debug_log, debug_tensor
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
@@ -689,7 +690,7 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
                 except Exception:
                     return None
             print(
-                "[DEBUG-ATTN] sparse_xattn inputs:",
+                f"{debug_ctx.prefix('ATTN')} sparse_xattn inputs:",
                 {
                     "Q": _stat(Q),
                     "K_gathered": _stat(K_gathered),
@@ -722,7 +723,7 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
     if do_debug:
         with torch.no_grad():
             print(
-                "[DEBUG-ATTN] logits:",
+                f"{debug_ctx.prefix('ATTN')} logits:",
                 {
                     "mean": float(attn.float().mean()),
                     "std": float(attn.float().std()),
@@ -735,7 +736,7 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
     if do_debug:
         with torch.no_grad():
             print(
-                "[DEBUG-ATTN] softmax:",
+                f"{debug_ctx.prefix('ATTN')} softmax:",
                 {
                     "mean": float(attn.float().mean()),
                     "std": float(attn.float().std()),
@@ -761,7 +762,7 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
     if do_debug:
         with torch.no_grad():
             print(
-                "[DEBUG-ATTN] attn_out:",
+                f"{debug_ctx.prefix('ATTN')} attn_out:",
                 {
                     "mean": float(attn_out.float().mean()),
                     "std": float(attn_out.float().std()),

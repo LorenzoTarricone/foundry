@@ -58,7 +58,8 @@ class RFD3(nn.Module):
         #   - Both: Sparse P_LL split across GPUs (most memory efficient)
         #
         low_mem = os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1"
-        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", None) is not None
+        # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
+        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0") == "1"
         
         # chunked_pll is INDEPENDENT of attn_parallel
         use_chunked_pll = low_mem
@@ -104,8 +105,18 @@ class RFD3(nn.Module):
         n_cycle=None,
         **_,
     ) -> dict:
-        # Ensure model is on the same device as input (for distributed processing)
-        device = coord_atom_lvl_to_be_noised.device if coord_atom_lvl_to_be_noised is not None else input["f"]["restype"].device
+        # Ensure model is on the correct device for this rank (CRITICAL for distributed training)
+        import torch.distributed as dist
+        import os
+        
+        if dist.is_initialized():
+            # In distributed mode, use LOCAL_RANK to ensure each rank uses its assigned GPU
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            # In single-GPU mode, use device from input tensors
+            device = coord_atom_lvl_to_be_noised.device if coord_atom_lvl_to_be_noised is not None else input["f"]["restype"].device
+        
         self.to(device)
         
         initializer_outputs = self.token_initializer(input["f"])

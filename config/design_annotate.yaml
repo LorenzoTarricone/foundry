@@ -25,6 +25,9 @@ low_memory_mode: true
 attention_parallel: false
 attention_parallel_factor: null  # null = auto-detect from allocated GPUs
 
+# Reproducibility
+seed: 42  # Random seed for reproducible results
+
 # Weights & Biases logging
 wandb:
   enabled: false

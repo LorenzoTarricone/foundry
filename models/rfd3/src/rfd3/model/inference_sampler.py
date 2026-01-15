@@ -18,6 +18,7 @@ from foundry.utils.rotation_augmentation import (
     rot_vec_mul,
     uniform_random_rotation,
 )
+from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
@@ -26,20 +27,16 @@ ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 # Multi-GPU Parallel Inference Utilities
 # =============================================================================
 
-def _get_n_parallel() -> int:
-    """Get parallelism factor from environment, or 0 if not set."""
-    val = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
-    if val is None:
-        return 0
-    try:
-        return int(val)
-    except ValueError:
-        return 0
-
-
 def _is_streaming_mode() -> bool:
-    """Check if streaming/parallel attention mode is enabled."""
-    return _get_n_parallel() > 1
+    """
+    Check if streaming/parallel attention mode is enabled.
+
+    Env var scheme:
+      - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
+      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+    """
+    val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+    return val == "1"
 
 
 def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
@@ -264,6 +261,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         is_motif_atom_with_fixed_coord,
     ) -> torch.Tensor:
         noise = c0 * torch.normal(mean=0.0, std=1.0, size=(D, L, 3), device=c0.device)
+        # NOTE: Initial noise is NOT broadcast here because tensors may not be on
+        # correct local devices yet. Initial noise synchronization relies on
+        # set_seed() being called with the same seed on all ranks. The per-step
+        # epsilon_L noise IS broadcast in the diffusion loop where device placement
+        # is correct.
         noise[..., is_motif_atom_with_fixed_coord, :] = 0  # Zero out noise going in
         X_L = noise + coord_atom_lvl_to_be_noised
         return X_L
@@ -302,12 +304,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         """
         # Check for streaming/parallel mode
         streaming_mode = initializer_outputs.get("streaming_mode", False)
-        n_parallel = _get_n_parallel()
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
-        
+
         if streaming_mode and world_size > 1:
             ranked_logger.info(
-                f"Parallel diffusion sampling: GPU {gpu_rank}/{world_size}, n_parallel={n_parallel}"
+                f"Parallel diffusion sampling: GPU {gpu_rank}/{world_size}"
             )
         
         # Motif setup to recenter the motif at every step
@@ -356,6 +357,9 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         )
         
         for step_num, (c_t_minus_1, c_t) in pbar:
+            # Update debug context with current step
+            debug_ctx.set_step(step_num)
+
             # Assert no grads on X_L
             assert not torch.is_grad_enabled(), "Computation graph should not be active"
             assert not X_L.requires_grad, "X_L should not require gradients"
@@ -389,6 +393,13 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
                 * torch.normal(mean=0.0, std=1.0, size=X_L.shape, device=X_L.device)
             )                                              # [D, L, 3]
+
+            # CRITICAL: In multi-GPU mode, broadcast noise from rank 0 to ensure
+            # all GPUs use identical noise. Otherwise each GPU generates different
+            # random noise, causing X_noisy_L to diverge across GPUs.
+            if streaming_mode and world_size > 1:
+                _broadcast_tensor(epsilon_L, src=0)
+
             epsilon_L[..., is_motif_atom_with_fixed_coord, :] = 0  # No noise for fixed atoms
             X_noisy_L = X_L + epsilon_L                    # [D, L, 3]
 
@@ -621,12 +632,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         """
         # Check for streaming/parallel mode
         streaming_mode = initializer_outputs.get("streaming_mode", False)
-        n_parallel = _get_n_parallel()
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
-        
+
         if streaming_mode and world_size > 1:
             ranked_logger.info(
-                f"Parallel symmetry diffusion: GPU {gpu_rank}/{world_size}, n_parallel={n_parallel}"
+                f"Parallel symmetry diffusion: GPU {gpu_rank}/{world_size}"
             )
         
         # Motif setup to recenter the motif at every step
@@ -640,7 +650,13 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
         L = f["ref_element"].shape[0]                      # Number of atoms
         D = diffusion_batch_size                           # Diffusion batch size
-        
+
+        # DIAGNOSTIC: Log input shapes
+        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+        print(f"[DIAG] SymmetryInferenceSampler START: L={L}, D={D}, attn_parallel={attn_parallel}", flush=True)
+        print(f"[DIAG]   coord_atom_lvl_to_be_noised.shape={coord_atom_lvl_to_be_noised.shape}", flush=True)
+        print(f"[DIAG]   f['is_ca'].sum()={f['is_ca'].sum().item()} (number of tokens I)", flush=True)
+
         X_L = self._get_initial_structure(
             c0=noise_schedule[0],
             D=D,
@@ -648,6 +664,17 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             coord_atom_lvl_to_be_noised=coord_atom_lvl_to_be_noised.clone(),
             is_motif_atom_with_fixed_coord=is_motif_atom_with_fixed_coord,
         )                                                  # [D, L, 3]
+
+        # CRITICAL: In multi-GPU mode, broadcast initial X_L from rank 0 to all ranks
+        # Each rank generates different random noise, so we must synchronize the initial structure
+        if streaming_mode and world_size > 1:
+            local_rank = int(os.environ.get("LOCAL_RANK", gpu_rank))
+            local_device = torch.device(f"cuda:{local_rank}")
+            # Move X_L to local device before broadcast (NCCL requires tensors on local GPU)
+            X_L = X_L.to(local_device)
+            debug_log_all_ranks("SAMPLER", "BEFORE_INIT_BROADCAST", f"X_L.shape={X_L.shape}, device={X_L.device}, X_L[0,0,:3]={X_L[0,0,:3].tolist()}")
+            dist.broadcast(X_L, src=0)
+            debug_log_all_ranks("SAMPLER", "AFTER_INIT_BROADCAST", f"X_L[0,0,:3]={X_L[0,0,:3].tolist()}")
 
         X_noisy_L_traj = []
         X_denoised_L_traj = []
@@ -674,10 +701,25 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         )
         
         for step_num, (c_t_minus_1, c_t) in pbar:
+            # Update debug context with current step
+            debug_ctx.set_step(step_num)
+
+            # CRITICAL: In multi-GPU mode, ensure X_L is on the correct LOCAL device
+            # X_L is initially created on cuda:0 for all ranks, but NCCL requires each rank
+            # to have tensors on its own device (rank 0 → cuda:0, rank 1 → cuda:1)
+            if streaming_mode and world_size > 1:
+                local_rank = int(os.environ.get("LOCAL_RANK", gpu_rank))
+                local_device = torch.device(f"cuda:{local_rank}")
+                if X_L.device != local_device:
+                    X_L = X_L.to(local_device)
+
+            # DEBUG: Track where each rank is at start of loop
+            debug_log_all_ranks("SAMPLER", "LOOP_START", f"step={step_num}, device={X_L.device}")
+
             # Assert no grads on X_L
             assert not torch.is_grad_enabled(), "Computation graph should not be active"
             assert not X_L.requires_grad, "X_L should not require gradients"
-            
+
             # Ensure all tensors are on the same device as X_L (for multi-GPU)
             # In single-GPU mode, all tensors are already on cuda:0
             # In multi-GPU mode, after parallel processing, X_L ends up on the local device
@@ -703,7 +745,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
             # Compute the value of t_hat
             t_hat = c_t_minus_1 * (gamma + 1)
-            
+
             # Update progress bar with current noise level
             if is_main_rank:
                 t_val = t_hat.item() if isinstance(t_hat, torch.Tensor) else t_hat
@@ -715,18 +757,36 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 * torch.sqrt(torch.square(t_hat) - torch.square(c_t_minus_1))
                 * torch.normal(mean=0.0, std=1.0, size=X_L.shape, device=X_L.device)
             )                                              # [D, L, 3]
+
+            # DEBUG: Track epsilon generation
+            debug_log_all_ranks("SAMPLER", "EPSILON_GENERATED", f"device={epsilon_L.device}, mean={epsilon_L.mean().item():.6f}")
+
+            # CRITICAL: In multi-GPU mode, broadcast noise from rank 0 to ensure
+            # all GPUs use identical noise. Otherwise each GPU generates different
+            # random noise, causing X_noisy_L to diverge across GPUs.
+            if streaming_mode and world_size > 1:
+                debug_log_all_ranks("SAMPLER", "BEFORE_BROADCAST", f"epsilon_L.device={epsilon_L.device}")
+                _broadcast_tensor(epsilon_L, src=0)
+                debug_log_all_ranks("SAMPLER", "AFTER_BROADCAST", f"epsilon_L.mean={epsilon_L.mean().item():.6f}")
+
             epsilon_L[..., is_motif_atom_with_fixed_coord, :] = 0  # No noise for fixed atoms
 
             # NOTE: no symmetry applied to the noisy structure
             X_noisy_L = X_L + epsilon_L                    # [D, L, 3]
 
+            # DEBUG: Track X_noisy_L
+            debug_log_all_ranks("SAMPLER", "X_NOISY_READY", f"device={X_noisy_L.device}, mean={X_noisy_L.mean().item():.6f}")
+
             # ================================================================
             # Denoise the coordinates - handle chunked/streaming mode
             # ================================================================
             tic = time.time()
-            
+
             chunked_embedder = initializer_outputs.get("chunked_pairwise_embedder", None)
-            
+
+            # DEBUG: Track before model forward
+            debug_log_all_ranks("SAMPLER", "BEFORE_MODEL_FORWARD", f"streaming={streaming_mode}, chunked={chunked_embedder is not None}")
+
             if chunked_embedder is not None or streaming_mode:
                 # Chunked/streaming mode: explicitly provide P_LL=None
                 other_outputs = {
@@ -760,11 +820,16 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     **initializer_outputs,
                 )
 
+            # DEBUG: Track after model forward
+            debug_log_all_ranks("SAMPLER", "AFTER_MODEL_FORWARD", f"X_L_shape={outs.get('X_L', 'N/A')}")
+
             # ================================================================
             # Multi-GPU synchronization
             # ================================================================
             if streaming_mode and world_size > 1:
+                debug_log_all_ranks("SAMPLER", "BEFORE_BARRIER", "entering barrier")
                 dist.barrier()
+                debug_log_all_ranks("SAMPLER", "AFTER_BARRIER", "barrier complete")
                 if "X_L" in outs:
                     _broadcast_tensor(outs["X_L"], src=0)
                 if "sequence_logits_I" in outs and outs["sequence_logits_I"] is not None:
@@ -826,6 +891,9 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 X_L,
                 X_exists_L=is_motif_atom_with_fixed_coord,
             )
+
+        # DIAGNOSTIC: Log output shapes
+        print(f"[DIAG] SymmetryInferenceSampler END: X_L.shape={X_L.shape}", flush=True)
 
         return dict(
             X_L=X_L,                                       # [D, L, 3]

@@ -32,19 +32,29 @@ from rfd3.model.layers.pairformer_layers import PairformerBlock
 
 from foundry.common import exists
 from foundry.training.checkpoint import activation_checkpointing
+from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks, verify_tensor_sync
 
 logger = logging.getLogger(__name__)
 
 
-def _get_n_parallel() -> int:
-    """Get parallelism factor from environment, or 0 if not set."""
-    val = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
-    if val is None:
-        return 0
-    try:
-        return int(val)
-    except ValueError:
-        return 0
+def _is_streaming_mode() -> bool:
+    """
+    Check if streaming/parallel mode is enabled.
+
+    Env var scheme:
+      - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
+      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+    """
+    val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+    return val == "1"
+
+
+def _get_world_size() -> int:
+    """Get actual GPU count from distributed runtime."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return dist.get_world_size()
+    return 1
 
 
 def _compute_chunk_ranges(total: int, n_par: int) -> List[Tuple[int, int]]:
@@ -144,6 +154,8 @@ def _all_gather_concat(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
         Full tensor reassembled from all GPUs
     """
     import torch.distributed as dist
+    import os
+    
     if not dist.is_initialized():
         return tensor
     
@@ -151,383 +163,37 @@ def _all_gather_concat(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
     if world_size == 1:
         return tensor
     
+    # Ensure tensor is on the correct device for this rank
+    # This is critical for distributed training - each rank must use its assigned GPU
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    expected_device = torch.device(f"cuda:{local_rank}")
+    if tensor.device != expected_device:
+        tensor = tensor.to(expected_device)
+    
+    # Ensure tensor is contiguous (required for NCCL)
+    tensor = tensor.contiguous()
+    
     gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
     dist.all_gather(gathered, tensor)
     
     return torch.cat(gathered, dim=dim)
 
 
-class StreamingZContainer:
-    """
-    Container for streaming Z_II computation with multi-GPU support.
-    
-    Instead of materializing full [I, I, c_z] tensor, stores components needed
-    to compute row chunks [I_par, I, c_z] on-the-fly.
-    
-    In multi-GPU mode:
-    - Each GPU only computes Z rows for its assigned query range
-    - Query range is [gpu_start, gpu_end) where gpu_start/end are determined by rank
-    - This ensures no single GPU ever materializes full [I, I, c_z]
-    
-    Downstream modules call get_gpu_chunk() to get this GPU's Z rows.
-    """
-    
-    def __init__(
-        self,
-        S_I: torch.Tensor,                    # [I, c_s] single features
-        to_z_init_i: nn.Module,               # Projection for queries
-        to_z_init_j: torch.Tensor,            # [I, c_z] pre-computed key projection  
-        rpe_module: nn.Module,                # RelativePositionEncoding module
-        rpe_module2: nn.Module,               # Second RPE module  
-        token_bonds: torch.Tensor,            # [I, I] token bond matrix (kept full, small)
-        process_token_bonds: nn.Module,       # Linear for token bonds
-        ref_pos_embedder: nn.Module,          # Reference position embedder
-        ref_pos: torch.Tensor,                # [I, 3] reference positions (CA atoms)
-        ref_space_uid: torch.Tensor,          # [I] reference space UIDs
-        f: dict,                              # Feature dictionary
-        transformer_stack: nn.ModuleList,     # Pairformer blocks
-        process_z_init: nn.Module,            # Post-concatenation processor
-        transition_modules: nn.ModuleList,    # Transition layers
-        c_z: int,                             # Pair embedding dimension
-        device: torch.device,
-        dtype: torch.dtype,
-    ):
-        """
-        Initialize streaming Z container with all components for on-demand computation.
-        
-        Multi-GPU: Each GPU will only compute Z for its assigned query range,
-        producing [I_par, I, c_z] instead of [I, I, c_z].
-        """
-        self.S_I = S_I                        # [I, c_s]
-        self.I = S_I.shape[0]
-        self.c_z = c_z
-        self.device = device
-        self.dtype = dtype
-        
-        # Store modules and pre-computations
-        self.to_z_init_i = to_z_init_i
-        self.Z_j = to_z_init_j                # [I, c_z] - pre-computed key projection
-        self.rpe_module = rpe_module
-        self.rpe_module2 = rpe_module2
-        self.token_bonds = token_bonds        # [I, I] - keep full (relatively small)
-        self.process_token_bonds = process_token_bonds
-        self.ref_pos_embedder = ref_pos_embedder
-        self.ref_pos = ref_pos                # [I, 3]
-        self.ref_space_uid = ref_space_uid    # [I]
-        self.f = f
-        self.transformer_stack = transformer_stack
-        self.process_z_init = process_z_init
-        self.transition_modules = transition_modules
-        
-        # Multi-GPU: Determine this GPU's query range
-        self.gpu_rank, self.world_size = _get_gpu_rank_and_world_size()
-        self.gpu_start, self.gpu_end = _compute_gpu_query_range(
-            self.I, self.gpu_rank, self.world_size
-        )
-        self.I_par = self.gpu_end - self.gpu_start  # This GPU's chunk size
-    
-    def get_chunk(self, start_i: int, end_i: int) -> torch.Tensor:
-        """
-        Compute Z_II[start_i:end_i, :, :] on-the-fly.
-        
-        Computes [I_par, I, c_z] - queries in range attend to ALL keys.
-        This is cross-attention style, avoiding full [I, I, c_z].
-        
-        Args:
-            start_i: Start index for query tokens
-            end_i: End index for query tokens
-            
-        Returns:
-            Z_chunk: [I_par, I, c_z] pair features for query chunk
-        """
-        # Ensure all stored tensors/modules are on this rank's device
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        device = torch.device(f"cuda:{local_rank}")
-        self.S_I = self.S_I.to(device)
-        self.Z_j = self.Z_j.to(device)
-        self.to_z_init_i.to(device)
-        self.token_bonds = self.token_bonds.to(device)
-        self.ref_pos = self.ref_pos.to(device)
-        self.ref_space_uid = self.ref_space_uid.to(device)
-        self.process_token_bonds.to(device)
-        self.rpe_module.to(device)
-        self.rpe_module2.to(device)
-        self.ref_pos_embedder.to(device)
-        self.process_z_init.to(device)
-        for block in self.transformer_stack:
-            block.to(device)
-        for mod in self.transition_modules:
-            mod.to(device)
-        # Move feature dict tensors to correct device
-        for key, val in self.f.items():
-            if isinstance(val, torch.Tensor):
-                self.f[key] = val.to(device)
-        
-        I_par = end_i - start_i
-        I = self.I
-        qs = slice(start_i, end_i)
-        
-        # Step 1: Base Z = Z_i + Z_j (cross-attention style)
-        # Z_i: [I_par, 1, c_z] - queries
-        # Z_j: [1, I, c_z] - all keys
-        S_I_chunk = self.S_I[qs]                          # [I_par, c_s]
-        Z_i = self.to_z_init_i(S_I_chunk).unsqueeze(-2)   # [I_par, 1, c_z]
-        Z_j = self.Z_j.unsqueeze(0)                       # [1, I, c_z]
-        Z_chunk = Z_i + Z_j                               # [I_par, I, c_z]
-        
-        # Debug: track dimensions
-        _dims = {"step1": Z_chunk.shape[-1]}
-        
-        # Step 2: Add RPE (chunked)
-        Z_chunk = Z_chunk + self.rpe_module.forward_chunk(
-            self.f, start_i, end_i
-        )  # [I_par, I, c_z]
-        _dims["step2_rpe"] = Z_chunk.shape[-1]
-        
-        # Step 3: Add token bonds (slice query rows, all key columns)
-        token_bonds_chunk = self.token_bonds[qs, :]       # [I_par, I]
-        Z_chunk = Z_chunk + self.process_token_bonds(
-            token_bonds_chunk.unsqueeze(-1).float()
-        )  # [I_par, I, c_z]
-        
-        # Step 4: Add reference position embedding (chunked)
-        ref_pos_chunk = self.ref_pos[qs]                  # [I_par, 3]
-        ref_space_uid_chunk = self.ref_space_uid[qs]      # [I_par]
-        
-        # Valid mask: [I_par, I, 1]
-        valid_mask = (
-            ref_space_uid_chunk.unsqueeze(-1) == self.ref_space_uid.unsqueeze(0)
-        ).unsqueeze(-1)  # [I_par, I, 1]
-        
-        ref_pos_embed = self.ref_pos_embedder.forward_chunk(
-            ref_pos_chunk, self.ref_pos, valid_mask
-        )  # [I_par, I, c_z]
-        Z_chunk = Z_chunk + ref_pos_embed
-        
-        # Step 5: Pairformer Z transitions (chunked along keys to save memory)
-        for block in self.transformer_stack:
-            Z_chunk = _z_transition_chunked(Z_chunk, block.z_transition)  # [I_par, I, c_z]
-        
-        # Step 6: Concatenate with second RPE and process
-        rpe2_chunk = self.rpe_module2.forward_chunk(
-            self.f, start_i, end_i
-        )  # [I_par, I, c_z]
-        _dims["step5_pre_cat"] = Z_chunk.shape[-1]
-        _dims["rpe2_dim"] = rpe2_chunk.shape[-1]
-        
-        Z_chunk = torch.cat([Z_chunk, rpe2_chunk], dim=-1)  # [I_par, I, 2*c_z]
-        _dims["step6_post_cat"] = Z_chunk.shape[-1]
-        
-        Z_chunk = self.process_z_init(Z_chunk)              # [I_par, I, c_z]
-        _dims["step6_post_process"] = Z_chunk.shape[-1]
-        
-        # Step 7: Apply transitions (chunked along keys to save memory)
-        for transition in self.transition_modules:
-            Z_chunk = _z_transition_chunked(Z_chunk, transition)  # [I_par, I, c_z]
-        
-        # Debug check: verify dimensions match expected c_z
-        actual_dim = Z_chunk.shape[-1]
-        _dims["final"] = actual_dim
-        
-        if actual_dim != self.c_z:
-            # Check where the mismatch originates
-            z_i_dim = self.to_z_init_i(self.S_I[:1]).shape[-1]
-            z_j_dim = self.Z_j.shape[-1]
-            
-            raise RuntimeError(
-                f"StreamingZContainer.get_chunk dimension mismatch:\n"
-                f"  Expected c_z={self.c_z}\n"
-                f"  Got: {actual_dim}\n"
-                f"  Dimension trace: {_dims}\n"
-                f"  Z_i (to_z_init_i output) dim: {z_i_dim}\n"
-                f"  Z_j dim: {z_j_dim}\n"
-                f"  process_z_init expects: {2*self.c_z} -> {self.c_z}\n"
-                f"  Note: process_z_init should output {self.c_z} dims"
-            )
-        
-        return Z_chunk  # [I_par, I, c_z]
-    
-    def get_gpu_chunk(self) -> torch.Tensor:
-        """
-        Get Z rows for THIS GPU's assigned query range.
-        
-        Multi-GPU: Each GPU calls this to get only its portion.
-        Returns [I_par, I, c_z] where I_par = I / world_size.
-        
-        Returns:
-            Z_chunk: [I_par, I, c_z] - this GPU's Z rows
-        """
-        return self.get_chunk(self.gpu_start, self.gpu_end)
-    
-    def get_gpu_query_range(self) -> Tuple[int, int]:
-        """Get this GPU's query range [start, end)."""
-        return self.gpu_start, self.gpu_end
-    
-    def get_all_chunks(self, n_par: int) -> List[torch.Tensor]:
-        """
-        Get all chunks without assembling them (single-GPU mode).
-        
-        Args:
-            n_par: Number of parallel chunks
-            
-        Returns:
-            List of [I_par, I, c_z] tensors
-        """
-        ranges = _compute_chunk_ranges(self.I, n_par)
-        return [self.get_chunk(start, end) for start, end in ranges]
-    
-    def assemble(self) -> torch.Tensor:
-        """
-        Assemble full Z_II tensor (for backward compatibility).
-        
-        WARNING: This materializes full [I, I, c_z] tensor!
-        Only use when streaming is not possible downstream.
-        
-        Returns:
-            Z_II: [I, I, c_z]
-        """
-        n_par = _get_n_parallel()
-        if n_par <= 1:
-            n_par = 4  # Default chunking for assembly
-        chunks = self.get_all_chunks(n_par)
-        return torch.cat(chunks, dim=0)  # [I, I, c_z]
-    
-    @property
-    def shape(self) -> Tuple[int, int, int]:
-        """Return virtual shape [I, I, c_z] for compatibility."""
-        return (self.I, self.I, self.c_z)
-    
-    def get_base_z_at_pairs(
-        self, 
-        tok_queries: torch.Tensor,  # [L, k] or similar token indices for queries
-        tok_keys: torch.Tensor,      # [L, k] or similar token indices for keys (same shape)
-        chunk_size: int = 512,       # Process in chunks to avoid OOM
-    ) -> torch.Tensor:
-        """
-        Compute BASE Z values at sparse (query, key) token pairs.
-        
-        This computes Z_i + Z_j WITHOUT the full RPE/token_bonds/etc processing.
-        Used by ChunkedPairwiseEmbedder when Z_II is streaming.
-        Processes in chunks to avoid OOM on large inputs.
-        
-        Args:
-            tok_queries: Token indices for query positions [L, k]
-            tok_keys: Token indices for key positions [L, k]
-            chunk_size: Number of L rows to process at once
-            
-        Returns:
-            Z_pairs: [L, k, c_z] Z values at the sparse pairs
-        """
-        L = tok_queries.shape[0]
-        k = tok_queries.shape[1] if tok_queries.dim() > 1 else 1
-        device = tok_queries.device
-        
-        # Ensure stored tensors and modules are on the correct device
-        S_I = self.S_I.to(device)
-        Z_j = self.Z_j.to(device)
-        self.to_z_init_i.to(device)
-        
-        # Process in chunks to avoid OOM
-        Z_pairs_list = []
-        for start in range(0, L, chunk_size):
-            end = min(start + chunk_size, L)
-            tq_chunk = tok_queries[start:end]            # [chunk, k]
-            tk_chunk = tok_keys[start:end]               # [chunk, k]
-            
-            # Z_i: query projection at tok_queries
-            S_queries = S_I[tq_chunk]                    # [chunk, k, c_s]
-            Z_i = self.to_z_init_i(S_queries)            # [chunk, k, c_z]
-            
-            # Z_j: key projection at tok_keys  
-            Z_j_chunk = Z_j[tk_chunk]                    # [chunk, k, c_z]
-            
-            # Base Z = Z_i + Z_j
-            Z_chunk = Z_i + Z_j_chunk                    # [chunk, k, c_z]
-            Z_pairs_list.append(Z_chunk)
-        
-        result = torch.cat(Z_pairs_list, dim=0)          # [L, k, c_z]
-        
-        # DIAGNOSTIC
-        import os
-        if os.environ.get("RFD3_PARALLEL_DEBUG", "0") == "1" or True:  # Hardcoded for now
-            print(f"[DEBUG-ENCODER] get_base_z_at_pairs output shape={list(result.shape)}, mean={result.mean().item():.6f}, std={result.std().item():.6f}", flush=True)
-        
-        return result
-    
-    def get_fully_processed_z_at_pairs(
-        self,
-        tok_queries: torch.Tensor,  # [L_par, k] token indices for queries
-        tok_keys: torch.Tensor,     # [L_par, k] token indices for keys
-    ) -> torch.Tensor:
-        """
-        Compute FULLY PROCESSED Z values at sparse (query, key) token pairs.
-        
-        Unlike get_base_z_at_pairs which only computes Z_i + Z_j, this method
-        computes the complete Z including RPE, token bonds, ref_pos, transformer
-        stack, and transitions - matching what get_chunk() returns.
-        
-        Strategy:
-        1. Find unique query token indices in tok_queries
-        2. Compute full Z chunk for those token rows via get_chunk()
-        3. Build a mapping from token index -> local row index
-        4. Use sparse indexing to extract Z[tok_queries, tok_keys]
-        
-        Args:
-            tok_queries: [L_par, k] token indices for query positions
-            tok_keys: [L_par, k] token indices for key positions
-            
-        Returns:
-            Z_pairs: [L_par, k, c_z] fully processed Z at sparse pairs
-        """
-        L_par, k = tok_queries.shape
-        device = tok_queries.device
-        
-        # Find unique query tokens and build mapping
-        unique_query_toks, inverse_indices = torch.unique(
-            tok_queries.flatten(), return_inverse=True
-        )
-        inverse_indices = inverse_indices.view(L_par, k)  # [L_par, k]
-        
-        # Find the range of unique tokens to compute chunk
-        tok_min = unique_query_toks.min().item()
-        tok_max = unique_query_toks.max().item()
-        
-        # Compute full Z chunk for this token range
-        # Z_chunk: [tok_max - tok_min + 1, I, c_z]
-        Z_chunk = self.get_chunk(tok_min, tok_max + 1)
-        
-        # Map query tokens to local chunk indices
-        local_query_indices = tok_queries - tok_min  # [L_par, k]
-        
-        # Gather Z values: Z_chunk[local_query_indices, tok_keys]
-        # Z_chunk shape: [I_par_chunk, I, c_z]
-        # We need: Z_pairs[l, n] = Z_chunk[local_query_indices[l,n], tok_keys[l,n], :]
-        
-        # Clamp indices to valid range
-        local_query_indices = torch.clamp(local_query_indices, 0, Z_chunk.shape[0] - 1)
-        tok_keys_clamped = torch.clamp(tok_keys, 0, Z_chunk.shape[1] - 1)
-        
-        # Vectorized gather using advanced indexing
-        # Flatten for easier indexing, then reshape
-        Z_pairs = Z_chunk[
-            local_query_indices.flatten(),
-            tok_keys_clamped.flatten()
-        ].view(L_par, k, self.c_z)
-        
-        print(f"[DEBUG-ENCODER] get_fully_processed_z_at_pairs output shape={list(Z_pairs.shape)}, mean={Z_pairs.mean().item():.6f}, std={Z_pairs.std().item():.6f}", flush=True)
-        
-        return Z_pairs
+# NOTE: StreamingZContainer has been removed. Z chunks are now computed
+# directly in TokenInitializer._forward_streaming() and returned as tensors.
+# The chunked Z tensor [I_par, I, c_z] is passed through with streaming_mode=True
+# and z_chunk_range=(start_i, end_i) kwargs.
 
 
 class TokenInitializer(nn.Module):
     """
     Token embedding module for RFD3.
-    
+
     Supports three modes:
     1. Standard mode: Full L×L and I×I tensors materialized
     2. Chunked mode (use_chunked_pll): Sparse P_LL for attention
     3. Streaming mode (RFD3_ATTENTION_PARALLEL): No full I×I/L×L tensors ever
-       - Returns StreamingZContainer instead of Z_II tensor
+       - Returns Z_II as [I_par, I, c_z] chunk tensor with z_chunk_range
        - All downstream modules must support streaming
     """
 
@@ -556,11 +222,11 @@ class TokenInitializer(nn.Module):
         self.use_chunked_pll = use_chunked_pll
         
         # Check for streaming mode (no full I×I/L×L tensors)
-        self.n_parallel = _get_n_parallel()
-        self.use_streaming = self.n_parallel > 1
+        # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
+        self.use_streaming = _is_streaming_mode()
         if self.use_streaming:
             logger.info(
-                f"TokenInitializer: Streaming mode enabled with n_parallel={self.n_parallel}. "
+                f"TokenInitializer: Streaming mode enabled. "
                 f"No full I×I tensors will be materialized."
             )
 
@@ -673,6 +339,190 @@ class TokenInitializer(nn.Module):
         #     linearNoBias(c_z, c_z),
         # )
 
+    def _process_s_through_transformer_stack(
+        self,
+        S_I: torch.Tensor,     # [I, c_s]
+        f: dict,
+        I: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """
+        Process S_I through transformer_stack using chunked attention.
+        
+        In standard mode, transformer_stack.forward does:
+            Z_II = Z_II + z_transition(Z_II)
+            S_I = S_I + attention_pair_bias(S_I, None, Z_II, ...)
+            S_I = S_I + s_transition(S_I)
+        
+        IMPORTANT: Z_II accumulates z_transition updates across blocks!
+        Block 0 applies z_transition_0, Block 1 applies z_transition_1, etc.
+        The attention bias at block N uses Z with all previous transitions applied.
+        
+        In streaming mode, we can't materialize full Z_II, so we:
+        1. Compute base Z_chunk for this GPU's query range
+        2. Maintain Z_chunk across blocks, applying z_transition at each block
+        3. Apply chunked attention to S_I
+        4. All-gather S_I chunks to reconstruct full S_I
+        
+        Args:
+            S_I: Single features [I, c_s]
+            f: Feature dictionary
+            I: Number of tokens
+            device: Device for tensors
+            dtype: Dtype for tensors
+            
+        Returns:
+            S_I: Updated single features [I, c_s]
+        """
+        import torch.distributed as dist
+        import os
+        
+        # Ensure S_I is on the correct device for this rank
+        if dist.is_initialized():
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            expected_device = torch.device(f"cuda:{local_rank}")
+            if S_I.device != expected_device:
+                S_I = S_I.to(expected_device)
+            # Override device parameter with computed expected_device for consistency
+            device = expected_device
+        else:
+            expected_device = device
+        
+        # Get GPU range for chunking
+        gpu_rank, world_size = _get_gpu_rank_and_world_size()
+        chunk_ranges = _compute_chunk_ranges(I, world_size)
+        
+        if gpu_rank >= len(chunk_ranges):
+            return S_I  # Edge case: more GPUs than tokens
+        
+        start_i, end_i = chunk_ranges[gpu_rank]
+        I_par = end_i - start_i
+        
+        # DEBUG: Helper function for printing tensor stats (define before use)
+        def _stat_tensor(t):
+            return {
+                "shape": list(t.shape),
+                "mean": float(t.float().mean().item()),
+                "std": float(t.float().std().item()),
+                "min": float(t.float().min().item()),
+                "max": float(t.float().max().item()),
+            }
+        
+        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        
+        # Pre-compute Z_j once (used for base Z)
+        Z_j = self.to_z_init_j(S_I)                           # [I, c_z]
+        
+        # Get reference positions for Z computation
+        ref_pos = f["ref_pos"][f["is_ca"]]                    # [I, 3]
+        ref_space_uid = f["ref_space_uid"][f["is_ca"]]        # [I]
+        
+        # ================================================================
+        # Compute base Z_chunk ONCE (before any z_transition)
+        # CRITICAL: This matches standard mode where Z_init_II is computed
+        # from INITIAL S_I before the transformer_stack loop
+        # ================================================================
+        S_I_chunk = S_I[start_i:end_i]                        # [I_par, c_s]
+        
+        # DEBUG: Print S_I_chunk used for Z_chunk computation
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_COMPUTATION: S_I_chunk={_stat_tensor(S_I_chunk)}, Z_j={_stat_tensor(Z_j)}", flush=True)
+        
+        Z_i = self.to_z_init_i(S_I_chunk).unsqueeze(-2)       # [I_par, 1, c_z]
+        Z_j_full = Z_j.unsqueeze(0)                           # [1, I, c_z]
+        Z_chunk = Z_i + Z_j_full                              # [I_par, I, c_z]
+        
+        # DEBUG: Print initial Z_chunk
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_INITIAL: Z_chunk={_stat_tensor(Z_chunk)}", flush=True)
+        
+        # Add RPE
+        Z_chunk = Z_chunk + self.relative_position_encoding.forward_chunk(
+            f, start_i, end_i
+        )                                                      # [I_par, I, c_z]
+        
+        # Add token bonds
+        token_bonds_chunk = f["token_bonds"][start_i:end_i, :]  # [I_par, I]
+        Z_chunk = Z_chunk + self.process_token_bonds(
+            token_bonds_chunk.unsqueeze(-1).float()
+        )                                                      # [I_par, I, c_z]
+        
+        # Add reference position embedding
+        ref_pos_chunk = ref_pos[start_i:end_i]                # [I_par, 3]
+        ref_space_uid_chunk = ref_space_uid[start_i:end_i]    # [I_par]
+        valid_mask = (
+            ref_space_uid_chunk.unsqueeze(-1) == ref_space_uid.unsqueeze(0)
+        ).unsqueeze(-1)                                        # [I_par, I, 1]
+        ref_pos_embed = self.ref_pos_embedder_tok.forward_chunk(
+            ref_pos_chunk, ref_pos, valid_mask
+        )                                                      # [I_par, I, c_z]
+        Z_chunk = Z_chunk + ref_pos_embed
+        
+        # ================================================================
+        # Process through transformer_stack (Z_chunk accumulates updates!)
+        # ================================================================
+        # Note: _stat_tensor and is_rank0 are already defined above
+        
+        for block_idx, block in enumerate(self.transformer_stack):
+            # DEBUG: Print S_I stats at start of each block to verify it's being updated
+            if is_rank0:
+                print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} START: S_I={_stat_tensor(S_I)}, device={S_I.device}", flush=True)
+            
+            # Step 1: Apply z_transition (ACCUMULATES across blocks)
+            Z_chunk = _z_transition_chunked(Z_chunk, block.z_transition)
+            
+            # Step 2: Apply attention_pair_bias to S_I using Z_chunk as bias
+            if hasattr(block, 'attention_pair_bias'):
+                # CRITICAL: Slice S_I at the start of each iteration to get updated values
+                # S_I should have been updated from the previous iteration's all_gather
+                S_I_chunk = S_I[start_i:end_i].clone()        # [I_par, c_s] - clone to ensure fresh tensor
+                
+                # DEBUG: Print S_I_chunk stats after slicing
+                if is_rank0:
+                    print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_SLICE: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
+                
+                S_I_chunk = S_I_chunk + block.attention_pair_bias.forward_chunked(
+                    A_I_query=S_I_chunk,                       # [I_par, c_s]
+                    A_I_key=S_I,                               # [I, c_s]
+                    Z_chunk=Z_chunk,                           # [I_par, I, c_z]
+                    Beta_II=torch.tensor([0.0], device=device),
+                )                                              # [I_par, c_s]
+                S_I_chunk = S_I_chunk + block.s_transition(S_I_chunk)
+                
+                # DEBUG: Print S_I_chunk stats after processing
+                if is_rank0:
+                    print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_PROCESS: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
+            
+                # Step 3: All-gather S_I chunks to update full S_I for next block
+                # CRITICAL: This updates S_I for the next iteration
+                if world_size > 1:
+                    S_I_gathered = _all_gather_concat(S_I_chunk, dim=0)  # [I, c_s]
+                    # Ensure S_I is on the correct device after all_gather
+                    if S_I_gathered.device != expected_device:
+                        S_I_gathered = S_I_gathered.to(expected_device)
+
+                    # DEBUG: Print S_I stats from ALL ranks after all_gather to verify sync
+                    debug_tensor_all_ranks("ENCODER-S_I", f"block{block_idx}_AFTER_ALLGATHER", S_I_gathered)
+
+                    # MULTI-GPU DIAGNOSTIC: Verify S_I is synchronized across all ranks
+                    # This broadcasts from rank 0 and compares on all ranks
+                    verify_tensor_sync("ENCODER-S_I", f"block{block_idx}_S_I_SYNC", S_I_gathered)
+
+                    S_I = S_I_gathered
+                else:
+                    S_I = S_I_chunk
+                    # DEBUG: Single GPU case
+                    if is_rank0:
+                        print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} SINGLE_GPU: S_I={_stat_tensor(S_I)}", flush=True)
+
+        # MULTI-GPU DIAGNOSTIC: Final S_I sync check
+        if world_size > 1:
+            debug_tensor_all_ranks("ENCODER-S_I", "FINAL_S_I", S_I)
+            verify_tensor_sync("ENCODER-S_I", "FINAL_S_I_SYNC", S_I)
+
+        return S_I
+
     def forward(self, f):
         """
         Provides initial representation for atom and token representations.
@@ -682,7 +532,7 @@ class TokenInitializer(nn.Module):
                 - Q_L_init: [L, c_atom] initial atom features
                 - C_L: [L, c_atom] conditioned atom features
                 - S_I: [I, c_s] token single features
-                - Z_II: [I, I, c_z] OR StreamingZContainer (streaming mode)
+                - Z_II: [I, I, c_z] (full) or [I_par, I, c_z] (chunked in streaming mode)
                 - P_LL: [L, L, c_atompair] (standard mode only)
                 - chunked_pairwise_embedder: (chunked/streaming mode only)
         """
@@ -701,13 +551,30 @@ class TokenInitializer(nn.Module):
         """
         Streaming forward: never materializes full I×I tensors.
         
-        Returns StreamingZContainer instead of Z_II tensor.
+        Returns Z_II as [I_par, I, c_z] chunk tensor with z_chunk_range.
         """
-        device = tok_idx.device
+        import torch.distributed as dist
+        import os
+        
+        # Get the correct device for this rank (CRITICAL for distributed training)
+        # Use LOCAL_RANK to ensure each rank uses its assigned GPU
+        if dist.is_initialized():
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = tok_idx.device
+        
         dtype = self.to_z_init_i.weight.dtype
         
         # Ensure TokenInitializer modules are on the correct device for this rank
         self.to(device)
+        
+        # Move input tensors to the correct device
+        tok_idx = tok_idx.to(device)
+        # Move feature dict tensors to correct device
+        for key, val in f.items():
+            if isinstance(val, torch.Tensor):
+                f[key] = val.to(device)
         
         # ============================================================
         # Step 1: Compute S_I (single token features) - no I×I here
@@ -724,51 +591,218 @@ class TokenInitializer(nn.Module):
         S_I = S_I + self.transition_post_atom(S_I)        # [I, c_s]
         S_I = self.process_s_init(S_I)                    # [I, c_s]
         
-        # ============================================================
-        # Step 2: Pre-compute Z_j (key projections) - [I, c_z], NOT I×I
-        # ============================================================
-        Z_j = self.to_z_init_j(S_I)                       # [I, c_z]
+        # DEBUG: Print initial S_I after process_s_init
+        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        def _stat(t):
+            return {
+                "shape": list(t.shape),
+                "mean": float(t.float().mean().item()),
+                "std": float(t.float().std().item()),
+                "min": float(t.float().min().item()),
+                "max": float(t.float().max().item()),
+            }
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER-S_I')} INITIAL_AFTER_PROCESS_S_INIT: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
         
         # ============================================================
-        # Step 3: Create StreamingZContainer for on-demand Z computation
+        # CRITICAL FIX: Save INITIAL S_I for Z computation
         # ============================================================
-        # Get reference positions for CA atoms
+        # In non-parallel mode, Z_init_II is computed from S_I BEFORE the
+        # transformer_stack processes it. The transformer_stack then updates
+        # BOTH S_I and Z_init_II together. We must match this behavior:
+        # 1. Compute Z from INITIAL S_I (before transformer_stack)
+        # 2. Process S_I through transformer_stack to get UPDATED S_I
+        # 3. Use UPDATED S_I for downstream (atom features, etc.)
+        S_I_initial = S_I.clone()  # Save INITIAL S_I for Z computation
+        
+        # ============================================================
+        # Step 2: Pre-compute Z_j from INITIAL S_I (before transformer_stack)
+        # ============================================================
+        # This matches non-parallel mode where Z_init_II = to_z_init_i(S_I) + to_z_init_j(S_I)
+        # is computed BEFORE the transformer_stack loop
+        Z_j = self.to_z_init_j(S_I_initial)              # [I, c_z] from INITIAL S_I
+        
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_j computed from INITIAL S_I: Z_j={_stat(Z_j)}", flush=True)
+        
+        # ============================================================
+        # Step 3: Process S_I through transformer_stack
+        # ============================================================
+        # In standard mode, transformer_stack processes BOTH S_I and Z_II.
+        # In streaming mode, we must also process S_I through the attention
+        # layers, using chunked Z computation to avoid full I×I tensor.
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER-S_I')} BEFORE_TRANSFORMER_STACK: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
+
+        # CRITICAL FIX: On single GPU, use standard transformer_stack to ensure
+        # bit-identical S_I computation with standard mode. The chunked attention
+        # path in _process_s_through_transformer_stack has small numerical differences.
+        gpu_rank, world_size = _get_gpu_rank_and_world_size()
+
+        if world_size == 1:
+            # Single GPU: Use standard transformer_stack loop for identical S_I
+            # Compute full Z_init_II like standard mode
+            Z_init_II = self.to_z_init_i(S_I).unsqueeze(-3) + self.to_z_init_j(S_I).unsqueeze(-2)  # [I, I, c_z]
+            Z_init_II = Z_init_II + self.relative_position_encoding(f)  # [I, I, c_z]
+            Z_init_II = Z_init_II + self.process_token_bonds(
+                f["token_bonds"].unsqueeze(-1).float()
+            )  # [I, I, c_z]
+
+            # Reference position embedding
+            token_id = f["ref_space_uid"][f["is_ca"]]  # [I]
+            valid_mask = (token_id.unsqueeze(-1) == token_id.unsqueeze(-2)).unsqueeze(-1)  # [I, I, 1]
+            Z_init_II = Z_init_II + self.ref_pos_embedder_tok(
+                f["ref_pos"][f["is_ca"]], valid_mask
+            )  # [I, I, c_z]
+
+            # Standard transformer_stack loop - processes BOTH S_I and Z_init_II
+            for block in self.transformer_stack:
+                S_I, Z_init_II = block(S_I, Z_init_II)  # [I, c_s], [I, I, c_z]
+
+            # CRITICAL: Continue processing Z_init_II exactly like standard mode!
+            # Concatenate with relative_position_encoding2 and apply process_z_init + transition_1
+            Z_init_II = torch.cat(
+                [
+                    Z_init_II,
+                    self.relative_position_encoding2(f),
+                ],
+                dim=-1,
+            )  # [I, I, 2*c_z]
+            Z_init_II = self.process_z_init(Z_init_II)  # [I, I, c_z]
+            for b in range(2):
+                Z_init_II = Z_init_II + self.transition_1[b](Z_init_II)  # [I, I, c_z]
+
+            if is_rank0:
+                print(f"{debug_ctx.prefix('ENCODER-S_I')} SINGLE_GPU_STANDARD_PATH: S_I={_stat(S_I)}", flush=True)
+                print(f"{debug_ctx.prefix('ENCODER-S_I')} SINGLE_GPU_Z_init_II: mean={Z_init_II.float().mean():.6f}", flush=True)
+
+            # For single GPU, use the full Z_init_II tensor directly
+            # This ensures bit-identical results with standard mode
+            Q_L_init = self.atom_1d_embedder_2(f, L)  # [L, c_atom]
+            C_L = Q_L_init + self.process_s_trunk(S_I)[..., tok_idx, :]  # [L, c_atom]
+
+            return {
+                "Q_L_init": Q_L_init,
+                "C_L": C_L,
+                "chunked_pairwise_embedder": self.chunked_pairwise_embedder if self.use_chunked_pll else None,
+                "S_I": S_I,
+                "Z_II": Z_init_II,  # Full tensor [I, I, c_z]
+                "streaming_mode": False,  # Use standard path since we have full Z tensor
+            }
+        else:
+            # Multi-GPU: Use chunked attention to avoid full I×I tensor
+            S_I = self._process_s_through_transformer_stack(
+                S_I=S_I,
+                f=f,
+                I=I,
+                device=device,
+                dtype=dtype,
+            )
+
+        # DEBUG: Print S_I after processing
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER-S_I')} AFTER_TRANSFORMER_STACK: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
+
+        # CRITICAL: Ensure S_I is synchronized across all ranks before continuing
+        if dist.is_initialized():
+            dist.barrier()
+
+        # ============================================================
+        # Step 4: Compute Z chunk [I_par, I, c_z] for this GPU directly
+        # ============================================================
+        # Each GPU computes its portion of Z [I_par, I, c_z].
+        # This is equivalent to Z_init_II[start_i:end_i, :, :] but never
+        # materializes the full [I, I, c_z] tensor.
+
+        # Get this GPU's query range
+        start_i, end_i = _compute_gpu_query_range(I, gpu_rank, world_size)
+        I_par = end_i - start_i
+        qs = slice(start_i, end_i)
+
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER')} Computing Z chunk [{start_i}:{end_i}] (I_par={I_par}) for GPU {gpu_rank}/{world_size}", flush=True)
+
+        # Step 4a: Base Z = Z_i + Z_j (cross-attention style)
+        # Use S_I_initial (before transformer_stack) to match standard mode
+        S_I_chunk = S_I_initial[qs]                        # [I_par, c_s]
+        Z_i = self.to_z_init_i(S_I_chunk).unsqueeze(-2)    # [I_par, 1, c_z]
+        Z_j_expanded = Z_j.unsqueeze(0)                    # [1, I, c_z]
+        Z_chunk = Z_i + Z_j_expanded                       # [I_par, I, c_z]
+
+        debug_log("ENCODER", "Z_chunk_step1",
+                  f"Z_i+Z_j mean={Z_chunk.float().mean():.6f}")
+
+        # Step 4b: Add RPE (chunked)
+        Z_chunk = Z_chunk + self.relative_position_encoding.forward_chunk(f, start_i, end_i)
+        debug_log("ENCODER", "Z_chunk_step2_rpe",
+                  f"after RPE mean={Z_chunk.float().mean():.6f}")
+
+        # Step 4c: Add token bonds
+        token_bonds_chunk = f["token_bonds"][qs, :]       # [I_par, I]
+        Z_chunk = Z_chunk + self.process_token_bonds(
+            token_bonds_chunk.unsqueeze(-1).float()
+        )
+        debug_log("ENCODER", "Z_chunk_step3_bonds",
+                  f"after token_bonds mean={Z_chunk.float().mean():.6f}")
+
+        # Step 4d: Add reference position embedding (chunked)
         ref_pos = f["ref_pos"][f["is_ca"]]                # [I, 3]
         ref_space_uid = f["ref_space_uid"][f["is_ca"]]    # [I]
-        
-        streaming_z = StreamingZContainer(
-            S_I=S_I,                                       # [I, c_s]
-            to_z_init_i=self.to_z_init_i,
-            to_z_init_j=Z_j,                               # [I, c_z] pre-computed
-            rpe_module=self.relative_position_encoding,
-            rpe_module2=self.relative_position_encoding2,
-            token_bonds=f["token_bonds"],                  # [I, I] (small, keep full)
-            process_token_bonds=self.process_token_bonds,
-            ref_pos_embedder=self.ref_pos_embedder_tok,
-            ref_pos=ref_pos,                               # [I, 3]
-            ref_space_uid=ref_space_uid,                   # [I]
-            f=f,
-            transformer_stack=self.transformer_stack,
-            process_z_init=self.process_z_init,
-            transition_modules=self.transition_1,
-            c_z=self.c_z,
-            device=device,
-            dtype=dtype,
+        ref_pos_chunk = ref_pos[qs]                        # [I_par, 3]
+        ref_space_uid_chunk = ref_space_uid[qs]            # [I_par]
+
+        valid_mask = (
+            ref_space_uid_chunk.unsqueeze(-1) == ref_space_uid.unsqueeze(0)
+        ).unsqueeze(-1)                                    # [I_par, I, 1]
+
+        Z_chunk = Z_chunk + self.ref_pos_embedder_tok.forward_chunk(
+            ref_pos_chunk, ref_pos, valid_mask
         )
-        
+        debug_log("ENCODER", "Z_chunk_step4_refpos",
+                  f"after ref_pos mean={Z_chunk.float().mean():.6f}")
+
+        # Step 4e: Pairformer Z transitions
+        for block_idx, block in enumerate(self.transformer_stack):
+            Z_chunk = _z_transition_chunked(Z_chunk, block.z_transition)
+            debug_log("ENCODER", f"Z_chunk_step5_block{block_idx}",
+                      f"after block mean={Z_chunk.float().mean():.6f}")
+
+        # Step 4f: Concatenate with second RPE and process
+        rpe2_chunk = self.relative_position_encoding2.forward_chunk(f, start_i, end_i)
+        Z_chunk = torch.cat([Z_chunk, rpe2_chunk], dim=-1)  # [I_par, I, 2*c_z]
+        debug_log("ENCODER", "Z_chunk_step6_rpe2cat",
+                  f"after rpe2 concat mean={Z_chunk.float().mean():.6f}")
+
+        Z_chunk = self.process_z_init(Z_chunk)              # [I_par, I, c_z]
+        debug_log("ENCODER", "Z_chunk_step7_processzinit",
+                  f"after process_z_init mean={Z_chunk.float().mean():.6f}")
+
+        # Step 4g: Apply transitions
+        for b, transition in enumerate(self.transition_1):
+            Z_chunk = _z_transition_chunked(Z_chunk, transition)
+            debug_log("ENCODER", f"Z_chunk_step8_trans{b}",
+                      f"after transition_{b} mean={Z_chunk.float().mean():.6f}")
+
+        debug_log("ENCODER", "Z_chunk_FINAL",
+                  f"[{start_i}:{end_i}] mean={Z_chunk.float().mean():.6f}")
+
+        if is_rank0:
+            print(f"{debug_ctx.prefix('ENCODER')} Z_chunk computed: shape={list(Z_chunk.shape)}, mean={Z_chunk.float().mean():.6f}", flush=True)
+
         # ============================================================
-        # Step 4: Compute atom features (Q_L_init, C_L)
+        # Step 5: Compute atom features (Q_L_init, C_L)
         # ============================================================
         Q_L_init = self.atom_1d_embedder_2(f, L)          # [L, c_atom]
         C_L = Q_L_init + self.process_s_trunk(S_I)[..., tok_idx, :]  # [L, c_atom]
-        
+
         return {
             "Q_L_init": Q_L_init,                          # [L, c_atom]
             "C_L": C_L,                                    # [L, c_atom]
             "chunked_pairwise_embedder": self.chunked_pairwise_embedder if self.use_chunked_pll else None,
             "S_I": S_I,                                    # [I, c_s]
-            "Z_II": streaming_z,                           # StreamingZContainer (NOT tensor!)
-            "streaming_mode": True,                        # Flag for downstream
+            "Z_II": Z_chunk,                               # [I_par, I, c_z] - this GPU's chunk
+            "streaming_mode": True,                        # Flag: Z_II is chunked [I_par, I] not full [I, I]
+            "z_chunk_range": (start_i, end_i),             # This GPU's query range for Z
         }
     
     def _forward_standard(self, f, tok_idx, L, I):
@@ -793,10 +827,20 @@ class TokenInitializer(nn.Module):
             Z_init_II = self.to_z_init_i(S_I).unsqueeze(-3) + self.to_z_init_j(
                 S_I
             ).unsqueeze(-2)                                # [I, I, c_z]
+            
+            # DEBUG: Print step 1 Z stats (compare with streaming mode)
+            debug_log("ENCODER", "Z_init_step1",
+                      f"Z_i+Z_j mean={Z_init_II.float().mean():.6f}")
+
             Z_init_II = Z_init_II + self.relative_position_encoding(f)  # [I, I, c_z]
+            debug_log("ENCODER", "Z_init_step2_rpe",
+                      f"after RPE mean={Z_init_II.float().mean():.6f}")
+
             Z_init_II = Z_init_II + self.process_token_bonds(
                 f["token_bonds"].unsqueeze(-1).float()
             )                                              # [I, I, c_z]
+            debug_log("ENCODER", "Z_init_step3_bonds",
+                      f"after token_bonds mean={Z_init_II.float().mean():.6f}")
 
             # Embed reference coordinates of ligands
             token_id = f["ref_space_uid"][f["is_ca"]]     # [I]
@@ -806,10 +850,14 @@ class TokenInitializer(nn.Module):
             Z_init_II = Z_init_II + self.ref_pos_embedder_tok(
                 f["ref_pos"][f["is_ca"]], valid_mask
             )                                              # [I, I, c_z]
+            debug_log("ENCODER", "Z_init_step4_refpos",
+                      f"after ref_pos mean={Z_init_II.float().mean():.6f}")
 
             # Run a small transformer to provide position encodings to single.
-            for block in self.transformer_stack:
+            for block_idx, block in enumerate(self.transformer_stack):
                 S_I, Z_init_II = block(S_I, Z_init_II)    # [I, c_s], [I, I, c_z]
+                debug_log("ENCODER", f"Z_init_step5_block{block_idx}",
+                          f"after block mean={Z_init_II.float().mean():.6f}")
 
             # Also cat the relative position encoding and mix
             Z_init_II = torch.cat(
@@ -819,9 +867,21 @@ class TokenInitializer(nn.Module):
                 ],
                 dim=-1,
             )                                              # [I, I, 2*c_z]
+            debug_log("ENCODER", "Z_init_step6_rpe2cat",
+                      f"after rpe2 concat mean={Z_init_II.float().mean():.6f}")
+
             Z_init_II = self.process_z_init(Z_init_II)    # [I, I, c_z]
+            debug_log("ENCODER", "Z_init_step7_processzinit",
+                      f"after process_z_init mean={Z_init_II.float().mean():.6f}")
+
             for b in range(2):
                 Z_init_II = Z_init_II + self.transition_1[b](Z_init_II)  # [I, I, c_z]
+                debug_log("ENCODER", f"Z_init_step8_trans{b}",
+                          f"after transition_{b} mean={Z_init_II.float().mean():.6f}")
+
+            # DEBUG: Print final Z stats (compare with streaming mode)
+            debug_log("ENCODER", "Z_init_FINAL",
+                      f"mean={Z_init_II.float().mean():.6f}")
 
             return {"S_init_I": S_I, "Z_init_II": Z_init_II}
 
@@ -906,7 +966,7 @@ class DiffusionTokenEncoder(nn.Module):
     """
     Encodes token-level features for diffusion.
     
-    Supports streaming mode where Z_init_II is a StreamingZContainer
+    Supports streaming mode where Z_init_II is a [I_par, I, c_z] chunk tensor
     instead of a full [I, I, c_z] tensor.
     """
     
@@ -981,87 +1041,91 @@ class DiffusionTokenEncoder(nn.Module):
         )
         
         # Check for streaming mode
-        self.n_parallel = _get_n_parallel()
-        self.use_streaming = self.n_parallel > 1
+        # Parallel mode: =0 or unset → standard, =1 → parallel
+        self.use_streaming = _is_streaming_mode()
 
     def forward(self, f, R_L, S_init_I, Z_init_II, C_L, P_LL, **kwargs):
         """
         Forward pass for token encoding.
-        
+
         Args:
             f: Feature dictionary
             R_L: [B, L, 3] scaled positions
             S_init_I: [I, c_s] initial single features
-            Z_init_II: [I, I, c_z] OR StreamingZContainer
+            Z_init_II: [I, I, c_z] (full) OR [I_par, I, c_z] (chunked in streaming mode)
             C_L: [L, c_atom] atom conditioning features
             P_LL: [L, L, c_atompair] or None
-            **kwargs: D_II_self for self-conditioning
-            
+            **kwargs: D_II_self, streaming_mode, z_chunk_range
+
         Returns:
-            S_I: [I, c_s] updated single features  
-            Z_II: [I, I, c_z] OR StreamingZContainer
+            S_I: [I, c_s] updated single features
+            Z_II: [I, I, c_z] (full) OR [I_par, I, c_z] (chunked)
         """
-        # Check if Z_init_II is a StreamingZContainer
-        is_streaming = isinstance(Z_init_II, StreamingZContainer)
-        
-        if is_streaming:
+        # Check for streaming mode via kwargs (Z_init_II is a chunked tensor)
+        streaming_mode = kwargs.get("streaming_mode", False)
+
+        if streaming_mode:
             return self._forward_streaming(f, R_L, S_init_I, Z_init_II, **kwargs)
         else:
             return self._forward_standard(f, R_L, S_init_I, Z_init_II, **kwargs)
-    
-    def _forward_streaming(self, f, R_L, S_init_I, Z_streaming, **kwargs):
+
+    def _forward_streaming(self, f, R_L, S_init_I, Z_init_II, **kwargs):
         """
-        True multi-GPU streaming forward: each GPU processes only its query chunk.
-        
+        Multi-GPU streaming forward: each GPU processes only its query chunk.
+
+        Args:
+            Z_init_II: Pre-computed Z chunk tensor [I_par, I, c_z]
+            **kwargs: Must include z_chunk_range=(start_i, end_i)
+
         Multi-GPU parallelism:
-        - Each GPU computes Z rows for its assigned query range [gpu_start, gpu_end)
+        - Each GPU processes Z rows for its assigned query range [gpu_start, gpu_end)
         - This produces [I_par, I, c_z] per GPU, never full [I, I, c_z]
         - Single features S_I are computed per-GPU then all_gathered
-        - Distogram/self features are also computed in chunks
-        
-        Args:
-            Z_streaming: StreamingZContainer (GPU-aware)
-            
+
         Returns:
             S_I: [I, c_s] - updated single features (all_gathered)
             Z_II: [I_par, I, c_z] - THIS GPU's Z rows only (NOT full I×I!)
         """
         B = R_L.shape[0]
-        I = Z_streaming.I
         device = R_L.device
         dtype = R_L.dtype
-        
+
         # Ensure encoder modules are on the correct device for this rank
         self.to(device)
-        
-        # Get this GPU's query range
-        gpu_start, gpu_end = Z_streaming.get_gpu_query_range()
-        I_par = gpu_end - gpu_start                        # This GPU's chunk size
-        world_size = Z_streaming.world_size
-        
+
+        # Z_init_II is a pre-computed chunk tensor [I_par, I, c_z]
+        Z_chunk = Z_init_II
+        z_chunk_range = kwargs.get("z_chunk_range")
+        if z_chunk_range is None:
+            raise ValueError("streaming_mode=True requires z_chunk_range in kwargs")
+        gpu_start, gpu_end = z_chunk_range
+        I = Z_chunk.shape[1]                            # Second dim is full I
+        _, world_size = _get_gpu_rank_and_world_size()
+        base_z_dim = Z_chunk.shape[-1]                  # c_z from tensor
+
+        I_par = gpu_end - gpu_start
+
         # Step 1: Update S_I (operates on full I, no I×I)
-        # S_init_I may have batch dim [B, I, c_s] or not [I, c_s]
         S_I = S_init_I
         has_batch_S = S_I.dim() == 3
         for b in range(2):
             S_I = S_I + self.transition_1[b](S_I)
-        
-        # Step 2: Get THIS GPU's Z chunk (never materializes full I×I)
-        Z_chunk = Z_streaming.get_gpu_chunk()              # [I_par, I, c_z]
+
+        # Step 2: Expand Z chunk for batch dimension
         Z_chunk = Z_chunk.unsqueeze(0).expand(B, -1, -1, -1)  # [B, I_par, I, c_z]
-        
+
         # Step 3: Add distogram for this GPU's query chunk
         if self.use_distogram:
             R_ca = R_L[..., f["is_ca"], :]                 # [B, I, 3]
-            
+
             if self.use_sinusoidal_distogram_embedder:
                 R_ca_query = R_ca[:, gpu_start:gpu_end, :] # [B, I_par, 3]
-                
+
                 # Mask: [I_par, I, 1] - query chunk vs all keys
                 motif_mask = f["is_motif_atom_with_fixed_coord"][f["is_ca"]]  # [I]
                 motif_query = motif_mask[gpu_start:gpu_end]                    # [I_par]
                 mask_chunk = (motif_query[:, None] != motif_mask[None, :]).unsqueeze(-1)
-                
+
                 # Sinusoidal distance embedding for this chunk
                 D_chunk = self.dist_embedder.forward_chunk(
                     R_ca_query, R_ca, ~mask_chunk
@@ -1074,14 +1138,8 @@ class DiffusionTokenEncoder(nn.Module):
                     n_bins=self.n_bins_distogram
                 )                                          # [B, I_par, I, n_bins]
             Z_chunk = torch.cat([Z_chunk, D_chunk], dim=-1)
-        
+
         # Step 4: Add self-conditioning for this GPU's chunk
-        #
-        # IMPORTANT: Base Z comes from TokenInitializer (Z_streaming.c_z), NOT self.c_z!
-        # The expected dimension for process_z is calculated at init time using self.c_z,
-        # so we MUST ensure TokenInitializer.c_z == DiffusionTokenEncoder.c_z.
-        #
-        base_z_dim = Z_streaming.c_z  # TokenInitializer's c_z
         expected_dim = base_z_dim
         if self.use_distogram:
             if self.use_sinusoidal_distogram_embedder:

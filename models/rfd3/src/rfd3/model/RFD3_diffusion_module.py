@@ -22,10 +22,10 @@ from rfd3.model.layers.blocks import (
 )
 from rfd3.model.layers.encoders import (
     DiffusionTokenEncoder,
-    StreamingZContainer,
 )
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
 from rfd3.model.layers.streaming import compute_chunk_ranges
+from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks, verify_tensor_sync
 
 from foundry.model.layers.blocks import (
     FourierEmbedding,
@@ -41,35 +41,20 @@ def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
     """Log tensor statistics for debugging parallel vs non-parallel differences."""
     if not PARALLEL_DEBUG:
         return
-    if dist.is_initialized() and dist.get_rank() != rank:
-        return  # Only log from specified rank
-    
-    if tensor is None:
-        print(f"[DEBUG] {name}: None", flush=True)
-        return
-    
-    with torch.no_grad():
-        t = tensor.float()
-        stats = {
-            "shape": list(tensor.shape),
-            "mean": f"{t.mean().item():.6f}",
-            "std": f"{t.std().item():.6f}",
-            "min": f"{t.min().item():.6f}",
-            "max": f"{t.max().item():.6f}",
-            "abs_mean": f"{t.abs().mean().item():.6f}",
-        }
-    print(f"[DEBUG] {name}: {stats}", flush=True)
+    # Use centralized debug context for consistent formatting
+    debug_tensor("MODEL", name, tensor, rank)
 
 
-def _get_n_parallel() -> int:
-    """Get parallelism factor from environment, or 0 if not set."""
-    val = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
-    if val is None:
-        return 0
-    try:
-        return int(val)
-    except ValueError:
-        return 0
+def _is_streaming_mode() -> bool:
+    """
+    Check if streaming/parallel mode is enabled.
+
+    Env var scheme:
+      - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
+      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+    """
+    val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+    return val == "1"
 
 
 def _get_gpu_rank_and_world_size() -> tuple[int, int]:
@@ -355,7 +340,7 @@ class RFD3DiffusionModule(nn.Module):
         if gpu_rank == 0:
             with torch.no_grad():
                 print(
-                    "[DEBUG-DIFF] xattn input shapes:",
+                    f"{debug_ctx.prefix('DIFF')} xattn input shapes:",
                     {
                         "A_I_full": list(A_I.shape),
                         "A_I_chunk": list(A_I_chunk.shape),
@@ -376,10 +361,17 @@ class RFD3DiffusionModule(nn.Module):
             query_start=start_i,                           # Global query start index
             world_size=world_size,
         )                                                  # [B, I_par, c_token]
-        
+
+        # MULTI-GPU DIAGNOSTIC: Log A_I_chunk stats from ALL ranks before gathering
+        debug_tensor_all_ranks("DIFF_XATTN", f"A_I_chunk_q{start_i}-{end_i}", A_I_chunk)
+
         # Gather chunks from all GPUs along token dimension (dim=1)
         A_I = _all_gather_along_dim(A_I_chunk, world_size, dim=1)  # [B, I, c_token]
-        
+
+        # MULTI-GPU DIAGNOSTIC: Verify A_I is synchronized after all_gather
+        debug_tensor_all_ranks("DIFF_XATTN", "A_I_after_gather", A_I)
+        verify_tensor_sync("DIFF_XATTN", "A_I_SYNC", A_I)
+
         return A_I
 
     def _decoder_parallel(
@@ -449,6 +441,9 @@ class RFD3DiffusionModule(nn.Module):
             query_end=end_l,
         )  # [L_par, L, c_atompair]
         
+        # MULTI-GPU DIAGNOSTIC: Log P_LL_chunk stats from ALL ranks
+        debug_tensor_all_ranks("DECODER_PAR", f"P_LL_chunk_q{start_l}-{end_l}", P_LL_chunk)
+
         # Call decoder with cross-attention
         A_I, Q_L, o = self.decoder.forward_parallel(
             A_I=A_I,                                       # [B, I, c_token]
@@ -463,7 +458,11 @@ class RFD3DiffusionModule(nn.Module):
             all_gather_fn=_all_gather_along_dim,
             world_size=world_size,
         )
-        
+
+        # MULTI-GPU DIAGNOSTIC: Log output Q_L stats from ALL ranks
+        debug_tensor_all_ranks("DECODER_PAR", "Q_L_output", Q_L)
+        verify_tensor_sync("DECODER_PAR", "Q_L_SYNC", Q_L)
+
         return A_I, Q_L, o
 
     def _decoder_parallel_sparse(
@@ -526,6 +525,10 @@ class RFD3DiffusionModule(nn.Module):
         indices_chunk = f["attn_indices"][:, start_l:end_l, :]  # [B, L_par, k]
         tok_idx_chunk = tok_idx[start_l:end_l]                   # [L_par]
         
+        # MULTI-GPU DIAGNOSTIC: Log chunk info from ALL ranks
+        debug_log_all_ranks("DECODER_SPARSE", "chunk_info",
+                           f"query_range=[{start_l},{end_l}], L_par={L_par}, indices_chunk_shape={list(indices_chunk.shape)}")
+
         # Call decoder with sparse P_LL computation for this GPU's chunk
         # The chunked_pairwise_embedder computes P_LL only for the (L_par, k) pairs
         A_I, Q_L, o = self.decoder.forward_parallel_sparse(
@@ -545,7 +548,11 @@ class RFD3DiffusionModule(nn.Module):
             all_gather_fn=_all_gather_along_dim,
             world_size=world_size,
         )
-        
+
+        # MULTI-GPU DIAGNOSTIC: Log output Q_L stats from ALL ranks
+        debug_tensor_all_ranks("DECODER_SPARSE", "Q_L_output", Q_L)
+        verify_tensor_sync("DECODER_SPARSE", "Q_L_SYNC", Q_L)
+
         return A_I, Q_L, o
 
     def _compute_P_LL_chunk(
@@ -612,27 +619,30 @@ class RFD3DiffusionModule(nn.Module):
         
         # === Z_II contribution (if available) ===
         if Z_II is not None:
-            # Z_II may be [I, I, c_z] tensor OR StreamingZContainer
             tok_idx_q = tok_idx[query_start:query_end]  # [L_par]
-            
-            if isinstance(Z_II, StreamingZContainer):
-                # Streaming mode: compute Z chunk for these atoms' tokens
-                # Map atom indices to token indices
+
+            # Check for streaming mode via kwargs
+            streaming_mode = kwargs.get("streaming_mode", False)
+            z_chunk_range = kwargs.get("z_chunk_range")
+
+            if streaming_mode and z_chunk_range is not None:
+                # Streaming mode: Z_II is pre-computed [I_par, I, c_z] chunk
+                z_start, z_end = z_chunk_range
+                I_par_z = Z_II.shape[0]
+                I_z = Z_II.shape[1]
+
+                # Map atom query token indices to local Z chunk indices
                 tok_q = tok_idx_q  # [L_par]
                 tok_all = tok_idx  # [L]
-                
-                # Get unique query tokens and their positions
-                unique_toks, inverse_idx = torch.unique(tok_q, return_inverse=True)
-                tok_start = unique_toks.min().item()
-                tok_end = unique_toks.max().item() + 1
-                
-                # Get fully processed Z for the token range
-                Z_tok_chunk = Z_II.get_chunk(tok_start, tok_end)  # [tok_range, I, c_z]
-                
-                # Map back to atom level: Z_chunk[l, m, :] = Z_tok_chunk[tok_q[l] - tok_start, tok_all[m], :]
-                tok_q_offset = tok_q - tok_start  # [L_par]
-                Z_chunk = Z_tok_chunk[tok_q_offset][:, tok_all]  # [L_par, L, c_z]
-                
+
+                # Map to local chunk indices (assuming alignment)
+                local_tok_q = tok_q - z_start  # [L_par]
+                local_tok_q = torch.clamp(local_tok_q, 0, I_par_z - 1)
+                tok_all_clamped = torch.clamp(tok_all, 0, I_z - 1)
+
+                # Index into chunked Z
+                Z_chunk = Z_II[local_tok_q][:, tok_all_clamped]  # [L_par, L, c_z]
+
                 # Process through linear layer
                 if hasattr(self.diffusion_token_encoder, 'process_z'):
                     Z_chunk = self.diffusion_token_encoder.process_z(Z_chunk)
@@ -641,12 +651,12 @@ class RFD3DiffusionModule(nn.Module):
                 processed_Z = self.diffusion_token_encoder.process_z(Z_II) if hasattr(self.diffusion_token_encoder, 'process_z') else Z_II
                 # Gather: Z_II[tok_idx_q, tok_idx_all, :] → [L_par, L, c_z]
                 Z_chunk = processed_Z[tok_idx_q][:, tok_idx]   # [L_par, L, c_z]
-            
+
             # Project to c_atompair if dimensions differ
             if Z_chunk.shape[-1] != c_atompair:
                 # Simple linear projection (in practice, use a learned layer)
                 Z_chunk = Z_chunk[..., :c_atompair]
-            
+
             P_LL_chunk = P_LL_chunk + Z_chunk
         
         # Apply mask
@@ -684,11 +694,11 @@ class RFD3DiffusionModule(nn.Module):
             C_L: [L, c_atom] conditioned atom features
             P_LL: [L, L, c_atompair] or None (chunked/streaming mode)
             S_I: [I, c_s] token single features
-            Z_II: [I, I, c_z] OR StreamingZContainer (streaming mode)
+            Z_II: [I, I, c_z] (full) OR [I_par, I, c_z] (chunked in streaming mode)
             n_recycle: Number of recycle iterations
             chunked_pairwise_embedder: ChunkedPairwiseEmbedder or None
             initializer_outputs: Dict with additional outputs
-            streaming_mode: If True, Z_II is a StreamingZContainer
+            streaming_mode: If True, Z_II is [I_par, I, c_z] (chunked tensor)
             
         Returns:
             dict with X_L, sequence_indices_I, sequence_logits_I
@@ -712,9 +722,15 @@ class RFD3DiffusionModule(nn.Module):
         tok_idx = f["atom_to_token_map"]                   # [L]
         L = len(tok_idx)
         I = tok_idx.max() + 1                              # Number of tokens
-        
-        # Check if we're in streaming mode
-        is_streaming = streaming_mode or isinstance(Z_II, StreamingZContainer)
+
+        # DIAGNOSTIC: Log input shapes at model entry (auto-detects mode from env)
+        debug_ctx.auto_detect_mode()
+        z_info = f"shape={list(Z_II.shape)}" if hasattr(Z_II, 'shape') else "tensor"
+        p_info = f"shape={list(P_LL.shape)}" if P_LL is not None else "None (chunked)"
+        debug_log("MODEL", "forward_START", f"L={L}, I={I}, X={list(X_noisy_L.shape)}, Z={z_info}, P={p_info}")
+
+        # Check if we're in streaming mode (Z_II is [I_par, I, c_z] instead of [I, I, c_z])
+        is_streaming = streaming_mode
         
         # Create attention indices
         f["attn_indices"] = create_attention_indices(
@@ -747,9 +763,15 @@ class RFD3DiffusionModule(nn.Module):
         C_L = C_L + self.process_c(C_L)                          # [B, L, c_atom]
 
         # ... Run Local-Atom Self Attention and Pool
-        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", None)
-        
-        if attn_parallel is not None and dist.is_initialized() and dist.get_world_size() > 1:
+        # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
+        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+        attn_parallel_enabled = (
+            attn_parallel == "1"
+            and dist.is_initialized()
+            and dist.get_world_size() > 1
+        )
+
+        if attn_parallel_enabled:
             # PARALLEL MODE: Split L atoms across GPUs
             # Each GPU processes L_par = L / n_gpus atom queries
             rank = dist.get_rank()
@@ -847,7 +869,7 @@ class RFD3DiffusionModule(nn.Module):
         
         Args:
             n_recycle: Number of recycle iterations (None = use self.n_recycle)
-            streaming_mode: If True, Z_II is handled as StreamingZContainer
+            streaming_mode: If True, Z_II is handled as [I_par, I, c_z] chunk
             **kwargs: Passed to process_()
         """
         if not self.training:
@@ -895,7 +917,7 @@ class RFD3DiffusionModule(nn.Module):
         chunked_pairwise_embedder=None,
         initializer_outputs=None,
         streaming_mode=False,
-        **_,
+        **kwargs,
     ):
         """
         Single recycling step.
@@ -912,7 +934,7 @@ class RFD3DiffusionModule(nn.Module):
             P_LL: [L, L, c_atompair] or None
             A_I: [B, I, c_token] token features
             S_I: [B, I, c_s] single features
-            Z_II: [I, I, c_z] OR StreamingZContainer
+            Z_II: [I, I, c_z] (full) OR [I_par, I, c_z] (chunked)
             chunked_pairwise_embedder: For sparse P_LL computation
             initializer_outputs: Additional outputs from TokenInitializer
             streaming_mode: If True, use streaming Z processing
@@ -920,25 +942,31 @@ class RFD3DiffusionModule(nn.Module):
         Returns:
             dict with X_L, D_II_self, sequence_logits_I, sequence_indices_I
         """
-        # Determine if Z_II is streaming
-        is_streaming = streaming_mode or isinstance(Z_II, StreamingZContainer)
-        
+        # Determine if Z_II is streaming (Z_II is [I_par, I, c_z] instead of [I, I, c_z])
+        is_streaming = streaming_mode
+
+        # Get z_chunk_range from kwargs or initializer_outputs
+        z_chunk_range = kwargs.get("z_chunk_range")
+        if z_chunk_range is None and initializer_outputs is not None:
+            z_chunk_range = initializer_outputs.get("z_chunk_range")
+
         # ... Embed token level features with atom level encodings
         S_I, Z_II = self.diffusion_token_encoder(
             f=f,
             R_L=R_L_uniform,                               # [B, L, 3]
             D_II_self=D_II_self,                           # [B, I, I, n_bins] or None
             S_init_I=S_I,                                  # [B, I, c_s]
-            Z_init_II=Z_II,                                # [I, I, c_z] or StreamingZContainer
+            Z_init_II=Z_II,                                # [I, I, c_z] or [I_par, I, c_z]
             C_L=C_L,                                       # [B, L, c_atom]
             P_LL=P_LL,                                     # [L, L, c_atompair] or None
-        )                                                  # Returns: [I, c_s], [I, I, c_z] or [B, I, I, c_z]
+            streaming_mode=streaming_mode,
+            z_chunk_range=z_chunk_range,
+        )                                                  # Returns: [I, c_s], [I, I, c_z] or [I_par, I, c_z]
 
         # Determine full mode for transformer
-        n_parallel = _get_n_parallel()
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
         use_full_attention = not (
-            os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1" or n_parallel > 1
+            os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1" or _is_streaming_mode()
         )
         
         # Check if Z_II is chunked (from streaming encoder)
@@ -1088,6 +1116,13 @@ class RFD3DiffusionModule(nn.Module):
         else:
             # Standard mode: compute full D_II_self
             D_II_self = self.bucketize_fn(X_out_L[..., f["is_ca"], :].detach())  # [B, I, I, n_bins]
+
+        # MULTI-GPU DIAGNOSTIC: Verify final outputs are synchronized across all ranks
+        if z_is_chunked:
+            debug_tensor_all_ranks("FINAL_OUTPUT", "X_out_L", X_out_L)
+            verify_tensor_sync("FINAL_OUTPUT", "X_out_L_SYNC", X_out_L)
+            if D_II_self is not None:
+                debug_tensor_all_ranks("FINAL_OUTPUT", "D_II_self", D_II_self)
 
         return {
             "X_L": X_out_L,                                # [B, L, 3]
