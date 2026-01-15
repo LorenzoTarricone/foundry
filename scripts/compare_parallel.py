@@ -85,6 +85,12 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # Reset the default generator to ensure identical state
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            torch.cuda.set_device(i)
+            torch.cuda.manual_seed(seed)
+        torch.cuda.set_device(0)  # Reset to default
 
 
 def compare_tensors(name: str, t1: torch.Tensor, t2: torch.Tensor, atol: float = 1e-5) -> dict:
@@ -176,6 +182,11 @@ def build_rfd3_spec(length: int, symmetry: str = None):
 def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sampler: dict,
                        ckpt_path: str, seed: int) -> torch.Tensor:
     """Run standard (1 GPU) inference and return coordinates."""
+    # CRITICAL: Set seed BEFORE any rfd3 imports to ensure deterministic behavior
+    # Module imports can consume random numbers during initialization
+    print(f"  Setting seed={seed} BEFORE imports...")
+    set_seed(seed)
+
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
     from rfd3.model.debug_context import debug_ctx
 
@@ -183,7 +194,6 @@ def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sample
     os.environ["RFD3_LOW_MEMORY_MODE"] = "1"
     debug_ctx.set_mode("STANDARD")
     debug_ctx.set_step(-1)
-    set_seed(seed)
 
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
@@ -196,6 +206,11 @@ def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sample
 
     print("  Initializing standard RFD3 engine...")
     engine = RFD3InferenceEngine(**rfd3_config)
+
+    # Set seed AGAIN after engine init to ensure diffusion sampling is identical
+    # (engine init may consume random numbers non-deterministically)
+    print(f"  Re-setting seed={seed} after engine init...")
+    set_seed(seed)
 
     print("  Running standard forward pass...")
     with torch.no_grad():
@@ -218,6 +233,11 @@ def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sample
 def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_inference_sampler: dict,
                                    ckpt_path: str, seed: int, output_cache: str) -> int:
     """Run parallel (N GPU) inference in distributed mode and save results."""
+    # CRITICAL: Set seed BEFORE any rfd3 imports to ensure deterministic behavior
+    # Module imports can consume random numbers during initialization
+    # NOTE: set_seed uses torch which is already imported at module level
+    set_seed(seed)
+
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
     from rfd3.model.debug_context import debug_ctx
 
@@ -227,13 +247,18 @@ def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_infe
         if is_main_process():
             print(msg)
 
+    log(f"  Seed={seed} set BEFORE imports (all ranks)")
+
+    # Synchronize after seeding to ensure all ranks start identically
+    if dist.is_initialized():
+        dist.barrier()
+
     log(f"  Parallel mode: rank={rank}, world_size={world_size}")
 
     os.environ["RFD3_ATTENTION_PARALLEL"] = "1"
     os.environ["RFD3_LOW_MEMORY_MODE"] = "1"
     debug_ctx.set_mode("PARALLEL")
     debug_ctx.set_step(-1)
-    set_seed(seed)
 
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
@@ -246,6 +271,14 @@ def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_infe
 
     log("  Initializing parallel RFD3 engine...")
     engine = RFD3InferenceEngine(**rfd3_config)
+
+    # Set seed AGAIN after engine init to ensure diffusion sampling is identical
+    log(f"  Re-setting seed={seed} after engine init (all ranks)...")
+    set_seed(seed)
+
+    # Synchronize after seeding to ensure all ranks are ready
+    if dist.is_initialized():
+        dist.barrier()
 
     log("  Running parallel forward pass...")
     with torch.no_grad():

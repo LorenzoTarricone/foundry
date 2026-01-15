@@ -317,6 +317,132 @@ def _topk_with_mask(dist: torch.Tensor, mask: torch.Tensor, k: int) -> torch.Ten
 
 
 @torch.no_grad()
+def _build_index_mask_chunked(
+    chunk_start: int,
+    chunk_end: int,
+    tok_idx: torch.Tensor,  # [L]
+    n_sequence_neighbours: int,
+    k_max: int,
+    chain_id: torch.Tensor | None,  # [L] or None
+    base_unindex_mask: torch.Tensor,  # [I, I]
+    n_atoms_per_token: torch.Tensor,  # [I]
+) -> torch.Tensor:
+    """
+    Build index mask for a chunk of query rows without materializing full L×L.
+
+    Replicates build_index_mask logic exactly, but only for rows [chunk_start:chunk_end].
+
+    Returns:
+        mask: [chunk_size, L] boolean mask
+    """
+    L = tok_idx.shape[0]
+    I = int(tok_idx.max()) + 1
+    device = tok_idx.device
+    half_k = k_max // 2
+    chunk_size = chunk_end - chunk_start
+
+    # Query indices and tokens for this chunk
+    query_indices = torch.arange(chunk_start, chunk_end, device=device)  # [Q]
+    query_tokens = tok_idx[chunk_start:chunk_end]  # [Q]
+
+    # All atom indices
+    all_indices = torch.arange(L, device=device)  # [L]
+
+    # 1. Token-level neighbor mask: |tok_idx[i] - tok_idx[j]| <= n_sequence_neighbours
+    # Shape: [Q, L]
+    token_diff = (query_tokens[:, None] - tok_idx[None, :]).abs()
+    token_in_range = token_diff <= n_sequence_neighbours
+
+    # 2. Atom distance constraint: |i - j| <= k_max // 2
+    # Shape: [Q, L]
+    atom_diff = (query_indices[:, None] - all_indices[None, :]).abs()
+    atom_in_range = atom_diff <= half_k
+
+    # 3. Base mask from unindexing_pair_mask
+    # Shape: [Q, L]
+    base_mask_chunk = ~base_unindex_mask[query_tokens[:, None], tok_idx[None, :]]
+
+    # Combine constraints
+    mask = token_in_range & atom_in_range & base_mask_chunk
+
+    # 4. Chain constraint (if applicable)
+    if chain_id is not None:
+        query_chains = chain_id[chunk_start:chunk_end]  # [Q]
+        same_chain = query_chains[:, None] == chain_id[None, :]  # [Q, L]
+        mask = mask & same_chain
+
+    # 5. "Fully included token" check
+    # For each (query_row, token) pair, count how many atoms from that token are in the mask
+    # A token is fully included only if ALL its atoms pass the mask
+    #
+    # n_candidates_per_token[q, t] = number of t's atoms in mask[q, :]
+    # fully_included[q, t] = (n_candidates_per_token[q, t] == n_atoms_per_token[t])
+
+    # Count candidates per token for each query row: [Q, I]
+    n_candidates_per_token = torch.zeros(chunk_size, I, device=device)
+    # Expand tok_idx to [Q, L] and use it to scatter mask values
+    tok_idx_expanded = tok_idx[None, :].expand(chunk_size, -1)  # [Q, L]
+    n_candidates_per_token.scatter_add_(1, tok_idx_expanded, mask.float())
+
+    # Token is fully included if count matches total atoms in token
+    # Shape: [Q, I]
+    fully_included = (n_candidates_per_token == n_atoms_per_token[None, :]) & (n_atoms_per_token[None, :] > 0)
+
+    # Map back to atoms: for each (q, j), check if tok_idx[j] is fully included for query q
+    # Shape: [Q, L]
+    fully_included_per_atom = fully_included.gather(1, tok_idx_expanded)
+
+    # Final mask: only include atoms from fully-included tokens
+    mask = mask & fully_included_per_atom
+
+    return mask
+
+
+@torch.no_grad()
+def _extend_index_mask_with_neighbours_chunked(
+    mask: torch.Tensor,  # [Q, L] boolean
+    D_chunk: torch.Tensor,  # [Q, L] distances
+    k: int,
+) -> torch.Tensor:
+    """
+    Extend index mask with k-NN neighbors for a chunk of queries.
+
+    Replicates extend_index_mask_with_neighbours logic exactly.
+
+    Returns:
+        indices: [Q, k] long tensor of neighbor indices
+    """
+    Q, L = mask.shape
+    device = mask.device
+    k = min(k, L)
+    inf = torch.tensor(float("inf"), dtype=D_chunk.dtype, device=device)
+
+    # 1. Selection of forced sequence neighbors (from mask)
+    # For each row, collect indices where mask is True
+    all_idx = torch.arange(L, device=device).expand(Q, L)  # [Q, L]
+    forced_indices = torch.where(mask, all_idx, inf.long() if inf.long() == inf else torch.full_like(all_idx, L))
+    # Sort to get forced neighbors first (inf/L values go to end)
+    forced_indices_float = forced_indices.float()
+    forced_indices_float = torch.where(mask, forced_indices_float, inf)
+    forced_sorted = forced_indices_float.sort(dim=1)[0][:, :k]  # [Q, k]
+
+    # 2. Find k-NN excluding forced indices (mask out forced positions)
+    D_masked = torch.where(mask, inf, D_chunk)  # [Q, L]
+    filler_idx = torch.topk(D_masked, k, dim=-1, largest=False).indices  # [Q, k]
+
+    # Reverse filler so best matches are last (to fill from end)
+    filler_idx = filler_idx.flip(dims=[-1])
+
+    # 3. Fill: use forced where available, filler otherwise
+    to_fill = forced_sorted >= L  # positions with sentinel values
+    # Handle inf values properly
+    to_fill = to_fill | ~torch.isfinite(forced_sorted)
+    indices = torch.where(to_fill, filler_idx.float(), forced_sorted).long()
+
+    return indices
+
+
+@torch.no_grad()
 def create_attention_indices_parallel(
     f,
     n_attn_keys: int,
@@ -328,19 +454,24 @@ def create_attention_indices_parallel(
 ):
     """
     Memory-efficient attention index builder that avoids full LxL tensors.
-    
+
+    IMPORTANT: This now replicates the EXACT behavior of the standard algorithm
+    (build_index_mask + extend_index_mask_with_neighbours), but processes in chunks
+    to avoid materializing the full L×L distance matrix.
+
     Processes queries in small chunks (capped at max_chunk_size) to avoid OOM.
     Each chunk computes distances [chunk, L] which is manageable.
-    
+
     For 84k atoms with max_chunk_size=2048:
     - Creates ~41 chunks
     - Each chunk: [2048, 84k] = 172M entries = ~1.4GB per intermediate tensor
-    
+
     Returns FULL indices [B, L, k] for encoder compatibility.
     """
     tok_idx = f["atom_to_token_map"] if tok_idx is None else tok_idx
     device = X_L.device if X_L is not None else tok_idx.device
     L = len(tok_idx)
+    I = int(tok_idx.max()) + 1
 
     # Prepare coordinates
     if X_L is None:
@@ -354,12 +485,10 @@ def create_attention_indices_parallel(
     # Chain handling (match original heuristic)
     chain_ids = f["asym_id"][tok_idx] if "asym_id" in f else None
     multi_chain = chain_ids is not None and len(torch.unique(chain_ids)) > 3
-    if multi_chain:
-        k_inter = max(32, k_total // 4)
-        k_intra = max(k_total - k_inter, 0)
-    else:
-        k_inter = 0
-        k_intra = 0
+
+    # Precompute n_atoms_per_token (needed for "fully included" check)
+    n_atoms_per_token = torch.zeros(I, device=device)
+    n_atoms_per_token.scatter_add_(0, tok_idx.long(), torch.ones(L, device=device))
 
     # Chunk size: cap at max_chunk_size to avoid OOM on [chunk, L] intermediates
     chunk_size = min(max(1, (L + n_parallel - 1) // n_parallel), max_chunk_size)
@@ -367,48 +496,60 @@ def create_attention_indices_parallel(
     # Output tensor - FULL indices [B, L, k] for encoder compatibility
     indices_out = torch.zeros(B, L, k_total, device=device, dtype=torch.long)
 
+    base_unindex_mask = f["unindexing_pair_mask"]  # token-level [I, I]
+
     for b in range(B):
         X_all = X_L[b]  # (L, 3)
-        base_unindex_mask = f["unindexing_pair_mask"]  # token-level [I, I]
-        all_tok = tok_idx
-        all_chain = chain_ids if chain_ids is not None else None
 
-        for i_start in range(0, L, chunk_size):
-            i_end = min(i_start + chunk_size, L)
-            i_slice = slice(i_start, i_end)
+        if multi_chain:
+            # For multi-chain: split into intra-chain and inter-chain
+            k_inter = max(32, k_total // 4)
+            k_intra = k_total - k_inter
 
-            X_q = X_all[i_slice]  # (Q, 3)
-            # Distance for this chunk only: (Q, L)
-            D_chunk = torch.cdist(X_q.unsqueeze(0), X_all.unsqueeze(0), p=2).squeeze(0)
+            for i_start in range(0, L, chunk_size):
+                i_end = min(i_start + chunk_size, L)
 
-            tok_q = all_tok[i_slice]
-            # Base mask derived per-chunk to avoid full LxL
-            base_mask_chunk = ~base_unindex_mask[tok_q[:, None], all_tok[None, :]]
-            seq_mask = (tok_q[:, None] - all_tok[None, :]).abs() <= n_attn_seq_neighbours
-            allowed = base_mask_chunk & seq_mask
+                X_q = X_all[i_start:i_end]  # (Q, 3)
+                D_chunk = torch.cdist(X_q.unsqueeze(0), X_all.unsqueeze(0), p=2).squeeze(0)
 
-            if multi_chain:
-                chain_q = all_chain[i_slice]
-                same_chain = chain_q[:, None] == all_chain[None, :]
-                diff_chain = ~same_chain
+                # Build mask for intra-chain (same chain only)
+                mask_intra = _build_index_mask_chunked(
+                    i_start, i_end, tok_idx, n_attn_seq_neighbours, k_intra,
+                    chain_ids, base_unindex_mask, n_atoms_per_token
+                )
+                intra_idx = _extend_index_mask_with_neighbours_chunked(mask_intra, D_chunk, k_intra)
 
-                allowed_intra = allowed & same_chain
-                allowed_inter = allowed & diff_chain
-
-                intra_idx = _topk_with_mask(D_chunk, allowed_intra, k_intra)
+                # Inter-chain: different chain, closest k_inter neighbors
+                query_chains = chain_ids[i_start:i_end]
+                diff_chain = query_chains[:, None] != chain_ids[None, :]
+                base_mask_chunk = ~base_unindex_mask[tok_idx[i_start:i_end, None], tok_idx[None, :]]
+                allowed_inter = diff_chain & base_mask_chunk
                 inter_idx = _topk_with_mask(D_chunk, allowed_inter, k_inter)
+
                 idx_chunk = torch.cat([intra_idx, inter_idx], dim=-1)
-            else:
-                idx_chunk = _topk_with_mask(D_chunk, allowed, k_total)
+                indices_out[b, i_start:i_end, :] = idx_chunk
 
-            # Ensure we fill exactly k_total (pad/truncate)
-            if idx_chunk.shape[-1] < k_total:
-                pad = torch.zeros(idx_chunk.shape[0], k_total - idx_chunk.shape[-1], device=device, dtype=torch.long)
-                idx_chunk = torch.cat([idx_chunk, pad], dim=-1)
-            elif idx_chunk.shape[-1] > k_total:
-                idx_chunk = idx_chunk[:, :k_total]
+        else:
+            # Single chain or small structure: use exact standard algorithm
+            for i_start in range(0, L, chunk_size):
+                i_end = min(i_start + chunk_size, L)
 
-            indices_out[b, i_slice, :] = idx_chunk
+                X_q = X_all[i_start:i_end]  # (Q, 3)
+                D_chunk = torch.cdist(X_q.unsqueeze(0), X_all.unsqueeze(0), p=2).squeeze(0)
+
+                # Build mask using exact same logic as build_index_mask
+                mask = _build_index_mask_chunked(
+                    i_start, i_end, tok_idx, n_attn_seq_neighbours, k_total,
+                    chain_ids, base_unindex_mask, n_atoms_per_token
+                )
+
+                # Extend with neighbors using exact same logic
+                idx_chunk = _extend_index_mask_with_neighbours_chunked(mask, D_chunk, k_total)
+
+                indices_out[b, i_start:i_end, :] = idx_chunk
+
+    # Sort indices along last dimension (matching standard behavior)
+    indices_out, _ = torch.sort(indices_out, dim=-1)
 
     return indices_out
 

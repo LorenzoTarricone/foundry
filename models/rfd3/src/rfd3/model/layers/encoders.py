@@ -829,18 +829,23 @@ class TokenInitializer(nn.Module):
             ).unsqueeze(-2)                                # [I, I, c_z]
             
             # DEBUG: Print step 1 Z stats (compare with streaming mode)
+            # Also print mean of first half for direct comparison with parallel GPU 0
+            I_half = Z_init_II.shape[0] // 2
             debug_log("ENCODER", "Z_init_step1",
-                      f"Z_i+Z_j mean={Z_init_II.float().mean():.6f}")
+                      f"Z_i+Z_j mean={Z_init_II.float().mean():.6f}, "
+                      f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             Z_init_II = Z_init_II + self.relative_position_encoding(f)  # [I, I, c_z]
             debug_log("ENCODER", "Z_init_step2_rpe",
-                      f"after RPE mean={Z_init_II.float().mean():.6f}")
+                      f"after RPE mean={Z_init_II.float().mean():.6f}, "
+                      f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             Z_init_II = Z_init_II + self.process_token_bonds(
                 f["token_bonds"].unsqueeze(-1).float()
             )                                              # [I, I, c_z]
             debug_log("ENCODER", "Z_init_step3_bonds",
-                      f"after token_bonds mean={Z_init_II.float().mean():.6f}")
+                      f"after token_bonds mean={Z_init_II.float().mean():.6f}, "
+                      f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             # Embed reference coordinates of ligands
             token_id = f["ref_space_uid"][f["is_ca"]]     # [I]
@@ -851,13 +856,15 @@ class TokenInitializer(nn.Module):
                 f["ref_pos"][f["is_ca"]], valid_mask
             )                                              # [I, I, c_z]
             debug_log("ENCODER", "Z_init_step4_refpos",
-                      f"after ref_pos mean={Z_init_II.float().mean():.6f}")
+                      f"after ref_pos mean={Z_init_II.float().mean():.6f}, "
+                      f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             # Run a small transformer to provide position encodings to single.
             for block_idx, block in enumerate(self.transformer_stack):
                 S_I, Z_init_II = block(S_I, Z_init_II)    # [I, c_s], [I, I, c_z]
                 debug_log("ENCODER", f"Z_init_step5_block{block_idx}",
-                          f"after block mean={Z_init_II.float().mean():.6f}")
+                          f"after block mean={Z_init_II.float().mean():.6f}, "
+                          f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             # Also cat the relative position encoding and mix
             Z_init_II = torch.cat(
@@ -868,20 +875,24 @@ class TokenInitializer(nn.Module):
                 dim=-1,
             )                                              # [I, I, 2*c_z]
             debug_log("ENCODER", "Z_init_step6_rpe2cat",
-                      f"after rpe2 concat mean={Z_init_II.float().mean():.6f}")
+                      f"after rpe2 concat mean={Z_init_II.float().mean():.6f}, "
+                      f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             Z_init_II = self.process_z_init(Z_init_II)    # [I, I, c_z]
             debug_log("ENCODER", "Z_init_step7_processzinit",
-                      f"after process_z_init mean={Z_init_II.float().mean():.6f}")
+                      f"after process_z_init mean={Z_init_II.float().mean():.6f}, "
+                      f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             for b in range(2):
                 Z_init_II = Z_init_II + self.transition_1[b](Z_init_II)  # [I, I, c_z]
                 debug_log("ENCODER", f"Z_init_step8_trans{b}",
-                          f"after transition_{b} mean={Z_init_II.float().mean():.6f}")
+                          f"after transition_{b} mean={Z_init_II.float().mean():.6f}, "
+                          f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             # DEBUG: Print final Z stats (compare with streaming mode)
             debug_log("ENCODER", "Z_init_FINAL",
-                      f"mean={Z_init_II.float().mean():.6f}")
+                      f"mean={Z_init_II.float().mean():.6f}, "
+                      f"first_half_mean={Z_init_II[:I_half].float().mean():.6f}")
 
             return {"S_init_I": S_I, "Z_init_II": Z_init_II}
 

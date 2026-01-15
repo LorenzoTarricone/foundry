@@ -1606,6 +1606,7 @@ class CompactStreamingDecoder(nn.Module):
             # Uses chunked_pairwise_embedder which computes P only for (L_par, k) pairs
             # indices_chunk tells which k neighbors each of the L_par atoms attends to
             # NOTE: Pass FULL C_L (not chunked) because forward_chunked gathers keys from any atom
+            # CRITICAL: Pass streaming_mode and z_chunk_range so chunked Z_II is handled correctly!
             P_sparse_chunk = chunked_pairwise_embedder.forward_chunked(
                 f=f,
                 indices=indices_chunk,                      # [B, L_par, k]
@@ -1613,6 +1614,8 @@ class CompactStreamingDecoder(nn.Module):
                 Z_init_II=initializer_outputs["Z_II"],      # [I, I, c_z] (full) or [I_par, I, c_z] (chunked)
                 tok_idx=f["atom_to_token_map"],             # [L]
                 query_start=query_start,                    # Offset for parallel mode
+                streaming_mode=initializer_outputs.get("streaming_mode", False),
+                z_chunk_range=initializer_outputs.get("z_chunk_range"),
             )                                              # [B, L_par, k, c_atompair]
             
             # DIAGNOSTIC: Log P_sparse_chunk for first block
