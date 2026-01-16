@@ -543,6 +543,16 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             X_denoised_L_traj.append(X_denoised_L)
             t_hats.append(t_hat)
 
+            # =======================================================================
+            # MEMORY OPTIMIZATION: Clear CUDA cache between diffusion steps
+            # In multi-GPU streaming mode, memory fragmentation can cause OOM even
+            # when total free memory is sufficient. empty_cache() defragments memory.
+            # NOTE: Do NOT delete 'outs' - it's used after the loop for return values
+            # =======================================================================
+            if streaming_mode:
+                del epsilon_L, X_noisy_L_scaled, delta_L
+                torch.cuda.empty_cache()
+
         # ================================================================
         # Post-processing: motif alignment
         # ================================================================
@@ -869,6 +879,16 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             X_noisy_L_traj.append(X_noisy_L_scaled)
             X_denoised_L_traj.append(X_denoised_L)
             t_hats.append(t_hat)
+
+            # =======================================================================
+            # MEMORY OPTIMIZATION: Clear CUDA cache between diffusion steps
+            # In multi-GPU streaming mode, memory fragmentation can cause OOM even
+            # when total free memory is sufficient. empty_cache() defragments memory.
+            # NOTE: Do NOT delete 'outs' - it's used after the loop for return values
+            # =======================================================================
+            if streaming_mode:
+                del epsilon_L, X_noisy_L_scaled, delta_L
+                torch.cuda.empty_cache()
 
         # ================================================================
         # Post-processing: motif alignment with symmetry

@@ -782,11 +782,51 @@ class RFD3DiffusionModule(nn.Module):
             query_end = min(query_start + L_par, L)
             
             def all_gather_concat(tensor, ws, dim):
-                # Ensure tensor is contiguous (required for NCCL)
+                # =======================================================================
+                # MEMORY OPTIMIZATION: Avoid creating ws separate tensors per GPU
+                # Old code created O(ws) tensors, causing O(ws²) total memory with GPUs
+                # New code uses all_gather_into_tensor for O(1) temporary allocations
+                # =======================================================================
+
+                # --- OLD IMPLEMENTATION ---
+                # tensor = tensor.contiguous()
+                # gathered = [torch.zeros_like(tensor) for _ in range(ws)]
+                # dist.all_gather(gathered, tensor)
+                # return torch.cat(gathered, dim=dim)
+                # --- END OLD IMPLEMENTATION ---
+
+                # --- NEW MEMORY-EFFICIENT IMPLEMENTATION ---
                 tensor = tensor.contiguous()
-                gathered = [torch.zeros_like(tensor) for _ in range(ws)]
-                dist.all_gather(gathered, tensor)
-                return torch.cat(gathered, dim=dim)
+
+                if hasattr(dist, 'all_gather_into_tensor'):
+                    # Use single flat output tensor instead of list of ws tensors
+                    flat_input = tensor.view(-1)
+                    flat_output = torch.empty(flat_input.numel() * ws, dtype=tensor.dtype, device=tensor.device)
+                    dist.all_gather_into_tensor(flat_output, flat_input)
+
+                    # Reshape back to proper dimensions
+                    chunk_shape = list(tensor.shape)
+                    reshaped = flat_output.view(ws, *chunk_shape)
+
+                    if dim == 0:
+                        result = reshaped.view(-1, *chunk_shape[1:])
+                    else:
+                        perm = list(range(1, dim + 1)) + [0] + list(range(dim + 1, len(chunk_shape) + 1))
+                        transposed = reshaped.permute(*perm)
+                        final_shape = list(tensor.shape)
+                        final_shape[dim] = final_shape[dim] * ws
+                        result = transposed.contiguous().view(*final_shape)
+
+                    del flat_input, flat_output, reshaped  # Explicit cleanup
+                    return result
+                else:
+                    # Fallback with explicit cleanup
+                    gathered = [torch.zeros_like(tensor) for _ in range(ws)]
+                    dist.all_gather(gathered, tensor)
+                    result = torch.cat(gathered, dim=dim)
+                    del gathered  # Free ws tensors immediately
+                    return result
+                # --- END NEW IMPLEMENTATION ---
             
             # Use parallel encoder - each GPU handles L_par atoms
             Q_L = self.encoder.forward_parallel(
@@ -896,6 +936,14 @@ class RFD3DiffusionModule(nn.Module):
                     streaming_mode=streaming_mode,
                     **kwargs,
                 )
+
+                # =======================================================================
+                # MEMORY OPTIMIZATION: Clear CUDA cache between recycle iterations
+                # In multi-GPU streaming mode, memory fragmentation builds up across
+                # recycle iterations. empty_cache() helps defragment between iterations.
+                # =======================================================================
+                if streaming_mode and not last:
+                    torch.cuda.empty_cache()
 
         return recycled_features
 
@@ -1106,10 +1154,24 @@ class RFD3DiffusionModule(nn.Module):
                     sigma_data=1,
                     n_bins=self.n_bins,
                 )                                          # [B, I_par, I, n_bins]
-                
-                # Gather D_II_self chunks from all GPUs
-                # Each GPU has [B, I_par, I, n_bins], gather to [B, I, I, n_bins]
-                D_II_self = _all_gather_along_dim(D_II_self_chunk, world_size, dim=1)
+
+                # =======================================================================
+                # MEMORY OPTIMIZATION: DON'T all_gather D_II_self back to full [I, I]
+                # The downstream code (encoders._forward_streaming) immediately slices
+                # D_II_self back to [I_par, I], so gathering is wasteful.
+                # For I=9000 (length 150), full D_II_self = 21 GB per GPU!
+                # Keeping it chunked saves massive memory.
+                # =======================================================================
+
+                # --- OLD IMPLEMENTATION (gathered full I×I tensor) ---
+                # D_II_self = _all_gather_along_dim(D_II_self_chunk, world_size, dim=1)
+                # --- END OLD IMPLEMENTATION ---
+
+                # --- NEW IMPLEMENTATION: Keep D_II_self as chunk ---
+                # Each GPU keeps its own [B, I_par, I, n_bins] chunk
+                # encoders._forward_streaming will use it directly without slicing
+                D_II_self = D_II_self_chunk  # [B, I_par, I, n_bins] - NOT gathered!
+                # --- END NEW IMPLEMENTATION ---
             else:
                 # Edge case: more GPUs than tokens
                 D_II_self = None

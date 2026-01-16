@@ -106,6 +106,48 @@ def _z_transition_chunked(Z: torch.Tensor, transition_fn, key_chunk: int = 512) 
         return Z + transition_fn(Z)
 
 
+def _process_z_chunked(Z: torch.Tensor, process_fn, key_chunk: int = 512) -> torch.Tensor:
+    """
+    Apply process_z (Linear) in sub-chunks along key dimension to reduce peak memory.
+
+    process_z transforms [I_par, I, c_in] -> [I_par, I, c_out].
+    For I=8100, c_in=258, c_out=128, full tensor is 22 GB.
+    By chunking keys: [I_par, chunk, c_in] -> [I_par, chunk, c_out] reduces memory.
+
+    Unlike _z_transition_chunked, this has NO residual connection - just applies process_fn.
+
+    Args:
+        Z: [I_par, I, c_in] or [B, I_par, I, c_in]
+        process_fn: process_z module (typically nn.Sequential with RMSNorm + Linear)
+        key_chunk: chunk size along key dimension
+
+    Returns:
+        process_fn(Z) computed memory-efficiently
+    """
+    if Z.dim() == 3:
+        # [I_par, I, c_in]
+        I = Z.shape[1]
+        out_chunks = []
+        for k_start in range(0, I, key_chunk):
+            k_end = min(k_start + key_chunk, I)
+            Z_sub = Z[:, k_start:k_end, :]
+            out_chunks.append(process_fn(Z_sub))
+            del Z_sub  # Free memory immediately
+        return torch.cat(out_chunks, dim=1)
+    elif Z.dim() == 4:
+        # [B, I_par, I, c_in]
+        I = Z.shape[2]
+        out_chunks = []
+        for k_start in range(0, I, key_chunk):
+            k_end = min(k_start + key_chunk, I)
+            Z_sub = Z[:, :, k_start:k_end, :]
+            out_chunks.append(process_fn(Z_sub))
+            del Z_sub  # Free memory immediately
+        return torch.cat(out_chunks, dim=2)
+    else:
+        return process_fn(Z)
+
+
 def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
     """Get current GPU rank and world size for distributed processing."""
     import torch.distributed as dist
@@ -172,11 +214,64 @@ def _all_gather_concat(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
     
     # Ensure tensor is contiguous (required for NCCL)
     tensor = tensor.contiguous()
-    
-    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
-    
-    return torch.cat(gathered, dim=dim)
+
+    # ===========================================================================
+    # MEMORY OPTIMIZATION: Use all_gather_into_tensor for better memory scaling
+    # Old implementation created world_size copies on EACH GPU, causing O(n²)
+    # memory growth with GPU count. New version uses single pre-allocated output.
+    # Commented out old code preserved for rollback if needed.
+    # ===========================================================================
+
+    # --- OLD IMPLEMENTATION (creates world_size tensors per GPU) ---
+    # gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+    # dist.all_gather(gathered, tensor)
+    # return torch.cat(gathered, dim=dim)
+    # --- END OLD IMPLEMENTATION ---
+
+    # --- NEW MEMORY-EFFICIENT IMPLEMENTATION ---
+    # Pre-allocate single output tensor instead of world_size separate tensors
+    # This reduces peak memory from O(world_size) to O(1) temporary allocations
+
+    # Calculate output shape: expand the gather dimension by world_size
+    output_shape = list(tensor.shape)
+    output_shape[dim] = output_shape[dim] * world_size
+    output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
+
+    # Use all_gather_into_tensor if available (PyTorch >= 1.13), else fallback
+    if hasattr(dist, 'all_gather_into_tensor'):
+        # Flatten for all_gather_into_tensor, then reshape
+        # all_gather_into_tensor expects flat output tensor
+        flat_input = tensor.contiguous().view(-1)
+        flat_output = torch.empty(flat_input.numel() * world_size, dtype=tensor.dtype, device=tensor.device)
+        dist.all_gather_into_tensor(flat_output, flat_input)
+
+        # Reshape: split into world_size chunks along dim 0, then move to correct dim
+        chunk_shape = list(tensor.shape)
+        reshaped = flat_output.view(world_size, *chunk_shape)
+
+        # Move the world_size dimension to position `dim` and merge
+        # e.g., for dim=0: [W, I_par, c] -> [W*I_par, c]
+        # e.g., for dim=1: [W, B, L_par, c] -> [B, W*L_par, c]
+        if dim == 0:
+            output_tensor = reshaped.view(-1, *chunk_shape[1:])
+        else:
+            # Transpose world_size dim to target position, then flatten
+            perm = list(range(1, dim + 1)) + [0] + list(range(dim + 1, len(chunk_shape) + 1))
+            transposed = reshaped.permute(*perm)
+            final_shape = list(tensor.shape)
+            final_shape[dim] = final_shape[dim] * world_size
+            output_tensor = transposed.contiguous().view(*final_shape)
+
+        del flat_input, flat_output, reshaped  # Explicit cleanup
+    else:
+        # Fallback for older PyTorch: use list-based all_gather but cleanup immediately
+        gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor)
+        output_tensor = torch.cat(gathered, dim=dim)
+        del gathered  # Explicit cleanup to free world_size tensors
+
+    return output_tensor
+    # --- END NEW IMPLEMENTATION ---
 
 
 # NOTE: StreamingZContainer has been removed. Z chunks are now computed
@@ -1149,6 +1244,7 @@ class DiffusionTokenEncoder(nn.Module):
                     n_bins=self.n_bins_distogram
                 )                                          # [B, I_par, I, n_bins]
             Z_chunk = torch.cat([Z_chunk, D_chunk], dim=-1)
+            del D_chunk  # Free memory immediately - no longer needed after cat
 
         # Step 4: Add self-conditioning for this GPU's chunk
         expected_dim = base_z_dim
@@ -1163,15 +1259,32 @@ class DiffusionTokenEncoder(nn.Module):
         if self.use_self:
             D_II_self = kwargs.get("D_II_self")
             if D_II_self is not None:
-                # Slice self-conditioning to this GPU's query rows
-                D_self_chunk = D_II_self[:, gpu_start:gpu_end, :]  # [B, I_par, I, n_bins]
+                # =======================================================================
+                # MEMORY OPTIMIZATION: D_II_self may already be chunked [B, I_par, I, n_bins]
+                # In multi-GPU mode, RFD3_diffusion_module now returns the chunk directly
+                # instead of gathering to full [B, I, I, n_bins] to save 12-21 GB per GPU.
+                # =======================================================================
+
+                # --- OLD IMPLEMENTATION (assumed full [B, I, I, n_bins]) ---
+                # D_self_chunk = D_II_self[:, gpu_start:gpu_end, :]  # [B, I_par, I, n_bins]
+                # --- END OLD IMPLEMENTATION ---
+
+                # --- NEW IMPLEMENTATION: Check if already chunked ---
+                if D_II_self.shape[1] == I_par:
+                    # Already chunked [B, I_par, I, n_bins] - use directly
+                    D_self_chunk = D_II_self
+                else:
+                    # Full tensor [B, I, I, n_bins] (standard mode) - slice it
+                    D_self_chunk = D_II_self[:, gpu_start:gpu_end, :]  # [B, I_par, I, n_bins]
+                # --- END NEW IMPLEMENTATION ---
             else:
                 D_self_chunk = torch.zeros(
                     B, I_par, I, self.n_bins_distogram,
                     device=device, dtype=dtype
                 )                                          # [B, I_par, I, n_bins]
             Z_chunk = torch.cat([Z_chunk, D_self_chunk], dim=-1)
-        
+            del D_self_chunk  # Free memory immediately - no longer needed after cat
+
         # Verify dimensions before process_z (diagnostic)
         actual_dim = Z_chunk.shape[-1]
         
@@ -1200,7 +1313,13 @@ class DiffusionTokenEncoder(nn.Module):
         
         # Step 5: Process concatenated Z features
         # Match standard: Z_II = self.process_z(Z_II)
-        Z_chunk = self.process_z(Z_chunk)                # [B, I_par, I, c_z]
+        # =======================================================================
+        # MEMORY OPTIMIZATION: Use key-chunking for process_z to avoid 22+ GB tensor
+        # Z_chunk is [B, I_par, I, c_in] where c_in = c_z + distogram + self_cond
+        # For I=8100, c_in=258, full tensor = 22 GB which causes OOM.
+        # Processing in key-chunks of 512: [B, I_par, 512, c_in] = ~1.4 GB
+        # =======================================================================
+        Z_chunk = _process_z_chunked(Z_chunk, self.process_z)  # [B, I_par, I, c_z]
         
         # Match standard: Z_II = Z_II + self.transition_2[b](Z_II)
         # Use key-chunking to reduce peak memory from SwiGLU 4x expansion

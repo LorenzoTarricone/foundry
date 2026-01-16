@@ -988,42 +988,15 @@ class LocalTokenTransformer(nn.Module):
                 pad_len = max_len - chunk.shape[1]
                 chunk = F.pad(chunk, (0, 0, 0, pad_len))  # pad length dim
             
-            # --- OLD IMPLEMENTATION (creates world_size tensors per GPU) ---
-            # gathered = [
-            #     torch.zeros_like(chunk) for _ in range(world_size)
-            # ]
-            # dist.all_gather(gathered, chunk)
-            # trimmed = []
-            # for g, l in zip(gathered, lens):
-            #     trimmed.append(g[:, : int(l.item()), :])
-            # --- END OLD IMPLEMENTATION ---
-
-            # --- NEW MEMORY-EFFICIENT IMPLEMENTATION ---
-            # Uses all_gather_into_tensor to avoid O(world_size) tensor allocations per GPU
-            chunk = chunk.contiguous()
-
-            if hasattr(dist, 'all_gather_into_tensor'):
-                flat_input = chunk.view(-1)
-                flat_output = torch.empty(flat_input.numel() * world_size, dtype=chunk.dtype, device=chunk.device)
-                dist.all_gather_into_tensor(flat_output, flat_input)
-
-                B, _, C = chunk.shape
-                reshaped = flat_output.view(world_size, B, max_len, C)
-
-                trimmed = []
-                for i, l in enumerate(lens):
-                    trimmed.append(reshaped[i, :, : int(l.item()), :])
-                del flat_input, flat_output, reshaped  # Explicit cleanup
-            else:
-                # Fallback with explicit cleanup
-                gathered = [torch.zeros_like(chunk) for _ in range(world_size)]
-                dist.all_gather(gathered, chunk)
-                trimmed = []
-                for g, l in zip(gathered, lens):
-                    trimmed.append(g[:, : int(l.item()), :])
-                del gathered
-            # --- END NEW IMPLEMENTATION ---
-
+            gathered = [
+                torch.zeros_like(chunk) for _ in range(world_size)
+            ]
+            dist.all_gather(gathered, chunk)
+            
+            trimmed = []
+            for g, l in zip(gathered, lens):
+                trimmed.append(g[:, : int(l.item()), :])
+            
             # Debug: log gather layout once (block 0, rank 0)
             if block_idx == 0 and rank == 0:
                 lens_py = [int(l.item()) for l in lens]

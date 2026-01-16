@@ -7,10 +7,10 @@
 #   python scripts/design_annotate.py --config config/design_low_memory.yaml
 
 # Output settings
-out_dir: "inference_outputs/design_demo"
+out_dir: "inference_outputs/design_I_52AAASU"
 
 # Protein design parameters
-length: 30
+length: 51
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
