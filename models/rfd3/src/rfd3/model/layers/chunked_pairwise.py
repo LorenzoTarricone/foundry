@@ -621,6 +621,18 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 tq = tok_queries_chunk[0]  # [L_par, k]
                 tk = tok_keys_chunk[0]     # [L_par, k]
 
+                # DEBUG: Log tq range to diagnose RANK1 issue
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    rank = dist.get_rank()
+                    world_size = dist.get_world_size()
+                    tq_min, tq_max = tq.min().item(), tq.max().item()
+                    tk_min, tk_max = tk.min().item(), tk.max().item()
+                    out_of_range = ((tq < start_i) | (tq >= end_i)).sum().item()
+                    print(f"[DEBUG-Z_LOOKUP] [RANK{rank}/{world_size}] z_chunk_range=[{start_i},{end_i}), "
+                          f"tq range=[{tq_min},{tq_max}], tk range=[{tk_min},{tk_max}], "
+                          f"tq out_of_range={out_of_range}/{tq.numel()}", flush=True)
+
                 # Map to local chunk indices
                 local_tq = torch.clamp(tq - start_i, 0, I_par_z - 1)
                 tk = torch.clamp(tk, 0, I_z - 1)

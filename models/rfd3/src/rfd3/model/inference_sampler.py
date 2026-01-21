@@ -24,6 +24,43 @@ ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
 
 # =============================================================================
+# RNG Diagnostic Utilities (for debugging reproducibility issues)
+# =============================================================================
+
+def _rng_diagnostic(checkpoint_name: str, sample_size: int = 3) -> str:
+    """
+    Log RNG state at a checkpoint WITHOUT consuming random numbers.
+    Returns a short hash of the RNG state for comparison.
+    """
+    import hashlib
+
+    # Get current RNG state
+    cpu_state = torch.get_rng_state()
+    cuda_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else torch.tensor([])
+
+    # Compute hash
+    combined = cpu_state.numpy().tobytes() + cuda_state.numpy().tobytes()
+    state_hash = hashlib.md5(combined).hexdigest()[:12]
+
+    # Sample without advancing (save/restore)
+    cuda_state_saved = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+    samples = torch.randn(sample_size).tolist()
+    torch.set_rng_state(cpu_state)
+    if cuda_state_saved is not None:
+        torch.cuda.set_rng_state(cuda_state_saved)
+
+    samples_str = ", ".join(f"{s:.4f}" for s in samples)
+
+    # Only log from rank 0
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    mode = "PAR" if os.environ.get("RFD3_ATTENTION_PARALLEL", "0") == "1" else "STD"
+    if rank == 0:
+        print(f"[RNG-{mode}] {checkpoint_name}: hash={state_hash}, next=[{samples_str}]", flush=True)
+
+    return state_hash
+
+
+# =============================================================================
 # Multi-GPU Parallel Inference Utilities
 # =============================================================================
 
@@ -305,6 +342,9 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         # Check for streaming/parallel mode
         streaming_mode = initializer_outputs.get("streaming_mode", False)
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
+
+        # RNG diagnostic: log state at start of diffusion sampling
+        _rng_diagnostic("SampleDiffusionWithMotif.sample_start")
 
         if streaming_mode and world_size > 1:
             ranked_logger.info(
@@ -644,14 +684,17 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         streaming_mode = initializer_outputs.get("streaming_mode", False)
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
 
+        # RNG diagnostic: log state at start of symmetry diffusion sampling
+        _rng_diagnostic("SampleDiffusionWithSymmetry.sample_start")
+
         if streaming_mode and world_size > 1:
             ranked_logger.info(
                 f"Parallel symmetry diffusion: GPU {gpu_rank}/{world_size}"
             )
-        
+
         # Motif setup to recenter the motif at every step
         is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
-        
+
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(
             device=coord_atom_lvl_to_be_noised.device,
@@ -666,6 +709,9 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         print(f"[DIAG] SymmetryInferenceSampler START: L={L}, D={D}, attn_parallel={attn_parallel}", flush=True)
         print(f"[DIAG]   coord_atom_lvl_to_be_noised.shape={coord_atom_lvl_to_be_noised.shape}", flush=True)
         print(f"[DIAG]   f['is_ca'].sum()={f['is_ca'].sum().item()} (number of tokens I)", flush=True)
+
+        # RNG diagnostic: log state before initial structure generation
+        _rng_diagnostic("SampleDiffusionWithSymmetry.before_initial_noise")
 
         X_L = self._get_initial_structure(
             c0=noise_schedule[0],

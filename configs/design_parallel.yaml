@@ -10,10 +10,10 @@
 # Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
 
 # Output settings
-out_dir: "inference_outputs/design_I_135AAASU_parallel"
+out_dir: "inference_outputs/design_I_40AAASU_parallel"
 
 # Protein design parameters 
-length: 135
+length: 40
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)

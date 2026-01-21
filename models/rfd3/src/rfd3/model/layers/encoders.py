@@ -824,8 +824,9 @@ class TokenInitializer(nn.Module):
         Z_j_expanded = Z_j.unsqueeze(0)                    # [1, I, c_z]
         Z_chunk = Z_i + Z_j_expanded                       # [I_par, I, c_z]
 
-        debug_log("ENCODER", "Z_chunk_step1",
-                  f"Z_i+Z_j mean={Z_chunk.float().mean():.6f}")
+        # Log Z_chunk step1 from ALL ranks for debugging
+        debug_log_all_ranks("ENCODER", "Z_chunk_step1",
+                  f"[{start_i}:{end_i}] Z_i+Z_j mean={Z_chunk.float().mean():.6f}")
 
         # Step 4b: Add RPE (chunked)
         Z_chunk = Z_chunk + self.relative_position_encoding.forward_chunk(f, start_i, end_i)
@@ -878,8 +879,9 @@ class TokenInitializer(nn.Module):
             debug_log("ENCODER", f"Z_chunk_step8_trans{b}",
                       f"after transition_{b} mean={Z_chunk.float().mean():.6f}")
 
-        debug_log("ENCODER", "Z_chunk_FINAL",
-                  f"[{start_i}:{end_i}] mean={Z_chunk.float().mean():.6f}")
+        # Log Z_chunk from ALL ranks for debugging
+        debug_log_all_ranks("ENCODER", "Z_chunk_FINAL",
+                  f"[{start_i}:{end_i}] shape={list(Z_chunk.shape)}, mean={Z_chunk.float().mean():.6f}")
 
         if is_rank0:
             print(f"{debug_ctx.prefix('ENCODER')} Z_chunk computed: shape={list(Z_chunk.shape)}, mean={Z_chunk.float().mean():.6f}", flush=True)
