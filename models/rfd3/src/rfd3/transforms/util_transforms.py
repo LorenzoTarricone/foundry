@@ -496,3 +496,133 @@ class EncodeAF3TokenLevelFeatures(Transform):
         }
 
         return data
+
+
+class AddAF3TokenBondFeatures(Transform):
+    """
+    Memory-efficient replacement for atomworks.ml.transforms.bonds.AddAF3TokenBondFeatures.
+
+    This is needed for parallel multi-GPU preprocessing of large symmetric structures
+    (e.g., Icosahedral with L=126,000 atoms). The standard atomworks implementation
+    creates an [L, L] atom-level bond distance matrix via get_bond_distance_matrix(),
+    which requires ~63 GB of CPU RAM for L=126k.
+
+    This transform computes the same result by working directly with the sparse bond
+    list, avoiding the O(L²) memory allocation:
+    1. Get bond pairs from the atom array (sparse)
+    2. Compute distances for each bond
+    3. Map bonds to token pairs and find minimum distance per token pair
+    4. Apply distance cutoff and filter polymer-polymer bonds
+
+    For smaller structures (below atom_threshold), it delegates to the standard
+    atomworks implementation for maximum compatibility.
+
+    Args:
+        atom_threshold: Number of atoms above which to use the memory-efficient
+                       approach. Below this, uses standard atomworks implementation.
+        distance_cutoff: Maximum bond distance to consider (default 2.4 Å, same as AF3).
+    """
+
+    requires_previous_transforms = [
+        "AtomizeByCCDName",
+    ]
+
+    def __init__(self, atom_threshold: int = 50000, distance_cutoff: float = 2.4):
+        super().__init__()
+        self.atom_threshold = atom_threshold
+        self.distance_cutoff = distance_cutoff
+
+    def check_input(self, data) -> None:
+        check_contains_keys(data, ["atom_array"])
+        check_is_instance(data, "atom_array", AtomArray)
+
+    def forward(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        atom_array = data["atom_array"]
+        n_atoms = len(atom_array)
+
+        if n_atoms <= self.atom_threshold:
+            # For smaller structures: use the standard atomworks transform
+            from atomworks.ml.transforms.bonds import (
+                AddAF3TokenBondFeatures as AtomworksAddAF3TokenBondFeatures,
+            )
+            standard_transform = AtomworksAddAF3TokenBondFeatures(
+                distance_cutoff=self.distance_cutoff
+            )
+            return standard_transform(data)
+
+        # Memory-efficient sparse implementation for large structures (parallel mode)
+        print(
+            f"[AddAF3TokenBondFeatures] Large structure ({n_atoms} atoms) - "
+            f"using sparse bond computation for parallel mode",
+            flush=True
+        )
+
+        token_bonds = self._compute_token_bonds_sparse(atom_array)
+
+        if "feats" not in data:
+            data["feats"] = {}
+        data["feats"]["token_bonds"] = torch.from_numpy(token_bonds)
+
+        return data
+
+    def _compute_token_bonds_sparse(self, atom_array) -> np.ndarray:
+        """
+        Compute token bond features without materializing [L, L] matrix.
+
+        Uses the sparse bond list directly to compute minimum inter-token distances.
+        """
+        from biotite.structure import BondList
+
+        # Get token boundaries
+        token_start_end_idxs = get_token_starts(atom_array, add_exclusive_stop=True)
+        token_starts = token_start_end_idxs[:-1]
+        n_tokens = len(token_starts)
+
+        # Create atom -> token mapping
+        atom_to_token = np.zeros(len(atom_array), dtype=np.int32)
+        for tok_idx in range(n_tokens):
+            start = token_start_end_idxs[tok_idx]
+            end = token_start_end_idxs[tok_idx + 1]
+            atom_to_token[start:end] = tok_idx
+
+        # Get bond pairs and compute distances
+        bonds: BondList = atom_array.bonds
+        bond_array = bonds.as_array()  # [N_bonds, 3] - (atom1, atom2, bond_type)
+
+        if len(bond_array) == 0:
+            # No bonds - return empty matrix
+            return np.zeros((n_tokens, n_tokens), dtype=bool)
+
+        atom1_idx = bond_array[:, 0]
+        atom2_idx = bond_array[:, 1]
+
+        # Compute bond distances
+        coords = atom_array.coord
+        bond_distances = np.linalg.norm(
+            coords[atom1_idx] - coords[atom2_idx], axis=1
+        )
+
+        # Map bonds to token pairs
+        token1 = atom_to_token[atom1_idx]
+        token2 = atom_to_token[atom2_idx]
+
+        # Initialize token bond distance matrix with infinity
+        token_bond_dist = np.full((n_tokens, n_tokens), np.inf, dtype=np.float32)
+
+        # Update with minimum distances (bonds are symmetric)
+        # Use np.minimum.at for efficient in-place min reduction
+        np.minimum.at(token_bond_dist, (token1, token2), bond_distances)
+        np.minimum.at(token_bond_dist, (token2, token1), bond_distances)
+
+        # Apply distance cutoff
+        token_bonds = token_bond_dist < self.distance_cutoff
+
+        # Remove self-bonds (diagonal)
+        np.fill_diagonal(token_bonds, False)
+
+        # Remove polymer-polymer bonds (same logic as AF3)
+        is_polymer = ~atom_array.atomize[token_starts]
+        is_poly_poly_bond = np.outer(is_polymer, is_polymer)
+        token_bonds[is_poly_poly_bond] = False
+
+        return token_bonds

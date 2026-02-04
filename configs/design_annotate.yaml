@@ -3,13 +3,13 @@
 # Standard single-GPU inference
 #
 # Usage:
-#   python scripts/design_annotate.py --config config/design_annotate.yaml
+#   python scripts/design_annotate.py --config configs/design_annotate.yaml
 
 # Output settings
 out_dir: "inference_outputs/design_demo"
 
 # Protein design parameters
-length: 100
+length: 50
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
@@ -30,6 +30,6 @@ seed: 42  # Random seed for reproducible results
 
 # Weights & Biases logging
 wandb:
-  enabled: false
+  enabled: true
   project: "fast-rfd3"
   run_name: null  # null = auto-generated

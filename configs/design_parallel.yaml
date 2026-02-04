@@ -10,10 +10,10 @@
 # Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
 
 # Output settings
-out_dir: "inference_outputs/design_I_40AAASU_parallel"
+out_dir: "inference_outputs/design_I_270AAASU_parallel"
 
 # Protein design parameters 
-length: 40
+length: 270  # Length of protein to design (in amino acids)
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
@@ -25,7 +25,7 @@ mpnn_batch_size: 5
 # Parallel processing
 # The script auto-detects allocated GPUs from CUDA_VISIBLE_DEVICES
 # Set attention_parallel_factor to override (e.g., 2 to use only 2 of 4 allocated GPUs)
-attention_parallel_factor: null
+attention_parallel_factor: 8
 low_memory_mode: true
 
 # Reproducibility
@@ -33,6 +33,6 @@ seed: 42  # Random seed for reproducible results (same seed ensures identical ou
 
 # Weights & Biases logging
 wandb:
-  enabled: false
+  enabled: true
   project: "fast-rfd3"
   run_name: null  # null = auto-generated

@@ -340,9 +340,20 @@ class LinearEmbedWithPool(nn.Module):
         self.c_token = c_token
         self.linear = linearNoBias(3, c_token)
 
-    def forward(self, R_L, tok_idx):
+    def forward(self, R_L, tok_idx, I=None):
+        """
+        Pool atom features to token level.
+
+        Args:
+            R_L: [B, L, 3] atom positions
+            tok_idx: [L] atom-to-token mapping
+            I: Optional token count. If None, computed from tok_idx.max() + 1.
+               Pass explicitly when tok_idx may have inconsistent indices
+               (e.g., in parallel mode where S_I.shape[0] is the canonical count).
+        """
         B = R_L.shape[0]
-        I = int(tok_idx.max().item()) + 1
+        if I is None:
+            I = int(tok_idx.max().item()) + 1
         A_I_shape = (
             B,
             I,
@@ -432,10 +443,10 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             2 * self.num_tok_pos_bins + (2 * self.s_max + 2) + 1, c_z
         )
         self.chunk_size = None
-        # If attention parallel is enabled (=1), stream RPE computation to avoid full LxL materialization
+        # If attention parallel is enabled, stream RPE computation to avoid full LxL materialization
         # GPU count is auto-detected from dist.get_world_size() at runtime
         attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-        if attn_parallel == "1":
+        if attn_parallel not in ("0", "", "false", "False"):
             # Marker that chunking is enabled; actual chunk count determined at runtime
             self.chunk_size = -1  # Will use dist.get_world_size() in _forward_chunked
 
@@ -583,20 +594,25 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
     def forward_chunk(self, f: dict, start_i: int, end_i: int) -> torch.Tensor:
         """
         Compute RPE for a specific row range (query chunk) against all columns (keys).
-        
+
         For streaming mode: computes [I_par, I, c_z] instead of full [I, I, c_z].
-        
+
+        Memory optimization: Processes in sub-chunks to avoid creating ~21GB of
+        one-hot tensors at once. Each one-hot tensor is [I_par, I, ~66] in float32,
+        which is ~7GB for I_par=2550, I=10200. Processing in sub-chunks reduces
+        peak memory from ~21GB to ~5GB.
+
         Args:
             f: Feature dictionary containing asym_id, entity_id, residue_index, etc.
             start_i: Start index for query tokens
             end_i: End index for query tokens
-            
+
         Returns:
             rpe_chunk: [I_par, I, c_z] relative position encoding for query chunk
         """
         I_par = end_i - start_i  # Number of queries
         qs = slice(start_i, end_i)
-        
+
         # Get 1D arrays
         asym = f["asym_id"]           # [I]
         entity = f["entity_id"]       # [I]
@@ -604,11 +620,11 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
         token_idx = f["token_index"]  # [I]
         sym_id = f["sym_id"]          # [I]
         unindex_mask = f["unindexing_pair_mask"]  # [I, I]
-        
+
         # Compute pairwise comparisons: [I_par, I]
         b_samechain = asym[qs, None] == asym[None, :]     # [I_par, I]
         b_same_entity = entity[qs, None] == entity[None, :]  # [I_par, I]
-        
+
         # Residue distances: [I_par, I]
         res_diff = residue[qs, None] - residue[None, :]
         d_res = torch.where(
@@ -616,7 +632,7 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             torch.clip(res_diff + self.r_max, 0, 2 * self.r_max),
             2 * self.r_max + 1,
         )  # [I_par, I]
-        
+
         # Token distances: [I_par, I]
         b_sameres = residue[qs, None] == residue[None, :]
         tok_diff = token_idx[qs, None] - token_idx[None, :] + self.r_max
@@ -625,7 +641,7 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             torch.clip(tok_diff, 0, 2 * self.r_max),
             2 * self.r_max + 1,
         )  # [I_par, I]
-        
+
         # Chain distances: [I_par, I]
         sym_diff = sym_id[qs, None] - sym_id[None, :]
         d_chain = torch.where(
@@ -633,24 +649,48 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             torch.clip(sym_diff + self.s_max, 0, 2 * self.s_max),
             2 * self.s_max + 1,
         )  # [I_par, I]
-        
+
         # Apply unindexing mask: [I_par, I]
         unmask = unindex_mask[qs, :]
         d_tok[unmask] = self.num_tok_pos_bins - 1
         d_res[unmask] = self.num_tok_pos_bins - 1
-        
-        # One-hot encodings: [I_par, I, num_bins]
-        A_res = one_hot(d_res.long(), self.num_tok_pos_bins)    # [I_par, I, num_tok_pos_bins]
-        A_tok = one_hot(d_tok.long(), self.num_tok_pos_bins)    # [I_par, I, num_tok_pos_bins]
-        A_chain = one_hot(d_chain.long(), 2 * self.s_max + 2)   # [I_par, I, 2*s_max+2]
-        
-        # Concatenate features and project: [I_par, I, c_z]
-        feats = torch.cat(
-            [A_res, A_tok, b_same_entity.unsqueeze(-1).float(), A_chain], 
-            dim=-1
-        )  # [I_par, I, input_dim]
-        
-        return self.linear(feats)  # [I_par, I, c_z]
+
+        # Free intermediate tensors no longer needed
+        del b_samechain, b_sameres, res_diff, tok_diff, sym_diff, unmask
+
+        # ============================================================
+        # MEMORY OPTIMIZATION: Process one-hot encoding in sub-chunks
+        # ============================================================
+        # Each one-hot tensor is [sub_I_par, I, ~66] in float32.
+        # Without sub-chunking: 3 tensors * 7GB = ~21GB peak memory.
+        # With sub-chunking (4 sub-chunks): ~5GB peak memory.
+        # ============================================================
+        sub_chunk_size = max(1, I_par // 4)  # Process in 4 sub-chunks
+        outputs = []
+
+        for sub_start in range(0, I_par, sub_chunk_size):
+            sub_end = min(sub_start + sub_chunk_size, I_par)
+            sub_qs = slice(sub_start, sub_end)
+
+            # Create smaller one-hot tensors for this sub-chunk
+            A_res = one_hot(d_res[sub_qs].long(), self.num_tok_pos_bins)
+            A_tok = one_hot(d_tok[sub_qs].long(), self.num_tok_pos_bins)
+            A_chain = one_hot(d_chain[sub_qs].long(), 2 * self.s_max + 2)
+
+            # Concatenate features and project: [sub_I_par, I, c_z]
+            feats = torch.cat(
+                [A_res, A_tok, b_same_entity[sub_qs].unsqueeze(-1).float(), A_chain],
+                dim=-1
+            )
+            outputs.append(self.linear(feats))
+
+            # Free one-hot tensors immediately
+            del A_res, A_tok, A_chain, feats
+
+        # Free distance tensors
+        del d_res, d_tok, d_chain, b_same_entity
+
+        return torch.cat(outputs, dim=0)  # [I_par, I, c_z]
 
 
 class VirtualPredictor(nn.Module):

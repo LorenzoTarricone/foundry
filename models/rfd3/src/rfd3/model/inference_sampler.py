@@ -19,6 +19,7 @@ from foundry.utils.rotation_augmentation import (
     uniform_random_rotation,
 )
 from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks
+from rfd3.model.layers.streaming import compute_chunk_ranges
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
@@ -53,7 +54,8 @@ def _rng_diagnostic(checkpoint_name: str, sample_size: int = 3) -> str:
 
     # Only log from rank 0
     rank = dist.get_rank() if dist.is_initialized() else 0
-    mode = "PAR" if os.environ.get("RFD3_ATTENTION_PARALLEL", "0") == "1" else "STD"
+    attn_par = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+    mode = "PAR" if attn_par not in ("0", "", "false", "False") else "STD"
     if rank == 0:
         print(f"[RNG-{mode}] {checkpoint_name}: hash={state_hash}, next=[{samples_str}]", flush=True)
 
@@ -70,10 +72,10 @@ def _is_streaming_mode() -> bool:
 
     Env var scheme:
       - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
-      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+      - RFD3_ATTENTION_PARALLEL=1 or any non-zero value → parallel mode (True)
     """
     val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    return val == "1"
+    return val not in ("0", "", "false", "False")
 
 
 def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
@@ -87,30 +89,22 @@ def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
 def _compute_gpu_query_range(total: int, rank: int, world_size: int) -> Tuple[int, int]:
     """
     Compute the query index range for a specific GPU.
-    
-    Each GPU handles a contiguous chunk of queries. Queries are split evenly,
-    with earlier ranks getting any remainder.
-    
+
+    Uses compute_chunk_ranges to ensure consistent chunk distribution
+    across all code paths (encoder, transformer, decoder).
+
     Args:
         total: Total number of queries (I or L)
         rank: This GPU's rank (0 to world_size-1)
         world_size: Total number of GPUs
-        
+
     Returns:
         (start_idx, end_idx): Query range for this GPU [start, end)
     """
-    chunk_size = total // world_size
-    remainder = total % world_size
-    
-    # Earlier ranks get one extra if there's remainder
-    if rank < remainder:
-        start = rank * (chunk_size + 1)
-        end = start + chunk_size + 1
-    else:
-        start = rank * chunk_size + remainder
-        end = start + chunk_size
-    
-    return start, end
+    chunk_ranges = compute_chunk_ranges(total, world_size)
+    if rank >= len(chunk_ranges):
+        return total, total  # No tokens for this rank
+    return chunk_ranges[rank]
 
 
 def _all_gather_variable_size(
@@ -150,31 +144,59 @@ def _all_gather_variable_size(
     return torch.cat(gathered, dim=dim)
 
 
-def _all_gather_concat(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+def _all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = None) -> torch.Tensor:
     """
     Gather tensors from all GPUs and concatenate along specified dimension.
-    
-    Assumes all tensors have the same size along the gather dimension.
-    
+
+    Handles uneven chunk sizes: when dividing N elements across W GPUs,
+    the last GPU may have fewer elements. This function pads smaller chunks
+    before gathering and slices to the correct total size.
+
     Args:
         tensor: Local tensor to gather
         dim: Dimension to concatenate along
-        
+        total_size: Expected total size after gathering (handles uneven chunks)
+
     Returns:
         Concatenated tensor from all GPUs
     """
     if not dist.is_initialized():
         return tensor
-    
+
     world_size = dist.get_world_size()
     if world_size == 1:
         return tensor
-    
+
+    # Handle uneven chunk sizes by finding max size and padding
+    local_size = tensor.shape[dim]
+    local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=tensor.device)
+    all_sizes = [torch.zeros(1, dtype=torch.long, device=tensor.device) for _ in range(world_size)]
+    dist.all_gather(all_sizes, local_size_tensor)
+    all_sizes = [s.item() for s in all_sizes]
+    max_size = max(all_sizes)
+    actual_total = sum(all_sizes)
+
+    # Pad tensor if needed
+    if local_size < max_size:
+        pad_size = max_size - local_size
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_size
+        padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        tensor = torch.cat([tensor, padding], dim=dim)
+
     # Gather all tensors
     gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
     dist.all_gather(gathered, tensor)
-    
-    return torch.cat(gathered, dim=dim)
+    result = torch.cat(gathered, dim=dim)
+
+    # Slice to correct size
+    final_size = total_size if total_size is not None else actual_total
+    if result.shape[dim] > final_size:
+        indices = [slice(None)] * result.dim()
+        indices[dim] = slice(0, final_size)
+        result = result[tuple(indices)].contiguous()
+
+    return result
 
 
 def _broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
@@ -400,6 +422,17 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # Update debug context with current step
             debug_ctx.set_step(step_num)
 
+            # =======================================================================
+            # MEMORY OPTIMIZATION: Clean memory at start of each step
+            # Force garbage collection and CUDA cache clear to ensure consistent
+            # memory state. This prevents fragmentation from accumulating.
+            # =======================================================================
+            if streaming_mode and step_num > 0:
+                import gc
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
             # Assert no grads on X_L
             assert not torch.is_grad_enabled(), "Computation graph should not be active"
             assert not X_L.requires_grad, "X_L should not require gradients"
@@ -579,18 +612,40 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             X_noisy_L_scaled = (
                 self.sigma_data * X_noisy_L / torch.sqrt(t_hat**2 + self.sigma_data**2)
             )                                              # [D, L, 3]
-            X_noisy_L_traj.append(X_noisy_L_scaled)
-            X_denoised_L_traj.append(X_denoised_L)
-            t_hats.append(t_hat)
+            # =======================================================================
+            # MEMORY OPTIMIZATION: Move trajectory tensors to CPU to prevent GPU
+            # memory accumulation. Over 99 steps, keeping these on GPU causes
+            # ~300MB+ accumulation that contributes to fragmentation and OOM.
+            # =======================================================================
+            if streaming_mode:
+                X_noisy_L_traj.append(X_noisy_L_scaled.cpu())
+                X_denoised_L_traj.append(X_denoised_L.cpu())
+                t_hats.append(t_hat.cpu())
+            else:
+                X_noisy_L_traj.append(X_noisy_L_scaled)
+                X_denoised_L_traj.append(X_denoised_L)
+                t_hats.append(t_hat)
 
             # =======================================================================
-            # MEMORY OPTIMIZATION: Clear CUDA cache between diffusion steps
+            # MEMORY OPTIMIZATION: Aggressive cleanup between diffusion steps
             # In multi-GPU streaming mode, memory fragmentation can cause OOM even
-            # when total free memory is sufficient. empty_cache() defragments memory.
+            # when total free memory is sufficient. The key is to:
+            # 1. Delete all temporary tensors explicitly
+            # 2. Force Python GC to release references
+            # 3. Synchronize CUDA to complete all pending ops
+            # 4. Clear CUDA cache to defragment memory
+            # This ensures that if step N succeeds, step N+1 will too.
             # NOTE: Do NOT delete 'outs' - it's used after the loop for return values
             # =======================================================================
             if streaming_mode:
-                del epsilon_L, X_noisy_L_scaled, delta_L
+                import gc
+                # Delete temporary tensors from this step
+                del epsilon_L, X_noisy_L_scaled, delta_L, X_denoised_L
+                # Force Python garbage collection to release any dangling references
+                gc.collect()
+                # Synchronize CUDA to ensure all operations are complete
+                torch.cuda.synchronize()
+                # Clear CUDA cache to defragment and release unused memory
                 torch.cuda.empty_cache()
 
         # ================================================================
@@ -760,6 +815,17 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # Update debug context with current step
             debug_ctx.set_step(step_num)
 
+            # =======================================================================
+            # MEMORY OPTIMIZATION: Clean memory at start of each step
+            # Force garbage collection and CUDA cache clear to ensure consistent
+            # memory state. This prevents fragmentation from accumulating.
+            # =======================================================================
+            if streaming_mode and step_num > 0:
+                import gc
+                gc.collect()
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
             # CRITICAL: In multi-GPU mode, ensure X_L is on the correct LOCAL device
             # X_L is initially created on cuda:0 for all ranks, but NCCL requires each rank
             # to have tensors on its own device (rank 0 → cuda:0, rank 1 → cuda:1)
@@ -922,18 +988,40 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             X_noisy_L_scaled = (
                 self.sigma_data * X_noisy_L / torch.sqrt(t_hat**2 + self.sigma_data**2)
             )                                              # [D, L, 3]
-            X_noisy_L_traj.append(X_noisy_L_scaled)
-            X_denoised_L_traj.append(X_denoised_L)
-            t_hats.append(t_hat)
+            # =======================================================================
+            # MEMORY OPTIMIZATION: Move trajectory tensors to CPU to prevent GPU
+            # memory accumulation. Over 99 steps, keeping these on GPU causes
+            # ~300MB+ accumulation that contributes to fragmentation and OOM.
+            # =======================================================================
+            if streaming_mode:
+                X_noisy_L_traj.append(X_noisy_L_scaled.cpu())
+                X_denoised_L_traj.append(X_denoised_L.cpu())
+                t_hats.append(t_hat.cpu())
+            else:
+                X_noisy_L_traj.append(X_noisy_L_scaled)
+                X_denoised_L_traj.append(X_denoised_L)
+                t_hats.append(t_hat)
 
             # =======================================================================
-            # MEMORY OPTIMIZATION: Clear CUDA cache between diffusion steps
+            # MEMORY OPTIMIZATION: Aggressive cleanup between diffusion steps
             # In multi-GPU streaming mode, memory fragmentation can cause OOM even
-            # when total free memory is sufficient. empty_cache() defragments memory.
+            # when total free memory is sufficient. The key is to:
+            # 1. Delete all temporary tensors explicitly
+            # 2. Force Python GC to release references
+            # 3. Synchronize CUDA to complete all pending ops
+            # 4. Clear CUDA cache to defragment memory
+            # This ensures that if step N succeeds, step N+1 will too.
             # NOTE: Do NOT delete 'outs' - it's used after the loop for return values
             # =======================================================================
             if streaming_mode:
-                del epsilon_L, X_noisy_L_scaled, delta_L
+                import gc
+                # Delete temporary tensors from this step
+                del epsilon_L, X_noisy_L_scaled, delta_L, X_denoised_L
+                # Force Python garbage collection to release any dangling references
+                gc.collect()
+                # Synchronize CUDA to ensure all operations are complete
+                torch.cuda.synchronize()
+                # Clear CUDA cache to defragment and release unused memory
                 torch.cuda.empty_cache()
 
         # ================================================================

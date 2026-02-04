@@ -32,33 +32,39 @@ def bucketize_scaled_distogram(R_L, min_dist=1, max_dist=30, sigma_data=16, n_bi
 
 
 def bucketize_scaled_distogram_chunked(
-    R_L, 
-    query_start, 
-    query_end, 
-    min_dist=1, 
-    max_dist=30, 
-    sigma_data=16, 
+    R_L,
+    query_start,
+    query_end,
+    min_dist=1,
+    max_dist=30,
+    sigma_data=16,
     n_bins=65
 ):
     """
     Chunked version of bucketize_scaled_distogram for multi-GPU parallel inference.
-    
+
     Computes pairwise distances only for a CHUNK of query atoms (query_start:query_end)
     against ALL atoms. This produces [B, I_par, I, n_bins] instead of [B, I, I, n_bins],
     avoiding full I×I tensor materialization.
-    
+
     Args:
         R_L: [B, N, 3] atom positions
         query_start: Start index of query atoms
         query_end: End index of query atoms
         min_dist, max_dist, sigma_data, n_bins: Same as bucketize_scaled_distogram
-        
+
     Returns:
         D_LL_binned: [B, I_par, I, n_bins] where I_par = query_end - query_start
     """
+    # CRITICAL: Set CUDA device context to match input tensor's device
+    # In multi-GPU setups, intermediate allocations may go to wrong device without this
+    device = R_L.device
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
+
     # R_query: [B, I_par, 3], R_all: [B, I, 3]
     R_query = R_L[:, query_start:query_end, :]               # [B, I_par, 3]
-    
+
     # Compute pairwise distances: query chunk vs all atoms
     # [B, I_par, 1, 3] - [B, 1, I, 3] = [B, I_par, I, 3]
     D_chunk = R_query.unsqueeze(-2) - R_L.unsqueeze(1)       # [B, I_par, I, 3]
@@ -68,7 +74,7 @@ def bucketize_scaled_distogram_chunked(
     min_dist_norm = min_dist / sigma_data
     max_dist_norm = max_dist / sigma_data
 
-    bins = torch.linspace(min_dist_norm, max_dist_norm, n_bins - 1, device=D_chunk.device)
+    bins = torch.linspace(min_dist_norm, max_dist_norm, n_bins - 1, device=device)
     bin_idxs = torch.bucketize(D_chunk, bins)
     return F.one_hot(bin_idxs, num_classes=len(bins) + 1).float()  # [B, I_par, I, n_bins]
 
@@ -233,10 +239,10 @@ def create_attention_indices(
 
     tok_idx = f["atom_to_token_map"] if tok_idx is None else tok_idx
     # Toggleable streaming mode to avoid materializing full LxL tensors
-    # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
+    # Parallel mode: =0 or unset → standard, any non-zero value → parallel
     import torch.distributed as dist
     n_parallel_env = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    if n_parallel_env == "1" and dist.is_initialized() and dist.get_world_size() > 1:
+    if n_parallel_env not in ("0", "", "false", "False") and dist.is_initialized() and dist.get_world_size() > 1:
         return create_attention_indices_parallel(
             f=f,
             n_attn_keys=n_attn_keys,

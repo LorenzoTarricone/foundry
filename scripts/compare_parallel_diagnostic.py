@@ -86,6 +86,10 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # Enable deterministic algorithms for all CUDA operations where possible
+    # Use warn_only=True because some ops (like index_reduce_cuda) don't have deterministic implementations
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    torch.use_deterministic_algorithms(True, warn_only=True)
 
 
 def init_distributed():

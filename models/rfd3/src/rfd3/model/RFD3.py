@@ -58,8 +58,9 @@ class RFD3(nn.Module):
         #   - Both: Sparse P_LL split across GPUs (most memory efficient)
         #
         low_mem = os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1"
-        # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
-        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0") == "1"
+        # Parallel mode: =0 or unset → standard, any non-zero value → parallel
+        attn_par_val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+        attn_parallel = attn_par_val not in ("0", "", "false", "False")
         
         # chunked_pll is INDEPENDENT of attn_parallel
         use_chunked_pll = low_mem

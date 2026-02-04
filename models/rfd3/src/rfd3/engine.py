@@ -360,6 +360,15 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         ) 
         # init before
         self.initialize()
+        # Debug: Log memory and clean up before _run_multi
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            free, total = torch.cuda.mem_get_info()
+            print(f"[RFD3Engine.run] MEMORY after gc: allocated={alloc:.2f}GB, free={free/1024**3:.2f}GB", flush=True)
+        print("[RFD3Engine.run] initialize() completed, calling _run_multi()", flush=True)
         outputs = self._run_multi(design_specifications)
         return outputs
 
@@ -374,6 +383,20 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         # ==============================================================================
         # Prepare pipeline and inference loader
         # ==============================================================================
+        # DEBUG: Immediate print to verify function entry
+        print("[_run_multi] ENTERING FUNCTION", flush=True)
+        import torch.distributed as dist
+        print("[_run_multi] After dist import", flush=True)
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        print(f"[_run_multi] rank={rank}, dist.is_initialized()={dist.is_initialized()}", flush=True)
+
+        def _log_mem(stage):
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                free, total = torch.cuda.mem_get_info()
+                print(f"[Rank {rank}] MEMORY@{stage}: allocated={alloc:.2f}GB, free={free/1024**3:.2f}GB", flush=True)
+
+        _log_mem("before_loader_setup")
         loader = assemble_distributed_inference_loader_from_json(
             # Passed directly to ContigJSONDataset
             data=specs,
@@ -386,38 +409,63 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             world_size=self.trainer.fabric.world_size,
             rank=self.trainer.fabric.global_rank,
         )
+        _log_mem("after_loader_assembly")
         loader = self.trainer.fabric.setup_dataloaders(
             loader,
             use_distributed_sampler=False,
         )
+        _log_mem("after_fabric_setup")
 
         # ==============================================================================
         # Evaluate, using `validation_step`
         # ==============================================================================
         outputs = {}
-        for batch_idx, batch in enumerate(loader):
+        print(f"[Rank {rank}] Starting dataloader iteration...", flush=True)
+        try:
+            for batch_idx, batch in enumerate(loader):
+                print(f"[Rank {rank}] Batch {batch_idx} loaded successfully", flush=True)
+                _log_mem(f"after_batch{batch_idx}_load")
             pipeline_output = batch[0]
             example_id = pipeline_output["example_id"]
+            print(f"[Rank {rank}] Loaded batch {batch_idx}, example_id={example_id}", flush=True)
 
             # Run model
+            _log_mem(f"before_model_forward_{batch_idx}")
             output_list = self._model_forward(pipeline_output)
             if self.out_dir:
                 for output in output_list:
                     output.dump(out_dir=self.out_dir)
             else:
                 outputs[example_id] = output_list
+        except Exception as e:
+            print(f"[Rank {rank}] ERROR during batch processing: {e}", flush=True)
+            _log_mem("error_state")
+            raise
         return outputs
 
     def _model_forward(self, pipeline_output) -> List[RFD3Output]:
         # Wraps around the trainer validation step to create atom arrays for saving.
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+
+        def _log_mem(stage):
+            if torch.cuda.is_available():
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                free, total = torch.cuda.mem_get_info()
+                print(f"[Rank {rank}] MEMORY@{stage}: allocated={alloc:.2f}GB, free={free/1024**3:.2f}GB", flush=True)
+
         t0 = time.time()
         with torch.no_grad():
+            _log_mem("before_to_device")
             pipeline_output = self.trainer.fabric.to_device(pipeline_output)
+            _log_mem("after_to_device")
+            print(f"[Rank {rank}] Calling validation_step...", flush=True)
             output_val = self.trainer.validation_step(
                 batch=pipeline_output,
                 batch_idx=0,
                 compute_metrics=False,
             )
+            _log_mem("after_validation_step")
         t_end = time.time()
 
         # Add additional information to prediction metadata

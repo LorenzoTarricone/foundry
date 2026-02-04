@@ -78,7 +78,8 @@ class DebugContext:
     def auto_detect_mode(self):
         """Auto-detect mode from environment variable."""
         attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-        if attn_parallel == "1":
+        # Enable parallel mode for any non-zero value (1, 2, 4, etc.)
+        if attn_parallel not in ("0", "", "false", "False"):
             self._mode = "PARALLEL"
         else:
             self._mode = "STANDARD"
@@ -272,3 +273,38 @@ def verify_tensor_sync(category: str, name: str, tensor: torch.Tensor, rtol: flo
             local_val = local_tensor.flatten()[:3].tolist()
             ref_val = ref_tensor.flatten()[:3].tolist()
             print(f"{prefix} [RANK{rank}/{world_size}] {name}: local[:3]={local_val}, ref[:3]={ref_val}", flush=True)
+
+
+def debug_memory(category: str, stage: str):
+    """
+    Log GPU memory usage from all ranks.
+
+    Args:
+        category: Category name (e.g., "ENCODER", "DECODER")
+        stage: Stage description (e.g., "before_Z_chunk", "after_distogram")
+    """
+    if not debug_ctx.enabled:
+        return
+
+    if not torch.cuda.is_available():
+        return
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    # Get memory stats
+    allocated = torch.cuda.memory_allocated(local_rank) / 1024**3
+    reserved = torch.cuda.memory_reserved(local_rank) / 1024**3
+    free_mem, total_mem = torch.cuda.mem_get_info(local_rank)
+    free_gb = free_mem / 1024**3
+    total_gb = total_mem / 1024**3
+    used_gb = total_gb - free_gb
+
+    prefix = debug_ctx.prefix(category)
+    print(
+        f"{prefix} [RANK{rank}/{world_size}] MEMORY@{stage}: "
+        f"allocated={allocated:.2f}GB, reserved={reserved:.2f}GB, "
+        f"global_used={used_gb:.2f}GB, global_free={free_gb:.2f}GB",
+        flush=True
+    )

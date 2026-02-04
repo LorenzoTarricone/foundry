@@ -7,10 +7,10 @@
 #   python scripts/design_annotate.py --config config/design_low_memory.yaml
 
 # Output settings
-out_dir: "inference_outputs/design_I_52AAASU"
+out_dir: "inference_outputs/design_I_50AAASU_lowmem"
 
 # Protein design parameters
-length: 51
+length: 50
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
@@ -29,6 +29,6 @@ seed: 42  # Random seed for reproducible results
 
 # Weights & Biases logging
 wandb:
-  enabled: false
+  enabled: true
   project: "fast-rfd3"
   run_name: null

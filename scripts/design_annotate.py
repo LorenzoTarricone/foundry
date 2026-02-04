@@ -39,7 +39,7 @@ import yaml
 import torch
 import random
 import numpy as np
-
+from lightning.fabric import seed_everything
 
 def set_seed(seed: int = 42):
     """
@@ -48,6 +48,7 @@ def set_seed(seed: int = 42):
     Args:
         seed: Random seed value (default: 42)
     """
+    seed_everything(seed)
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -96,44 +97,67 @@ except ImportError:
 
 class GPUMemoryMonitor:
     """Background thread that continuously monitors GPU memory usage."""
-    
+
     def __init__(self, wandb_run=None, interval=1.0):
+        """
+        Args:
+            wandb_run: W&B run object for logging
+            interval: Sampling interval in seconds
+        """
         self.wandb_run = wandb_run
         self.interval = interval
         self.running = False
         self.thread = None
         self.current_stage = "init"
         self.start_time = None
-    
+
     def _get_gpu_stats(self):
+        """Get current GPU memory usage."""
         if not torch.cuda.is_available():
             return {}
-        
+
         stats = {}
         for i in range(torch.cuda.device_count()):
-            free_b, total_b = torch.cuda.mem_get_info(i)
+            # Global (CUDA) view — includes other processes
+            free_b, total_b = torch.cuda.mem_get_info(i)  # cudaMemGetInfo
             free_gb = free_b / 1024**3
             total_gb = total_b / 1024**3
-            
+            used_gb = total_gb - free_gb
+
+            # PyTorch (this process) view
             allocated = torch.cuda.memory_allocated(i) / 1024**3
             reserved = torch.cuda.memory_reserved(i) / 1024**3
             peak_allocated = torch.cuda.max_memory_allocated(i) / 1024**3
-            
-            stats[f"gpu_{i}/global_free_gb"] = free_gb
+
+            # cached = reserved - allocated (PyTorch's internal cache, but FRAGMENTED!)
+            cached = max(reserved - allocated, 0.0)
+
+            stats[f"gpu_{i}/global_total_gb"] = total_gb
+            stats[f"gpu_{i}/global_free_gb"] = free_gb      # KEY: OOM when single alloc > this!
+            stats[f"gpu_{i}/global_used_gb"] = used_gb
             stats[f"gpu_{i}/allocated_gb"] = allocated
+            stats[f"gpu_{i}/reserved_gb"] = reserved
+            stats[f"gpu_{i}/cached_gb"] = cached            # WARNING: fragmented, can't use for large allocs
             stats[f"gpu_{i}/peak_allocated_gb"] = peak_allocated
-        
+
         return stats
-    
+
     def _monitor_loop(self):
+        """Main monitoring loop."""
         while self.running:
             stats = self._get_gpu_stats()
+
             if stats and self.wandb_run is not None:
-                log_data = {f"monitor/{k}": v for k, v in stats.items()}
+                log_data = {}
+                for k, v in stats.items():
+                    log_data[f"monitor/{k}"] = v
+
                 self.wandb_run.log(log_data)
+
             time.sleep(self.interval)
-    
+
     def start(self):
+        """Start the monitoring thread."""
         if self.running:
             return
         self.running = True
@@ -141,32 +165,49 @@ class GPUMemoryMonitor:
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
         print(f"  GPU memory monitor started (interval: {self.interval}s)")
-    
+
     def stop(self):
+        """Stop the monitoring thread."""
         self.running = False
         if self.thread is not None:
             self.thread.join(timeout=2.0)
             self.thread = None
         print("  GPU memory monitor stopped")
 
+    def set_stage(self, stage: str):
+        """Update the current pipeline stage."""
+        self.current_stage = stage
+
 
 def get_gpu_memory_stats():
     """Get current GPU memory usage statistics."""
     if not torch.cuda.is_available():
         return {}
-    
+
     stats = {}
     for i in range(torch.cuda.device_count()):
+        # Global (CUDA) view — includes other processes
         free_b, total_b = torch.cuda.mem_get_info(i)
         free_gb = free_b / 1024**3
-        
+        total_gb = total_b / 1024**3
+        used_gb = total_gb - free_gb
+
+        # PyTorch (this process) view
         allocated = torch.cuda.memory_allocated(i) / 1024**3
+        reserved = torch.cuda.memory_reserved(i) / 1024**3
         peak_allocated = torch.cuda.max_memory_allocated(i) / 1024**3
-        
+
+        # cached = reserved - allocated (PyTorch's internal cache, but FRAGMENTED!)
+        cached = max(reserved - allocated, 0.0)
+
+        stats[f"gpu_{i}/global_total_gb"] = total_gb
         stats[f"gpu_{i}/global_free_gb"] = free_gb
+        stats[f"gpu_{i}/global_used_gb"] = used_gb
         stats[f"gpu_{i}/allocated_gb"] = allocated
+        stats[f"gpu_{i}/reserved_gb"] = reserved
+        stats[f"gpu_{i}/cached_gb"] = cached
         stats[f"gpu_{i}/peak_allocated_gb"] = peak_allocated
-    
+
     return stats
 
 
@@ -174,14 +215,20 @@ def log_memory(stage: str, wandb_run=None, monitor=None):
     """Log memory stats for a given stage."""
     stats = get_gpu_memory_stats()
     if stats:
-        for k, v in stats.items():
-            if "free" in k or "peak" in k:
-                print(f"  [{stage}] {k}: {v:.2f} GB")
-        
+        # Show the KEY metric: global_free_gb determines if large allocations will OOM
+        global_free = stats.get('gpu_0/global_free_gb', 0)
+        allocated = stats.get('gpu_0/allocated_gb', 0)
+        print(f"  [{stage}] GPU: {allocated:.1f} GB allocated, {global_free:.1f} GB free (OOM if alloc > free)")
+
         if wandb_run is not None:
-            log_data = {f"stage/{stage}/{k}": v for k, v in stats.items()}
-            wandb_run.log(log_data)
-    
+            # Add stage prefix to all keys
+            logged_stats = {f"{stage}/{k}": v for k, v in stats.items()}
+            wandb_run.log(logged_stats)
+
+        # Update monitor stage
+        if monitor is not None:
+            monitor.set_stage(stage)
+
     return stats
 
 
@@ -227,11 +274,15 @@ def run_design(
     wandb_run = None
     monitor = None
     
+    # Reset peak memory stats
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
     if use_wandb and WANDB_AVAILABLE:
         n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         mode_str = "parallel" if attention_parallel else ("low_mem" if low_memory_mode else "standard")
         run_name = wandb_run_name or f"{mode_str}_L{length}_N{num_designs}_GPUs{n_gpus}"
-        
+
         wandb_run = wandb.init(
             project=wandb_project,
             name=run_name,
@@ -242,8 +293,10 @@ def run_design(
                 "low_memory_mode": low_memory_mode,
                 "attention_parallel": attention_parallel,
                 "n_gpus": n_gpus,
+                "pipeline": "design_annotate",
             }
         )
+        print(f"W&B run initialized: {wandb_run.url}")
         monitor = GPUMemoryMonitor(wandb_run=wandb_run, interval=1.0)
         monitor.start()
     
@@ -302,6 +355,7 @@ def run_design(
         low_memory_mode=low_memory_mode,
         attention_parallel=attention_parallel,
         attention_parallel_factor=attention_parallel_factor,
+        seed=seed,
     )
     
     print(f"\nInitializing RFD3 engine...")

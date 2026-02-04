@@ -38,7 +38,15 @@ from atomworks.ml.transforms.base import (
     SubsetToKeys,
 )
 from atomworks.ml.transforms.bfactor_conditioned_transforms import SetOccToZeroOnBfactor
-from atomworks.ml.transforms.bonds import AddAF3TokenBondFeatures
+# NOTE: We use our own AddAF3TokenBondFeatures from util_transforms only when
+# RFD3_ATTENTION_PARALLEL is set, for memory-efficient parallel multi-GPU
+# preprocessing of large symmetric structures. Otherwise use standard atomworks.
+import os
+_attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+if _attn_parallel not in ("0", "", "false", "False"):
+    from rfd3.transforms.util_transforms import AddAF3TokenBondFeatures
+else:
+    from atomworks.ml.transforms.bonds import AddAF3TokenBondFeatures
 from atomworks.ml.transforms.cached_residue_data import LoadCachedResidueLevelData
 from atomworks.ml.transforms.covalent_modifications import (
     FlagAndReassignCovalentModifications,
@@ -519,6 +527,7 @@ def build_atom14_base_pipeline_(
             token_1d_features=token_1d_features,
             atom_1d_features=atom_1d_features,
         ),
+        # Memory-efficient implementation for parallel multi-GPU preprocessing
         AddAF3TokenBondFeatures(),
         AddGroundTruthSequence(sequence_encoding=af3_sequence_encoding),
         ConditionalRoute(

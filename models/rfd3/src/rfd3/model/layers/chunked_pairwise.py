@@ -404,6 +404,13 @@ class ChunkedPairwiseEmbedder(nn.Module):
         streaming_mode = kwargs.get("streaming_mode", False)
         z_chunk_range = kwargs.get("z_chunk_range")
 
+        # DEBUG: Log streaming mode check
+        import torch.distributed as dist
+        if dist.is_initialized():
+            rank = dist.get_rank()
+            print(f"[DEBUG-STREAMING] RANK{rank}: streaming_mode={streaming_mode}, z_chunk_range={z_chunk_range}, "
+                  f"Z_init_II.shape={list(Z_init_II.shape)}, kwargs.keys()={list(kwargs.keys())}", flush=True)
+
         if streaming_mode and z_chunk_range is not None:
             debug_log("PAIRWISE", "Z_init_II", f"CHUNKED TENSOR shape={list(Z_init_II.shape)}, range={z_chunk_range}")
             # Streaming mode: Z_init_II is pre-computed [I_par, I, c_z] chunk
@@ -611,6 +618,15 @@ class ChunkedPairwiseEmbedder(nn.Module):
             # Check for streaming mode via initializer_outputs (Z_init_II is a chunked tensor)
             streaming_mode = initializer_outputs.get("streaming_mode", False)
             z_chunk_range = initializer_outputs.get("z_chunk_range")
+
+            # DEBUG: Log streaming_mode check to diagnose encoder path issue
+            import torch.distributed as dist
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                print(f"[DEBUG-STREAMING-CHECK] RANK{rank}: streaming_mode={streaming_mode}, "
+                      f"z_chunk_range={z_chunk_range}, "
+                      f"Z_init_II.shape={list(Z_init_II.shape)}, "
+                      f"initializer_outputs.keys()={list(initializer_outputs.keys())}", flush=True)
 
             if streaming_mode and z_chunk_range is not None:
                 # Streaming mode: Z_init_II is pre-computed [I_par, I, c_z] chunk

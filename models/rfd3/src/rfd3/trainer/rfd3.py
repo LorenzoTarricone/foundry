@@ -1,5 +1,7 @@
+import gc
 import numpy as np
 import torch
+import torch.distributed as dist
 from beartype.typing import Any, List, Union
 from biotite.structure import AtomArray, AtomArrayStack
 from biotite.structure.residues import get_residue_starts
@@ -226,7 +228,36 @@ class AADesignTrainer(FabricTrainer):
             msg=f"network_output for example_id: {example['example_id']}",
         )
 
-        # ... Convert output to a stack of atom arrays
+        # Determine rank for parallel mode
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        is_parallel_mode = dist.is_initialized() and dist.get_world_size() > 1
+
+        # Memory cleanup before post-processing (all ranks)
+        # This helps prevent OOM during the memory-intensive post-processing step
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if rank == 0:
+                alloc = torch.cuda.memory_allocated() / 1024**3
+                free, _ = torch.cuda.mem_get_info()
+                global_logger.info(f"[Post-processing] Memory after cleanup: allocated={alloc:.2f}GB, free={free/1024**3:.2f}GB")
+
+        # In parallel mode, only rank 0 builds atom arrays (memory-intensive operation)
+        # Other ranks return early with empty results to avoid OOM
+        if is_parallel_mode and rank != 0:
+            # Detach network output before returning
+            if network_output is not None:
+                network_output = apply_to_collection(
+                    network_output, torch.Tensor, lambda x: x.detach()
+                )
+            return {
+                "metrics_output": {},
+                "network_output": network_output,
+                "predicted_atom_array_stack": [],
+                "prediction_metadata": {},
+            }
+
+        # ... Convert output to a stack of atom arrays (rank 0 only in parallel mode)
         predicted_atom_array_stack, prediction_metadata = (
             self._build_predicted_atom_array_stack(network_output, example)
         )

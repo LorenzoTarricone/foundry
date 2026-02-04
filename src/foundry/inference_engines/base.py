@@ -139,6 +139,7 @@ class BaseInferenceEngine:
 
         ranked_logger.info("Model loaded and ready for inference.")
         self.initialized_ = True
+        print("[BaseInferenceEngine.initialize] Completed, returning cfg", flush=True)
         return cfg
 
     def run(
@@ -195,6 +196,12 @@ class BaseInferenceEngine:
         trainer.setup_model_optimizers_and_schedulers()
         trainer.state["model"].eval()
         self.trainer = trainer
+        # Debug: Log memory after model setup
+        import torch
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**3
+            free, total = torch.cuda.mem_get_info()
+            print(f"[_construct_trainer] MEMORY after model setup: allocated={alloc:.2f}GB, free={free/1024**3:.2f}GB", flush=True)
 
     def _assign_override(self, dotted_key: str, value: Any) -> None:
         """Assign ``value`` into ``self.overrides`` using a dotted path."""

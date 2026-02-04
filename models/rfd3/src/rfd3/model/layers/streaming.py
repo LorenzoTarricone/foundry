@@ -32,10 +32,10 @@ def is_streaming_mode() -> bool:
 
     Env var scheme:
       - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
-      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+      - RFD3_ATTENTION_PARALLEL=1 or any non-zero value → parallel mode (True)
     """
     val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    return val == "1"
+    return val not in ("0", "", "false", "False")
 
 
 def get_world_size() -> int:
@@ -49,19 +49,28 @@ def get_world_size() -> int:
 def compute_chunk_ranges(total: int, n_par: int) -> List[Tuple[int, int]]:
     """
     Compute start/end indices for chunked processing.
-    
+
+    Uses floor division with remainder distributed to early ranks.
+    For 13800 tokens / 7 GPUs: ranks 0-2 get 1972, ranks 3-6 get 1971.
+
     Args:
         total: Total number of elements (I or L)
         n_par: Number of parallel chunks
-        
+
     Returns:
         List of (start, end) tuples for each chunk
     """
-    chunk_size = (total + n_par - 1) // n_par  # Ceiling division
+    chunk_size = total // n_par
+    remainder = total % n_par
+
     ranges = []
-    for i in range(n_par):
-        start = i * chunk_size
-        end = min((i + 1) * chunk_size, total)
+    for rank in range(n_par):
+        if rank < remainder:
+            start = rank * (chunk_size + 1)
+            end = start + chunk_size + 1
+        else:
+            start = rank * chunk_size + remainder
+            end = start + chunk_size
         if start < total:
             ranges.append((start, end))
     return ranges
