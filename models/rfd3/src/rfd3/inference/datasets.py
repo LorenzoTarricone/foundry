@@ -23,6 +23,7 @@ from torch.utils.data import (
 
 from foundry.utils.datasets import assemble_distributed_loader
 from foundry.utils.ddp import RankedLogger
+from rfd3.model.debug_context import debug_ctx, debug_memory
 
 logger = RankedLogger(__name__, rank_zero_only=True)
 all_ranks_logger = RankedLogger(__name__, rank_zero_only=False)
@@ -158,15 +159,7 @@ class ContigJsonDataset(MolecularDataset):
         import torch
         import torch.distributed as dist
 
-        rank = dist.get_rank() if dist.is_initialized() else 0
-
-        def _log_mem(stage):
-            if torch.cuda.is_available():
-                alloc = torch.cuda.memory_allocated() / 1024**3
-                free, total = torch.cuda.mem_get_info()
-                print(f"[Rank {rank}] __getitem__ MEMORY@{stage}: allocated={alloc:.2f}GB, free={free/1024**3:.2f}GB", flush=True)
-
-        _log_mem("getitem_start")
+        debug_memory("DATASET", "getitem_start")
         example_id = self.idx_to_id(idx)
         spec = self.data[example_id]
 
@@ -178,43 +171,24 @@ class ContigJsonDataset(MolecularDataset):
 
         # Create pipeline input
         data = spec.to_pipeline_input(example_id=example_id)
-        _log_mem("after_pipeline_input")
+        debug_memory("DATASET", "after_pipeline_input")
 
-        # Apply transforms and return - with per-transform logging
-        print(f"[Rank {rank}] __getitem__ applying transforms...", flush=True)
-
-        # Check if transform is a Compose and log each step
+        # Apply transforms and return
         if hasattr(self.transform, 'transforms'):
-            n_transforms = len(self.transform.transforms)
-            print(f"[Rank {rank}] Total transforms: {n_transforms}", flush=True)
             for i, t in enumerate(self.transform.transforms):
                 t_name = type(t).__name__
                 try:
-                    # Log ALL transforms after 35 to catch the OOM culprit
-                    if i >= 35:
-                        print(f"[Rank {rank}] Starting transform_{i}_{t_name}...", flush=True)
                     data = t(data)
-                    if i % 5 == 0 or i >= 35:  # Log every 5th OR all after 35
-                        _log_mem(f"transform_{i}_{t_name}")
+                    # Log every 10th transform if memory logging enabled
+                    if i % 10 == 0:
+                        debug_memory("DATASET", f"transform_{i}_{t_name}")
                 except Exception as e:
-                    print(f"[Rank {rank}] ERROR in transform {i} ({t_name}): {e}", flush=True)
-                    _log_mem(f"transform_{i}_{t_name}_ERROR")
+                    debug_memory("DATASET", f"transform_{i}_{t_name}_ERROR")
                     raise
         else:
             data = self.transform(data)
 
-        _log_mem("after_transform")
-
-        # Log tensor sizes in the data to identify large allocations
-        if 'feats' in data:
-            large_tensors = []
-            for k, v in data['feats'].items():
-                if hasattr(v, 'shape'):
-                    size_mb = v.numel() * v.element_size() / 1024**2
-                    if size_mb > 10:  # Only log tensors > 10MB
-                        large_tensors.append(f"{k}: {list(v.shape)} ({size_mb:.1f}MB)")
-            if large_tensors:
-                print(f"[Rank {rank}] Large tensors in feats: {large_tensors}", flush=True)
+        debug_memory("DATASET", "after_transform")
 
         return data
 

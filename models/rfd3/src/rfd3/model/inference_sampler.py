@@ -18,7 +18,7 @@ from foundry.utils.rotation_augmentation import (
     rot_vec_mul,
     uniform_random_rotation,
 )
-from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks
+from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks, debug_time, debug_time_log
 from rfd3.model.layers.streaming import compute_chunk_ranges
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
@@ -479,43 +479,36 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # ================================================================
             # Denoise the coordinates - handle chunked/streaming mode
             # ================================================================
-            tic = time.time()
-            
             # Prepare common arguments
             chunked_embedder = initializer_outputs.get("chunked_pairwise_embedder", None)
-            
-            if chunked_embedder is not None or streaming_mode:
-                # Chunked/streaming mode: explicitly provide P_LL=None
-                other_outputs = {
-                    k: v
-                    for k, v in initializer_outputs.items()
-                    if k not in ("chunked_pairwise_embedder", "streaming_mode")
-                }
-                
-                outs = diffusion_module(
-                    X_noisy_L=X_noisy_L,                   # [D, L, 3]
-                    t=t_hat.tile(D),                       # [D]
-                    f=f,
-                    P_LL=None,                             # Not used in chunked/streaming mode
-                    chunked_pairwise_embedder=chunked_embedder,
-                    initializer_outputs=other_outputs,
-                    streaming_mode=streaming_mode,         # Pass streaming flag!
-                    **other_outputs,
-                )
-                
-                toc = time.time()
-                if step_num == 0:  # Log only first step to avoid spam
-                    ranked_logger.info(
-                        f"{'Streaming' if streaming_mode else 'Chunked'} mode step time: {toc - tic:.2f}s"
+
+            with debug_time("SAMPLER", f"diffusion_step_{step_num}"):
+                if chunked_embedder is not None or streaming_mode:
+                    # Chunked/streaming mode: explicitly provide P_LL=None
+                    other_outputs = {
+                        k: v
+                        for k, v in initializer_outputs.items()
+                        if k not in ("chunked_pairwise_embedder", "streaming_mode")
+                    }
+
+                    outs = diffusion_module(
+                        X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                        t=t_hat.tile(D),                       # [D]
+                        f=f,
+                        P_LL=None,                             # Not used in chunked/streaming mode
+                        chunked_pairwise_embedder=chunked_embedder,
+                        initializer_outputs=other_outputs,
+                        streaming_mode=streaming_mode,         # Pass streaming flag!
+                        **other_outputs,
                     )
-            else:
-                # Standard mode: P_LL is included in initializer_outputs
-                outs = diffusion_module(
-                    X_noisy_L=X_noisy_L,                   # [D, L, 3]
-                    t=t_hat.tile(D),                       # [D]
-                    f=f,
-                    **initializer_outputs,
-                )
+                else:
+                    # Standard mode: P_LL is included in initializer_outputs
+                    outs = diffusion_module(
+                        X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                        t=t_hat.tile(D),                       # [D]
+                        f=f,
+                        **initializer_outputs,
+                    )
 
             X_denoised_L = outs["X_L"] if "X_L" in outs else outs  # [D, L, 3]
 
@@ -647,6 +640,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 torch.cuda.synchronize()
                 # Clear CUDA cache to defragment and release unused memory
                 torch.cuda.empty_cache()
+
+        # ================================================================
+        # Print timing summary at end of diffusion loop
+        # ================================================================
+        debug_ctx.print_timing_summary()
 
         # ================================================================
         # Post-processing: motif alignment

@@ -461,7 +461,16 @@ def run_worker(
     from biotite.structure import get_chains
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
     from mpnn.inference_engines.mpnn import MPNNInferenceEngine
-    
+    from rfd3.model.debug_context import debug_ctx
+
+    # Configure debug logging from config kwargs
+    debug_ctx.configure({
+        'verbose': kwargs.get('verbose', False),
+        'verbose_stats': kwargs.get('verbose_stats', False),
+        'verbose_memory': kwargs.get('verbose_memory', False),
+        'verbose_time': kwargs.get('verbose_time', False),
+    })
+
     # Optional W&B
     try:
         import wandb

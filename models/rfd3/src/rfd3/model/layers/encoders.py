@@ -33,9 +33,24 @@ from rfd3.model.layers.streaming import compute_chunk_ranges
 
 from foundry.common import exists
 from foundry.training.checkpoint import activation_checkpointing
-from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks, verify_tensor_sync, debug_memory
+from rfd3.model.debug_context import (
+    debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks,
+    verify_tensor_sync, debug_memory, debug_gpu_memory_snapshot, debug_chunking, debug_time
+)
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# EXTRA_CHUNKING: Control sequential loop behavior in parallel mode
+# =============================================================================
+# Default False = vectorized operation (fast, O(1) scaling, more memory)
+# Set True = chunked operation (slower, O(N) scaling, less memory)
+#
+# In parallel mode, the chunked functions loop over the full I dimension which
+# causes O(N) time scaling. Setting EXTRA_CHUNKING=False (default) bypasses
+# these loops and uses vectorized operations instead.
+# =============================================================================
+EXTRA_CHUNKING = os.environ.get("RFD3_EXTRA_CHUNKING", "0") == "1"
 
 
 def _is_streaming_mode() -> bool:
@@ -63,91 +78,149 @@ def _get_world_size() -> int:
 
 
 
-def _z_transition_chunked(Z: torch.Tensor, transition_fn, key_chunk: int = 512) -> torch.Tensor:
+def _z_transition_chunked(Z: torch.Tensor, transition_fn, key_chunk: int = 512, extra_chunking: bool = None) -> torch.Tensor:
     """
-    Apply z_transition in sub-chunks along key dimension to reduce peak memory.
-    
-    SwiGLU creates 4x intermediate: [I_par, I, c] -> [I_par, I, 4*c] -> [I_par, I, c]
-    By chunking keys: [I_par, chunk, c] -> [I_par, chunk, 4*c] reduces memory 4x.
-    
+    Apply z_transition, optionally with chunking for memory efficiency.
+
+    By default (extra_chunking=False), uses a single vectorized operation for O(1) scaling.
+    If extra_chunking=True, processes in sub-chunks to reduce peak memory (O(N) scaling).
+
     Args:
         Z: [I_par, I, c_z] or [B, I_par, I, c_z]
         transition_fn: z_transition module
-        key_chunk: chunk size along key dimension
-    
+        key_chunk: chunk size along key dimension (only used if extra_chunking=True)
+        extra_chunking: If True, use chunked processing. If None, uses EXTRA_CHUNKING env var.
+
     Returns:
-        Z + transition_fn(Z), computed memory-efficiently
+        Z + transition_fn(Z)
     """
+    # Determine if chunking is enabled (default: use global EXTRA_CHUNKING)
+    use_chunking = extra_chunking if extra_chunking is not None else EXTRA_CHUNKING
+
+    # DEFAULT: Vectorized operation (fast, O(1) scaling)
+    if not use_chunking or Z.dim() not in [3, 4]:
+        if debug_ctx.memory_enabled and Z.dim() in [3, 4]:
+            I = Z.shape[1] if Z.dim() == 3 else Z.shape[2]
+            z_mem_gb = Z.numel() * Z.element_size() / 1e9
+            # SwiGLU creates 4x intermediate: c_z -> 4*c_z -> c_z
+            swiglu_peak_gb = Z.numel() * 4 * Z.element_size() / 1e9  # 4x expansion
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9
+                free_mem, total_mem = torch.cuda.mem_get_info()
+                free_gb = free_mem / 1e9
+                debug_chunking(f"_z_transition_chunked: VECTORIZED, I={I}")
+                debug_chunking(f"  Z shape={list(Z.shape)}, Z_mem={z_mem_gb:.2f}GB")
+                debug_chunking(f"  SwiGLU 4x expansion will need ~{swiglu_peak_gb:.2f}GB")
+                debug_chunking(f"  GPU: allocated={allocated:.2f}GB, free={free_gb:.2f}GB")
+                if swiglu_peak_gb > free_gb:
+                    debug_chunking(f"  WARNING: SwiGLU peak ({swiglu_peak_gb:.2f}GB) > free ({free_gb:.2f}GB) - OOM likely!")
+                    # Take a full memory snapshot to see what's consuming memory
+                    debug_gpu_memory_snapshot("OOM_DEBUG", f"before_z_transition_I={I}", min_size_mb=50.0)
+            else:
+                debug_chunking(f"_z_transition_chunked: VECTORIZED, I={I}, Z_mem={z_mem_gb:.2f}GB, SwiGLU_peak={swiglu_peak_gb:.2f}GB")
+        return Z + transition_fn(Z)
+
+    # OPTIONAL: Chunked operation (slow, O(N) scaling, less memory)
     if Z.dim() == 3:
         # [I_par, I, c_z]
         I = Z.shape[1]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_z_transition_chunked(3D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, k_start:k_end, :]
             out_chunks.append(Z_sub + transition_fn(Z_sub))
         result = torch.cat(out_chunks, dim=1)
-        del out_chunks  # Free chunk list after cat
+        del out_chunks
         return result
-    elif Z.dim() == 4:
+    else:  # Z.dim() == 4
         # [B, I_par, I, c_z]
         I = Z.shape[2]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_z_transition_chunked(4D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, :, k_start:k_end, :]
             out_chunks.append(Z_sub + transition_fn(Z_sub))
         result = torch.cat(out_chunks, dim=2)
-        del out_chunks  # Free chunk list after cat
+        del out_chunks
         return result
-    else:
-        return Z + transition_fn(Z)
 
 
-def _process_z_chunked(Z: torch.Tensor, process_fn, key_chunk: int = 512) -> torch.Tensor:
+def _process_z_chunked(Z: torch.Tensor, process_fn, key_chunk: int = 512, extra_chunking: bool = None) -> torch.Tensor:
     """
-    Apply process_z (Linear) in sub-chunks along key dimension to reduce peak memory.
+    Apply process_z (Linear), optionally with chunking for memory efficiency.
 
-    process_z transforms [I_par, I, c_in] -> [I_par, I, c_out].
-    For I=8100, c_in=258, c_out=128, full tensor is 22 GB.
-    By chunking keys: [I_par, chunk, c_in] -> [I_par, chunk, c_out] reduces memory.
-
-    Unlike _z_transition_chunked, this has NO residual connection - just applies process_fn.
+    By default (extra_chunking=False), uses a single vectorized operation for O(1) scaling.
+    If extra_chunking=True, processes in sub-chunks to reduce peak memory (O(N) scaling).
 
     Args:
         Z: [I_par, I, c_in] or [B, I_par, I, c_in]
         process_fn: process_z module (typically nn.Sequential with RMSNorm + Linear)
-        key_chunk: chunk size along key dimension
+        key_chunk: chunk size along key dimension (only used if extra_chunking=True)
+        extra_chunking: If True, use chunked processing. If None, uses EXTRA_CHUNKING env var.
 
     Returns:
-        process_fn(Z) computed memory-efficiently
+        process_fn(Z)
     """
+    # Determine if chunking is enabled (default: use global EXTRA_CHUNKING)
+    use_chunking = extra_chunking if extra_chunking is not None else EXTRA_CHUNKING
+
+    # DEFAULT: Vectorized operation (fast, O(1) scaling)
+    if not use_chunking or Z.dim() not in [3, 4]:
+        if debug_ctx.memory_enabled and Z.dim() in [3, 4]:
+            I = Z.shape[1] if Z.dim() == 3 else Z.shape[2]
+            z_mem_gb = Z.numel() * Z.element_size() / 1e9
+            # process_fn is typically RMSNorm + Linear, output similar size to input
+            # But the Linear may have different output dimension - estimate 2x peak
+            peak_gb = z_mem_gb * 2
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9
+                free_mem, total_mem = torch.cuda.mem_get_info()
+                free_gb = free_mem / 1e9
+                debug_chunking(f"_process_z_chunked: VECTORIZED, I={I}")
+                debug_chunking(f"  Z shape={list(Z.shape)}, Z_mem={z_mem_gb:.2f}GB")
+                debug_chunking(f"  Estimated peak ~{peak_gb:.2f}GB")
+                debug_chunking(f"  GPU: allocated={allocated:.2f}GB, free={free_gb:.2f}GB")
+            else:
+                debug_chunking(f"_process_z_chunked: VECTORIZED, I={I}, Z_mem={z_mem_gb:.2f}GB")
+        return process_fn(Z)
+
+    # OPTIONAL: Chunked operation (slow, O(N) scaling, less memory)
     if Z.dim() == 3:
         # [I_par, I, c_in]
         I = Z.shape[1]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_process_z_chunked(3D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, k_start:k_end, :]
             out_chunks.append(process_fn(Z_sub))
-            del Z_sub  # Free memory immediately
+            del Z_sub
         result = torch.cat(out_chunks, dim=1)
-        del out_chunks  # Free chunk list after cat
+        del out_chunks
         return result
-    elif Z.dim() == 4:
+    else:  # Z.dim() == 4
         # [B, I_par, I, c_in]
         I = Z.shape[2]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_process_z_chunked(4D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, :, k_start:k_end, :]
             out_chunks.append(process_fn(Z_sub))
-            del Z_sub  # Free memory immediately
+            del Z_sub
         result = torch.cat(out_chunks, dim=2)
-        del out_chunks  # Free chunk list after cat
+        del out_chunks
         return result
-    else:
-        return process_fn(Z)
 
 
 def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
@@ -332,7 +405,8 @@ class TokenInitializer(nn.Module):
         # Parallel mode: =0 or unset → standard, any non-zero value → parallel
         env_val = os.environ.get("RFD3_ATTENTION_PARALLEL", "NOT_SET")
         self.use_streaming = _is_streaming_mode()
-        print(f"[TokenInitializer.__init__] RFD3_ATTENTION_PARALLEL={env_val}, use_streaming={self.use_streaming}", flush=True)
+        if debug_ctx.stats_enabled:
+            debug_log("INIT", "TokenInitializer", f"RFD3_ATTENTION_PARALLEL={env_val}, use_streaming={self.use_streaming}")
         if self.use_streaming:
             logger.info(
                 f"TokenInitializer: Streaming mode enabled. "
@@ -1244,7 +1318,8 @@ class DiffusionTokenEncoder(nn.Module):
         # Parallel mode: =0 or unset → standard, any non-zero value → parallel
         env_val = os.environ.get("RFD3_ATTENTION_PARALLEL", "NOT_SET")
         self.use_streaming = _is_streaming_mode()
-        print(f"[DiffusionTokenEncoder.__init__] RFD3_ATTENTION_PARALLEL={env_val}, use_streaming={self.use_streaming}", flush=True)
+        if debug_ctx.stats_enabled:
+            debug_log("INIT", "DiffusionTokenEncoder", f"RFD3_ATTENTION_PARALLEL={env_val}, use_streaming={self.use_streaming}")
 
     def forward(self, f, R_L, S_init_I, Z_init_II, C_L, P_LL, **kwargs):
         """

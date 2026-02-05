@@ -25,7 +25,10 @@ from rfd3.model.layers.encoders import (
 )
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
 from rfd3.model.layers.streaming import compute_chunk_ranges
-from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks, verify_tensor_sync
+from rfd3.model.debug_context import (
+    debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks,
+    verify_tensor_sync, debug_memory, debug_tensor_memory, debug_time, debug_chunking
+)
 
 from foundry.model.layers.blocks import (
     FourierEmbedding,
@@ -849,6 +852,12 @@ class RFD3DiffusionModule(nn.Module):
         S_I = S_I.unsqueeze(0) + self.process_time_(t_I, i=1)    # [B, I, c_s]
         C_L = C_L + self.process_c(C_L)                          # [B, L, c_atom]
 
+        # MEMORY TRACKING: Log key tensor memory usage to verify bottleneck hypothesis
+        debug_memory("DIFFUSION", "after_atom_features")
+        debug_tensor_memory("DIFFUSION", "Q_L", Q_L)
+        debug_tensor_memory("DIFFUSION", "C_L", C_L)
+        debug_tensor_memory("DIFFUSION", "S_I", S_I)
+
         # ... Run Local-Atom Self Attention and Pool
         # Parallel mode: =0 or unset → standard, any non-zero value → parallel
         attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
@@ -916,18 +925,19 @@ class RFD3DiffusionModule(nn.Module):
                 # --- END NEW IMPLEMENTATION ---
             
             # Use parallel encoder - each GPU handles L_par atoms
-            Q_L = self.encoder.forward_parallel(
-                Q_L=Q_L,
-                C_L=C_L,
-                indices=f["attn_indices"],
-                query_start=query_start,
-                query_end=query_end,
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-                all_gather_fn=all_gather_concat,
-                world_size=world_size,
-            )                                              # [B, L, c_atom]
+            with debug_time("DIFFUSION", "encoder_parallel"):
+                Q_L = self.encoder.forward_parallel(
+                    Q_L=Q_L,
+                    C_L=C_L,
+                    indices=f["attn_indices"],
+                    query_start=query_start,
+                    query_end=query_end,
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                    all_gather_fn=all_gather_concat,
+                    world_size=world_size,
+                )                                              # [B, L, c_atom]
             
             # Move all tensors and modules to this rank's device (Q_L is now on LOCAL_RANK's device)
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -979,14 +989,16 @@ class RFD3DiffusionModule(nn.Module):
                             initializer_outputs[key] = val.to(local_device)
         elif chunked_pairwise_embedder is not None:
             # Low-memory mode: sparse P_LL but single GPU
-            Q_L = self.encoder(
-                Q_L, C_L, P_LL=None, indices=f["attn_indices"],
-                f=f, chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-            )                                              # [B, L, c_atom]
+            with debug_time("DIFFUSION", "encoder_low_memory"):
+                Q_L = self.encoder(
+                    Q_L, C_L, P_LL=None, indices=f["attn_indices"],
+                    f=f, chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                )                                              # [B, L, c_atom]
         else:
             # Standard mode: use full P_LL
-            Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])  # [B, L, c_atom]
+            with debug_time("DIFFUSION", "encoder_standard"):
+                Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])  # [B, L, c_atom]
         
         # DIAGNOSTIC: Log Q_L after encoder
         _log_tensor_stats("Q_L_after_encoder", Q_L)
@@ -1123,17 +1135,23 @@ class RFD3DiffusionModule(nn.Module):
             z_chunk_range = initializer_outputs.get("z_chunk_range")
 
         # ... Embed token level features with atom level encodings
-        S_I, Z_II = self.diffusion_token_encoder(
-            f=f,
-            R_L=R_L_uniform,                               # [B, L, 3]
-            D_II_self=D_II_self,                           # [B, I, I, n_bins] or None
-            S_init_I=S_I,                                  # [B, I, c_s]
-            Z_init_II=Z_II,                                # [I, I, c_z] or [I_par, I, c_z]
-            C_L=C_L,                                       # [B, L, c_atom]
-            P_LL=P_LL,                                     # [L, L, c_atompair] or None
-            streaming_mode=streaming_mode,
-            z_chunk_range=z_chunk_range,
-        )                                                  # Returns: [I, c_s], [I, I, c_z] or [I_par, I, c_z]
+        with debug_time("DIFFUSION", "diffusion_token_encoder"):
+            S_I, Z_II = self.diffusion_token_encoder(
+                f=f,
+                R_L=R_L_uniform,                               # [B, L, 3]
+                D_II_self=D_II_self,                           # [B, I, I, n_bins] or None
+                S_init_I=S_I,                                  # [B, I, c_s]
+                Z_init_II=Z_II,                                # [I, I, c_z] or [I_par, I, c_z]
+                C_L=C_L,                                       # [B, L, c_atom]
+                P_LL=P_LL,                                     # [L, L, c_atompair] or None
+                streaming_mode=streaming_mode,
+                z_chunk_range=z_chunk_range,
+            )                                                  # Returns: [I, c_s], [I, I, c_z] or [I_par, I, c_z]
+
+        # MEMORY TRACKING: Log token tensor memory after diffusion_token_encoder
+        debug_memory("DIFFUSION", "after_token_encoder")
+        debug_tensor_memory("DIFFUSION", "S_I_after_encoder", S_I)
+        debug_tensor_memory("DIFFUSION", "Z_II_after_encoder", Z_II)
 
         # Determine full mode for transformer
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
@@ -1154,35 +1172,36 @@ class RFD3DiffusionModule(nn.Module):
             initializer_outputs["z_chunk_range"] = z_chunk_range
 
         # ... Diffusion transformer with GPU-parallel attention
-        if z_is_chunked:
-            # Multi-GPU parallel: each GPU processes its query chunk
-            A_I = self._diffusion_transformer_parallel(
-                A_I=A_I,                                   # [B, I, c_token]
-                S_I=S_I,                                   # [I, c_s]
-                Z_II_chunk=Z_II,                           # [I_par, I, c_z] - this GPU's rows
-                f=f,
-                X_L=(
-                    X_noisy_L[..., f["is_ca"], :]
-                    if X_L_self is None
-                    else X_L_self[..., f["is_ca"], :]
-                ),
-                gpu_rank=gpu_rank,
-                world_size=world_size,
-            )                                              # [B, I, c_token] (all_gathered)
-        else:
-            # Standard mode
-            A_I = self.diffusion_transformer(
-                A_I,                                       # [B, I, c_token]
-                S_I,                                       # [I, c_s] or [B, I, c_s]
-                Z_II,                                      # [I, I, c_z] or [B, I, I, c_z]
-                f=f,
-                X_L=(
-                    X_noisy_L[..., f["is_ca"], :]
-                    if X_L_self is None
-                    else X_L_self[..., f["is_ca"], :]
-                ),
-                full=use_full_attention,
-            )                                              # [B, I, c_token]
+        with debug_time("DIFFUSION", "diffusion_transformer"):
+            if z_is_chunked:
+                # Multi-GPU parallel: each GPU processes its query chunk
+                A_I = self._diffusion_transformer_parallel(
+                    A_I=A_I,                                   # [B, I, c_token]
+                    S_I=S_I,                                   # [I, c_s]
+                    Z_II_chunk=Z_II,                           # [I_par, I, c_z] - this GPU's rows
+                    f=f,
+                    X_L=(
+                        X_noisy_L[..., f["is_ca"], :]
+                        if X_L_self is None
+                        else X_L_self[..., f["is_ca"], :]
+                    ),
+                    gpu_rank=gpu_rank,
+                    world_size=world_size,
+                )                                              # [B, I, c_token] (all_gathered)
+            else:
+                # Standard mode
+                A_I = self.diffusion_transformer(
+                    A_I,                                       # [B, I, c_token]
+                    S_I,                                       # [I, c_s] or [B, I, c_s]
+                    Z_II,                                      # [I, I, c_z] or [B, I, I, c_z]
+                    f=f,
+                    X_L=(
+                        X_noisy_L[..., f["is_ca"], :]
+                        if X_L_self is None
+                        else X_L_self[..., f["is_ca"], :]
+                    ),
+                    full=use_full_attention,
+                )                                              # [B, I, c_token]
 
         # DIAGNOSTIC: Log A_I after diffusion transformer
         _log_tensor_stats("A_I_after_transformer", A_I)
@@ -1197,60 +1216,61 @@ class RFD3DiffusionModule(nn.Module):
         # | True         | None             | PARALLEL: P_chunk cross-attention |
         # | True         | Present          | BOTH: sparse P_LL across GPUs     |
         #
-        if z_is_chunked and chunked_pairwise_embedder is not None:
-            # BOTH modes: Sparse P_LL computation split across GPUs
-            # Most memory efficient: each GPU computes sparse P_LL for its L_par atoms
-            A_I, Q_L, o = self._decoder_parallel_sparse(
-                A_I=A_I,                                   # [B, I, c_token]
-                S_I=S_I,                                   # [I, c_s]
-                Q_L=Q_L,                                   # [B, L, c_atom]
-                C_L=C_L,                                   # [B, L, c_atom]
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-                gpu_rank=gpu_rank,
-                world_size=world_size,
-            )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
-        elif z_is_chunked:
-            # PARALLEL only: cross-attention with P_chunk [L_par, L]
-            # Each GPU computes full P for its query chunk
-            A_I, Q_L, o = self._decoder_parallel(
-                A_I=A_I,                                   # [B, I, c_token]
-                S_I=S_I,                                   # [I, c_s]
-                Q_L=Q_L,                                   # [B, L, c_atom]
-                C_L=C_L,                                   # [B, L, c_atom]
-                f=f,
-                initializer_outputs=initializer_outputs,
-                gpu_rank=gpu_rank,
-                world_size=world_size,
-            )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
-        elif chunked_pairwise_embedder is not None:
-            # LOW_MEM only: sparse P_LL via chunked_pairwise_embedder
-            A_I, Q_L, o = self.decoder(
-                A_I,                                       # [B, I, c_token]
-                S_I,                                       # [I, c_s] or [B, I, c_s]
-                None,                                      # Decoder doesn't use Z_II directly
-                Q_L,                                       # [B, L, c_atom]
-                C_L,                                       # [B, L, c_atom]
-                P_LL=None,
-                tok_idx=f["atom_to_token_map"],            # [L]
-                indices=f["attn_indices"],                 # [B, L, k]
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-            )
-        else:
-            # Standard mode: full P_LL [L, L, c_atompair]
-            A_I, Q_L, o = self.decoder(
-                A_I,
-                S_I,
-                Z_II,
-                Q_L,
-                C_L,
-                P_LL=P_LL,
-                tok_idx=f["atom_to_token_map"],
-                indices=f["attn_indices"],
-            )
+        with debug_time("DIFFUSION", "decoder"):
+            if z_is_chunked and chunked_pairwise_embedder is not None:
+                # BOTH modes: Sparse P_LL computation split across GPUs
+                # Most memory efficient: each GPU computes sparse P_LL for its L_par atoms
+                A_I, Q_L, o = self._decoder_parallel_sparse(
+                    A_I=A_I,                                   # [B, I, c_token]
+                    S_I=S_I,                                   # [I, c_s]
+                    Q_L=Q_L,                                   # [B, L, c_atom]
+                    C_L=C_L,                                   # [B, L, c_atom]
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                    gpu_rank=gpu_rank,
+                    world_size=world_size,
+                )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
+            elif z_is_chunked:
+                # PARALLEL only: cross-attention with P_chunk [L_par, L]
+                # Each GPU computes full P for its query chunk
+                A_I, Q_L, o = self._decoder_parallel(
+                    A_I=A_I,                                   # [B, I, c_token]
+                    S_I=S_I,                                   # [I, c_s]
+                    Q_L=Q_L,                                   # [B, L, c_atom]
+                    C_L=C_L,                                   # [B, L, c_atom]
+                    f=f,
+                    initializer_outputs=initializer_outputs,
+                    gpu_rank=gpu_rank,
+                    world_size=world_size,
+                )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
+            elif chunked_pairwise_embedder is not None:
+                # LOW_MEM only: sparse P_LL via chunked_pairwise_embedder
+                A_I, Q_L, o = self.decoder(
+                    A_I,                                       # [B, I, c_token]
+                    S_I,                                       # [I, c_s] or [B, I, c_s]
+                    None,                                      # Decoder doesn't use Z_II directly
+                    Q_L,                                       # [B, L, c_atom]
+                    C_L,                                       # [B, L, c_atom]
+                    P_LL=None,
+                    tok_idx=f["atom_to_token_map"],            # [L]
+                    indices=f["attn_indices"],                 # [B, L, k]
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                )
+            else:
+                # Standard mode: full P_LL [L, L, c_atompair]
+                A_I, Q_L, o = self.decoder(
+                    A_I,
+                    S_I,
+                    Z_II,
+                    Q_L,
+                    C_L,
+                    P_LL=P_LL,
+                    tok_idx=f["atom_to_token_map"],
+                    indices=f["attn_indices"],
+                )
 
         # DIAGNOSTIC: Log Q_L after decoder
         _log_tensor_stats("Q_L_after_decoder", Q_L)
