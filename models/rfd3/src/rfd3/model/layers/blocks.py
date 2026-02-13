@@ -29,20 +29,15 @@ from rfd3.model.layers.layer_utils import (
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
 from rfd3.model.layers.streaming import compute_chunk_ranges
-from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log
+from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, timed_all_gather
 from torch.nn.functional import one_hot
 
 logger = logging.getLogger(__name__)
 
-# Diagnostic flag
-PARALLEL_DEBUG = True  # Hardcoded for debugging
-
-
 def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
-    """Log tensor statistics for debugging."""
-    if not PARALLEL_DEBUG:
+    """Log tensor statistics for debugging. Controlled by verbose_stats config flag."""
+    if not debug_ctx.stats_enabled:
         return
-    # Use centralized debug context for consistent formatting
     debug_tensor("BLOCKS", name, tensor, rank)
 
 from foundry import DISABLE_CHECKPOINTING
@@ -1021,7 +1016,9 @@ class LocalTokenTransformer(nn.Module):
             
             local_len = torch.tensor([chunk.shape[1]], device=device, dtype=torch.long)
             lens = [torch.zeros_like(local_len) for _ in range(world_size)]
-            dist.all_gather(lens, local_len)
+            timed_all_gather(lens, local_len,
+                             "ALL_GATHER", f"blocks._gather_updated_tokens.lens.block{block_idx}",
+                             gather_type="all_gather")
             max_len = int(torch.stack(lens).max().item())
             
             if chunk.shape[1] < max_len:
@@ -1045,7 +1042,9 @@ class LocalTokenTransformer(nn.Module):
             if hasattr(dist, 'all_gather_into_tensor'):
                 flat_input = chunk.view(-1)
                 flat_output = torch.empty(flat_input.numel() * world_size, dtype=chunk.dtype, device=chunk.device)
-                dist.all_gather_into_tensor(flat_output, flat_input)
+                timed_all_gather(flat_output, flat_input,
+                                 "ALL_GATHER", f"blocks._gather_updated_tokens.data.block{block_idx}",
+                                 gather_type="all_gather_into_tensor")
 
                 B, _, C = chunk.shape
                 reshaped = flat_output.view(world_size, B, max_len, C)
@@ -1057,7 +1056,9 @@ class LocalTokenTransformer(nn.Module):
             else:
                 # Fallback with explicit cleanup
                 gathered = [torch.zeros_like(chunk) for _ in range(world_size)]
-                dist.all_gather(gathered, chunk)
+                timed_all_gather(gathered, chunk,
+                                 "ALL_GATHER", f"blocks._gather_updated_tokens.data_fallback.block{block_idx}",
+                                 gather_type="all_gather")
                 trimmed = []
                 for g, l in zip(gathered, lens):
                     trimmed.append(g[:, : int(l.item()), :])
@@ -1107,7 +1108,7 @@ class LocalTokenTransformer(nn.Module):
         for block_idx, block in enumerate(self.blocks):
             block.attention_pair_bias.use_checkpointing = not DISABLE_CHECKPOINTING
             
-            if rank == 0:
+            if rank == 0 and debug_ctx.stats_enabled:
                 with torch.no_grad():
                     def _stat(t):
                         return {
@@ -1127,7 +1128,7 @@ class LocalTokenTransformer(nn.Module):
                         },
                         flush=True,
                     )
-            
+
             # Cross-attention: chunk queries → all keys
             A_I_chunk = block.forward_cross_attn(
                 Q_chunk=A_I_chunk,                  # [B, I_par, c_token]
@@ -1143,16 +1144,16 @@ class LocalTokenTransformer(nn.Module):
             # Refresh local chunk slice for next iteration
             query_start, query_end = chunk_ranges[rank]
             A_I_chunk = A_I_full[:, query_start:query_end, :]
-            # Refresh dependent slices to stay aligned
-            indices_chunk = _compute_indices_chunk(query_start, query_end)
-            S_I_chunk = _slice_S_I_chunk(query_start, query_end)
-            Z_local_chunk = _slice_Z_chunk(Z_chunk, query_start, query_end)
+            # NOTE: indices_chunk, S_I_chunk, Z_local_chunk are NOT recomputed here.
+            # They depend only on X_L, S_I_full, Z_chunk, and query_start/query_end —
+            # all of which are constant across block iterations. The values computed
+            # before the loop (lines 1097-1099) are reused.
             
             if block_idx == 0 and rank == 0:
                 debug_log("BLOCKS", "post-gather block0",
                           f"A_I_full.shape={list(A_I_full.shape)}, slice=({query_start},{query_end}), "
                           f"indices_chunk.shape={list(indices_chunk.shape)}, Z_local_chunk.shape={list(Z_local_chunk.shape)}")
-            if rank == 0:
+            if rank == 0 and debug_ctx.stats_enabled:
                 with torch.no_grad():
                     def _stat(t):
                         return {

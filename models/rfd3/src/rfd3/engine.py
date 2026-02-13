@@ -78,6 +78,9 @@ class RFD3InferenceConfig:
     num_nodes: int = 1
     devices_per_node: int = 1
     verbose: bool = False
+    verbose_time: bool = False
+    verbose_memory: bool = False
+    verbose_stats: bool = False
     seed: Optional[int] = None
     # Parallel attention mode to avoid materializing full LxL tensors
     attention_parallel: bool = False
@@ -264,6 +267,11 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         low_memory_mode: bool,
         attention_parallel: bool = False,
         attention_parallel_factor: int | None = None,
+        # Debugging/verbosity flags
+        verbose: bool = False,
+        verbose_time: bool = False,
+        verbose_memory: bool = False,
+        verbose_stats: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -277,6 +285,15 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             },
             **kwargs,
         )
+
+        # Configure debug context with verbosity flags
+        debug_ctx.configure({
+            'verbose': verbose,
+            'verbose_time': verbose_time,
+            'verbose_memory': verbose_memory,
+            'verbose_stats': verbose_stats,
+        })
+
         # save
         self.specification_overrides = dict(specification or {})
         self.inference_sampler_overrides = dict(inference_sampler or {})

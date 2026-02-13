@@ -35,7 +35,8 @@ from foundry.common import exists
 from foundry.training.checkpoint import activation_checkpointing
 from rfd3.model.debug_context import (
     debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks,
-    verify_tensor_sync, debug_memory, debug_gpu_memory_snapshot, debug_chunking, debug_time
+    verify_tensor_sync, debug_memory, debug_gpu_memory_snapshot, debug_chunking, debug_time,
+    timed_all_gather
 )
 
 logger = logging.getLogger(__name__)
@@ -299,7 +300,9 @@ def _all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = Non
     # Gather all chunk sizes to find the max
     local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=tensor.device)
     all_sizes = [torch.zeros(1, dtype=torch.long, device=tensor.device) for _ in range(world_size)]
-    dist.all_gather(all_sizes, local_size_tensor)
+    timed_all_gather(all_sizes, local_size_tensor,
+                     "ALL_GATHER", "encoders._all_gather_concat.sizes",
+                     gather_type="all_gather")
     all_sizes = [s.item() for s in all_sizes]
     max_size = max(all_sizes)
     actual_total = sum(all_sizes)
@@ -320,7 +323,9 @@ def _all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = Non
         # Flatten for all_gather_into_tensor
         flat_input = tensor.contiguous().view(-1)
         flat_output = torch.empty(flat_input.numel() * world_size, dtype=tensor.dtype, device=tensor.device)
-        dist.all_gather_into_tensor(flat_output, flat_input)
+        timed_all_gather(flat_output, flat_input,
+                         "ALL_GATHER", "encoders._all_gather_concat.data",
+                         gather_type="all_gather_into_tensor")
 
         # Reshape: split into world_size chunks, then merge along dim
         chunk_shape = list(tensor.shape)  # [max_size, ...]
@@ -339,7 +344,9 @@ def _all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = Non
     else:
         # Fallback for older PyTorch
         gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-        dist.all_gather(gathered, tensor)
+        timed_all_gather(gathered, tensor,
+                         "ALL_GATHER", "encoders._all_gather_concat.data_fallback",
+                         gather_type="all_gather")
         output_tensor = torch.cat(gathered, dim=dim)
         del gathered
 
@@ -613,7 +620,7 @@ class TokenInitializer(nn.Module):
         S_I_chunk = S_I[start_i:end_i]                        # [I_par, c_s]
         
         # DEBUG: Print S_I_chunk used for Z_chunk computation
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_COMPUTATION: S_I_chunk={_stat_tensor(S_I_chunk)}, Z_j={_stat_tensor(Z_j)}", flush=True)
         
         Z_i = self.to_z_init_i(S_I_chunk).unsqueeze(-2)       # [I_par, 1, c_z]
@@ -621,7 +628,7 @@ class TokenInitializer(nn.Module):
         Z_chunk = Z_i + Z_j_full                              # [I_par, I, c_z]
         
         # DEBUG: Print initial Z_chunk
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_INITIAL: Z_chunk={_stat_tensor(Z_chunk)}", flush=True)
         
         # Add RPE
@@ -653,7 +660,7 @@ class TokenInitializer(nn.Module):
         
         for block_idx, block in enumerate(self.transformer_stack):
             # DEBUG: Print S_I stats at start of each block to verify it's being updated
-            if is_rank0:
+            if is_rank0 and debug_ctx.stats_enabled:
                 print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} START: S_I={_stat_tensor(S_I)}, device={S_I.device}", flush=True)
             
             # Step 1: Apply z_transition (ACCUMULATES across blocks)
@@ -666,7 +673,7 @@ class TokenInitializer(nn.Module):
                 S_I_chunk = S_I[start_i:end_i].clone()        # [I_par, c_s] - clone to ensure fresh tensor
                 
                 # DEBUG: Print S_I_chunk stats after slicing
-                if is_rank0:
+                if is_rank0 and debug_ctx.stats_enabled:
                     print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_SLICE: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
                 
                 S_I_chunk = S_I_chunk + block.attention_pair_bias.forward_chunked(
@@ -678,7 +685,7 @@ class TokenInitializer(nn.Module):
                 S_I_chunk = S_I_chunk + block.s_transition(S_I_chunk)
                 
                 # DEBUG: Print S_I_chunk stats after processing
-                if is_rank0:
+                if is_rank0 and debug_ctx.stats_enabled:
                     print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_PROCESS: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
             
                 # Step 3: All-gather S_I chunks to update full S_I for next block
@@ -701,7 +708,7 @@ class TokenInitializer(nn.Module):
                 else:
                     S_I = S_I_chunk
                     # DEBUG: Single GPU case
-                    if is_rank0:
+                    if is_rank0 and debug_ctx.stats_enabled:
                         print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} SINGLE_GPU: S_I={_stat_tensor(S_I)}", flush=True)
 
                 # Memory cleanup after each block to prevent excessive accumulation
@@ -740,7 +747,7 @@ class TokenInitializer(nn.Module):
         env_val = os.environ.get("RFD3_ATTENTION_PARALLEL", "NOT_SET")
 
         # DIAGNOSTIC: Print feature sizes to debug dimension mismatch
-        if rank == 0:
+        if rank == 0 and debug_ctx.stats_enabled:
             print(f"[Rank {rank}] TokenInitializer.forward: L={L}, I=len(f['restype'])={I}", flush=True)
             print(f"[Rank {rank}]   f['token_bonds'].shape = {f['token_bonds'].shape}", flush=True)
             print(f"[Rank {rank}]   f['is_ca'].sum() = {f['is_ca'].sum().item()}", flush=True)
@@ -794,9 +801,9 @@ class TokenInitializer(nn.Module):
         # Define is_rank0 early for diagnostics
         is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
         actual_S_I_size = S_I.shape[0]
-        if actual_S_I_size != I and is_rank0:
+        if actual_S_I_size != I and is_rank0 and debug_ctx.stats_enabled:
             print(f"[Rank 0] WARNING: S_I.shape[0]={actual_S_I_size} != I={I} - DIMENSION MISMATCH!", flush=True)
-        elif is_rank0:
+        elif is_rank0 and debug_ctx.stats_enabled:
             print(f"[Rank 0] S_I.shape[0]={actual_S_I_size} == I={I} (no mismatch)", flush=True)
 
         # Embed atom features and downcast to token features
@@ -818,7 +825,7 @@ class TokenInitializer(nn.Module):
                 "min": float(t.float().min().item()),
                 "max": float(t.float().max().item()),
             }
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} INITIAL_AFTER_PROCESS_S_INIT: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
         
         # ============================================================
@@ -839,7 +846,7 @@ class TokenInitializer(nn.Module):
         # is computed BEFORE the transformer_stack loop
         Z_j = self.to_z_init_j(S_I_initial)              # [I, c_z] from INITIAL S_I
         
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_j computed from INITIAL S_I: Z_j={_stat(Z_j)}", flush=True)
         
         # ============================================================
@@ -848,7 +855,7 @@ class TokenInitializer(nn.Module):
         # In standard mode, transformer_stack processes BOTH S_I and Z_II.
         # In streaming mode, we must also process S_I through the attention
         # layers, using chunked Z computation to avoid full I×I tensor.
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} BEFORE_TRANSFORMER_STACK: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
 
         # CRITICAL FIX: On single GPU, use standard transformer_stack to ensure
@@ -889,7 +896,7 @@ class TokenInitializer(nn.Module):
             for b in range(2):
                 Z_init_II = Z_init_II + self.transition_1[b](Z_init_II)  # [I, I, c_z]
 
-            if is_rank0:
+            if is_rank0 and debug_ctx.stats_enabled:
                 print(f"{debug_ctx.prefix('ENCODER-S_I')} SINGLE_GPU_STANDARD_PATH: S_I={_stat(S_I)}", flush=True)
                 print(f"{debug_ctx.prefix('ENCODER-S_I')} SINGLE_GPU_Z_init_II: mean={Z_init_II.float().mean():.6f}", flush=True)
 
@@ -917,7 +924,7 @@ class TokenInitializer(nn.Module):
             )
 
         # DEBUG: Print S_I after processing
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} AFTER_TRANSFORMER_STACK: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
 
         # CRITICAL: Ensure S_I is synchronized across all ranks before continuing
@@ -955,7 +962,7 @@ class TokenInitializer(nn.Module):
         I_par = end_i - start_i
         qs = slice(start_i, end_i)
 
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER')} Computing Z chunk [{start_i}:{end_i}] (I_par={I_par}) for GPU {gpu_rank}/{world_size}, actual_I={actual_I}", flush=True)
 
         # Step 4a: Base Z = Z_i + Z_j (cross-attention style)
@@ -1048,7 +1055,7 @@ class TokenInitializer(nn.Module):
         debug_log_all_ranks("ENCODER", "Z_chunk_FINAL",
                   f"[{start_i}:{end_i}] shape={list(Z_chunk.shape)}, mean={Z_chunk.float().mean():.6f}")
 
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER')} Z_chunk computed: shape={list(Z_chunk.shape)}, mean={Z_chunk.float().mean():.6f}", flush=True)
         debug_memory("ENCODER", "after_Z_chunk")
 

@@ -10,30 +10,31 @@
 # Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
 
 # Output settings
-out_dir: "inference_outputs/design_I_170AAASU_parallel"
+out_dir: "inference_outputs/design_I_173AAASU_parallel"
 
 # Protein design parameters 
-length: 175  # Length of protein to design (in amino acids)
+length: 173  # Length of protein to design (in amino acids)
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
 symmetry: I
 
 # MPNN settings
-mpnn_batch_size: 5
+mpnn_batch_size: 8
 
 # Parallel processing
 # The script auto-detects allocated GPUs from CUDA_VISIBLE_DEVICES
 # Set attention_parallel_factor to override (e.g., 2 to use only 2 of 4 allocated GPUs)
-attention_parallel_factor: 6
+attention_parallel_factor: 8
 low_memory_mode: true  # Use structure local sequence local attention indices
 extra_chunking: false  # Further chunking to reduce memory at cost of speed
 
-# Verbosity (controlled by debug_context.py)
-# verbose: false       # Enable ALL logging
-# verbose_stats: false # Tensor statistics logs
-verbose_time: true     # Timing logs for each step
-verbose_memory: true   # Memory usage at key steps
+# Debug verbosity flags (controlled by debug_context.py)
+# All default to false for production runs
+verbose: false           # Master flag: enables ALL debug logging
+verbose_stats: false     # Tensor statistics (.float().mean()/.std() on large tensors - expensive!)
+verbose_time: true       # Timing for each pipeline phase
+verbose_memory: false     # GPU memory tracking at key stages
 
 # Reproducibility
 seed: 42  # Random seed for reproducible results (same seed ensures identical outputs)

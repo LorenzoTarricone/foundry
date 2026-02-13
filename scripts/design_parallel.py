@@ -65,6 +65,26 @@ import numpy as np
 import threading
 from lightning.fabric import seed_everything
 
+def calculate_diameter(coords: np.ndarray) -> float:
+    """
+    Calculate naive diameter of protein structure.
+
+    Args:
+        coords: [N, 3] array of atom coordinates after cleaning
+
+    Returns:
+        Diameter in Angstroms: max(|max(x)-min(x)|, |max(y)-min(y)|, |max(z)-min(z)|)
+    """
+    if coords is None or len(coords) == 0:
+        return 0.0
+
+    x_range = coords[:, 0].max() - coords[:, 0].min()
+    y_range = coords[:, 1].max() - coords[:, 1].min()
+    z_range = coords[:, 2].max() - coords[:, 2].min()
+
+    return float(max(x_range, y_range, z_range))
+
+
 def set_seed(seed: int = 42):
     """
     Set random seed for reproducibility across all random number generators.
@@ -172,15 +192,16 @@ def setup_distributed():
         current = torch.cuda.current_device()
         print(f"[Rank {rank}] Current CUDA device after set_device: {current}", flush=True)
 
-        # Initialize distributed with explicit device_id matching LOCAL_RANK
-        # Using --ntasks-per-node + --gpus-per-node, each task sees all GPUs on the node
-        # and LOCAL_RANK determines which GPU this task uses
+        # Initialize distributed process group with explicit device_id
+        # TRADITIONAL APPROACH: each task sees all GPUs on the node via CUDA_VISIBLE_DEVICES
+        # LOCAL_RANK selects which GPU this task uses (0, 1, 2, etc.)
+        # We MUST pass device_id to tell NCCL which GPU this rank uses
         dist.init_process_group(
             backend="nccl",
             init_method="env://",
             device_id=torch.device(f"cuda:{local_rank}"),
         )
-        dist.barrier(device_ids=[local_rank])
+        dist.barrier()
 
         if is_main_process():
             print(f"Distributed initialized: {world_size} GPUs", flush=True)
@@ -461,7 +482,7 @@ def run_worker(
     from biotite.structure import get_chains
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
     from mpnn.inference_engines.mpnn import MPNNInferenceEngine
-    from rfd3.model.debug_context import debug_ctx
+    from rfd3.model.debug_context import debug_ctx, debug_time
 
     # Configure debug logging from config kwargs
     debug_ctx.configure({
@@ -579,11 +600,20 @@ def run_worker(
         attention_parallel=True,
         attention_parallel_factor=attention_parallel_factor,
         seed=seed,
+        # Pass verbose flags from config
+        verbose=kwargs.get('verbose', False),
+        verbose_time=kwargs.get('verbose_time', False),
+        verbose_memory=kwargs.get('verbose_memory', False),
+        verbose_stats=kwargs.get('verbose_stats', False),
     )
     
     # Initialize and run RFD3
     print_rank0("Initializing RFD3 engine...")
-    rfd3_engine = RFD3InferenceEngine(**rfd3_config)
+    init_start = time.time()
+    with debug_time("PIPELINE", "engine_init"):
+        rfd3_engine = RFD3InferenceEngine(**rfd3_config)
+    init_time = time.time() - init_start
+    print_rank0(f"  Engine init took {init_time:.2f}s")
     log_memory("rfd3_init", wandb_run, monitor)
 
     if dist.is_initialized():
@@ -591,7 +621,8 @@ def run_worker(
 
     print_rank0("Running RFD3 inference...")
     rfd3_start = time.time()
-    rfd3_outputs = rfd3_engine.run(inputs=None, out_dir=None, n_batches=1)
+    with debug_time("PIPELINE", "rfd3_inference"):
+        rfd3_outputs = rfd3_engine.run(inputs=None, out_dir=None, n_batches=1)
     rfd3_time = time.time() - rfd3_start
 
     log_memory("rfd3_inference", wandb_run, monitor)
@@ -599,11 +630,69 @@ def run_worker(
     if dist.is_initialized():
         dist.barrier()
 
-    print_rank0(f"  RFD3 took {rfd3_time:.2f}s")
+    print_rank0(f"  RFD3 inference took {rfd3_time:.2f}s")
+
+    # Calculate diameter and benchmark metrics for each output
+    benchmark_results = []
+    for batch_id, output_list in rfd3_outputs.items():
+        for i, rfd3_out in enumerate(output_list):
+            # Extract coordinates and calculate diameter
+            coords = rfd3_out.atom_array.coord  # [N, 3] numpy array
+            diameter = calculate_diameter(coords)
+
+            # Store diameter in output metadata
+            rfd3_out.metadata["diameter_angstroms"] = diameter
+
+            # Get peak memory
+            peak_memory_gb = 0.0
+            if torch.cuda.is_available():
+                peak_memory_gb = torch.cuda.max_memory_allocated() / 1024**3
+
+            # Compute benchmark metrics
+            n_atoms = coords.shape[0] if coords is not None else 0
+            # For I symmetry, I_total = ASU_length * 60
+            i_multiplier = 60 if symmetry and symmetry.upper() == "I" else 1
+            i_total = length * i_multiplier
+
+            benchmark_metrics = {
+                "job_id": os.environ.get("SLURM_JOB_ID", "interactive"),
+                "n_gpus": world_size,
+                "n_nodes": int(os.environ.get("SLURM_JOB_NUM_NODES", 1)),
+                "asu_length": length,
+                "i_total": i_total,
+                "l_total": n_atoms,
+                "extra_chunking": kwargs.get("extra_chunking", False),
+                "time_seconds": rfd3_time,
+                "diameter_angstroms": diameter,
+                "peak_memory_gb": peak_memory_gb,
+                "status": "success"
+            }
+            benchmark_results.append(benchmark_metrics)
+
+            print_rank0(f"  Design {batch_id}_{i}: diameter={diameter:.1f}Å, "
+                       f"atoms={n_atoms}, peak_mem={peak_memory_gb:.1f}GB")
 
     if wandb_run:
         wandb_run.log({"rfd3/inference_time_s": rfd3_time})
-    
+        if benchmark_results:
+            wandb_run.log({
+                "rfd3/diameter_angstroms": benchmark_results[0]["diameter_angstroms"],
+                "rfd3/peak_memory_gb": benchmark_results[0]["peak_memory_gb"],
+            })
+
+    # Write benchmark results to CSV (rank 0 only)
+    if is_main_process() and benchmark_results:
+        import csv
+        benchmark_csv_path = out_path / "benchmark_metrics.csv"
+        with open(benchmark_csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "job_id", "n_gpus", "n_nodes", "asu_length", "i_total", "l_total",
+                "extra_chunking", "time_seconds", "diameter_angstroms", "peak_memory_gb", "status"
+            ])
+            writer.writeheader()
+            writer.writerows(benchmark_results)
+        print_rank0(f"  Benchmark metrics saved to {benchmark_csv_path}")
+
     # MPNN (rank 0 only)
     if is_main_process():
         print("\nInitializing MPNN Engine...")

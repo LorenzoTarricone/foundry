@@ -62,6 +62,10 @@ class DebugContext:
         # Timing accumulator for summary
         self._timing_data: Dict[str, list] = {}
 
+        # All-gather timing accumulator for synchronization overhead analysis
+        self._allgather_timings: Dict[str, list] = {}
+        self._allgather_counts: Dict[str, int] = {}
+
     def configure(self, config: Dict[str, Any]):
         """
         Configure debug context from a config dictionary (e.g., from YAML).
@@ -205,6 +209,95 @@ class DebugContext:
     def reset_timing(self):
         """Reset timing data for new step."""
         self._timing_data.clear()
+
+    def record_allgather_time(self, category: str, name: str, elapsed_ms: float):
+        """Record timing for an all_gather operation."""
+        key = f"{category}/{name}"
+        if key not in self._allgather_timings:
+            self._allgather_timings[key] = []
+            self._allgather_counts[key] = 0
+        self._allgather_timings[key].append(elapsed_ms)
+        self._allgather_counts[key] += 1
+
+    def print_allgather_summary(self):
+        """Print summary of all all_gather operations."""
+        if not (self.time_enabled or self.memory_enabled):
+            return
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            return
+
+        if not self._allgather_timings:
+            return
+
+        print("\n" + "="*100, flush=True)
+        print(f"ALL_GATHER SYNCHRONIZATION SUMMARY", flush=True)
+        print("="*100, flush=True)
+
+        # Sort by total time (descending)
+        items = []
+        for key, timings in self._allgather_timings.items():
+            total_ms = sum(timings)
+            count = len(timings)
+            avg_ms = total_ms / count if count > 0 else 0
+            items.append((key, count, total_ms, avg_ms, min(timings), max(timings)))
+
+        items.sort(key=lambda x: x[2], reverse=True)  # Sort by total time
+
+        print(f"{'Operation':<60} {'Count':>8} {'Total(ms)':>12} {'Avg(ms)':>10} {'Min(ms)':>10} {'Max(ms)':>10}", flush=True)
+        print("-" * 100, flush=True)
+
+        grand_total = 0
+        grand_count = 0
+        for key, count, total, avg, min_t, max_t in items:
+            print(f"{key:<60} {count:>8} {total:>12.2f} {avg:>10.2f} {min_t:>10.2f} {max_t:>10.2f}", flush=True)
+            grand_total += total
+            grand_count += count
+
+        print("-" * 100, flush=True)
+        print(f"{'TOTAL':<60} {grand_count:>8} {grand_total:>12.2f} {'':>10} {'':>10} {'':>10}", flush=True)
+        print("="*100, flush=True)
+        print(f"\nTotal time in all_gather: {grand_total/1000:.2f} seconds", flush=True)
+        print(f"Average per all_gather: {grand_total/grand_count:.2f} ms" if grand_count > 0 else "No all_gather calls recorded", flush=True)
+        print("="*100 + "\n", flush=True)
+
+    def print_allgather_per_step_summary(self, num_steps: int = None):
+        """Print per-step breakdown of all_gather overhead."""
+        if not (self.time_enabled or self.memory_enabled):
+            return
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank != 0:
+            return
+
+        if not self._allgather_timings:
+            return
+
+        if num_steps is None:
+            num_steps = self.step + 1 if self.step is not None and self.step >= 0 else 1
+
+        # Group by operation
+        step_totals = {}
+        for key, timings in self._allgather_timings.items():
+            # Estimate step distribution (assumes uniform distribution)
+            per_step = sum(timings) / num_steps
+            step_totals[key] = per_step
+
+        print("\n" + "="*80, flush=True)
+        print(f"ALL_GATHER OVERHEAD PER DIFFUSION STEP (estimated)", flush=True)
+        print("="*80, flush=True)
+        print(f"{'Operation':<50} {'Per-Step(ms)':>12} {'% of Total':>15}", flush=True)
+        print("-" * 80, flush=True)
+
+        total_per_step = sum(step_totals.values())
+        for key, per_step_ms in sorted(step_totals.items(), key=lambda x: x[1], reverse=True):
+            pct = (per_step_ms / total_per_step * 100) if total_per_step > 0 else 0
+            print(f"{key:<50} {per_step_ms:>12.2f} {pct:>14.1f}%", flush=True)
+
+        print("-" * 80, flush=True)
+        print(f"{'TOTAL PER STEP':<50} {total_per_step:>12.2f} {'100.0%':>15}", flush=True)
+        print("="*80 + "\n", flush=True)
 
 
 # Global singleton instance
@@ -751,3 +844,460 @@ def ensure_on_local_device(tensor: torch.Tensor, name: str = "tensor") -> torch.
         return tensor.to(local_device)
 
     return tensor
+
+
+# =============================================================================
+# COMPREHENSIVE TIMING INSTRUMENTATION
+# =============================================================================
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class StepTiming:
+    """Stores all timing data for a single diffusion step."""
+    step_num: int
+    total_time: float = 0.0
+    model_forward_time: float = 0.0
+    ode_update_time: float = 0.0
+    all_gather_time: float = 0.0
+    sync_overhead: float = 0.0
+    barrier_overhead: float = 0.0
+    memory_overhead: float = 0.0
+    device_transfer_overhead: float = 0.0
+    other_time: float = 0.0
+
+
+@dataclass
+class EventPair:
+    """Stores a CUDA event pair for deferred timing measurement."""
+    category: str
+    start: Any  # torch.cuda.Event
+    end: Any  # torch.cuda.Event
+    step_num: int
+
+
+class TimingInstrument:
+    """
+    Zero-overhead comprehensive timing for bottleneck analysis.
+
+    Uses CUDA events to record timings without adding synchronization overhead
+    during execution. All timing computations are deferred until finalize_all_steps().
+    """
+
+    def __init__(self, enabled: bool = False, rank: int = 0, world_size: int = 1, num_steps: int = 200):
+        """
+        Initialize timing instrumentation.
+
+        Args:
+            enabled: Whether timing is active (controlled by verbose_time flag)
+            rank: Current GPU rank
+            world_size: Total number of GPUs
+            num_steps: Total number of diffusion steps (for pre-allocation)
+        """
+        self.enabled = enabled
+        self.rank = rank
+        self.world_size = world_size
+        self.num_steps = num_steps
+
+        # Per-step storage
+        self.step_timings = []
+
+        # CUDA event pairs (processed at end to avoid sync during execution)
+        self._pending_events = []
+
+        # CPU-side timing accumulator (for non-CUDA operations)
+        self._cpu_timings = {}
+
+        # Current step state
+        self.current_step = -1
+        self._step_start_events = []
+        self._step_end_events = []
+
+        # Compute interval tracking
+        self.last_sync_timestamp = None
+        self.compute_intervals = []
+
+    @contextmanager
+    def time_operation(self, category: str, use_cuda_events: bool = True):
+        """
+        Context manager for timing with zero overhead during execution.
+
+        Args:
+            category: Operation category (e.g., "model_forward", "cuda_sync")
+            use_cuda_events: If True, use CUDA events (GPU ops). If False, use CPU timing.
+        """
+        if not self.enabled:
+            yield
+            return
+
+        if use_cuda_events:
+            # GPU operation timing - use CUDA events (no synchronization)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+
+            yield
+
+            end.record()
+            # Don't synchronize! Just record for later processing
+            self._pending_events.append(EventPair(
+                category=category,
+                start=start,
+                end=end,
+                step_num=self.current_step
+            ))
+        else:
+            # CPU operation timing - use wall-clock time
+            start_time = time.perf_counter()
+
+            yield
+
+            elapsed = time.perf_counter() - start_time
+            self._record_cpu_timing(category, elapsed * 1000)  # Convert to ms
+
+    def mark_step_start(self, step_num: int):
+        """Mark the beginning of a diffusion step."""
+        if not self.enabled:
+            return
+
+        self.current_step = step_num
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self._step_start_events.append((step_num, event))
+
+    def mark_step_end(self):
+        """Mark the end of a diffusion step."""
+        if not self.enabled:
+            return
+
+        event = torch.cuda.Event(enable_timing=True)
+        event.record()
+        self._step_end_events.append((self.current_step, event))
+
+    def mark_sync_point(self, sync_type: str):
+        """
+        Track when synchronization occurs to measure compute intervals.
+
+        Args:
+            sync_type: Type of synchronization (e.g., "all_gather", "barrier", "cuda_sync")
+        """
+        if not self.enabled:
+            return
+
+        current_time = time.perf_counter()
+        if self.last_sync_timestamp is not None:
+            # Time between syncs = pure compute time
+            interval = (current_time - self.last_sync_timestamp) * 1000  # ms
+            self.compute_intervals.append((self.current_step, sync_type, interval))
+        self.last_sync_timestamp = current_time
+
+    def _record_cpu_timing(self, category: str, elapsed_ms: float):
+        """Record CPU-side timing."""
+        if category not in self._cpu_timings:
+            self._cpu_timings[category] = []
+        self._cpu_timings[category].append(elapsed_ms)
+
+    def finalize_all_steps(self):
+        """
+        Process all recorded events ONCE at the very end.
+
+        This is when we finally synchronize to get all timing results.
+        """
+        if not self.enabled:
+            return
+
+        # NOW synchronize to get all timing results
+        torch.cuda.synchronize()
+
+        # Initialize step timings
+        self.step_timings = [StepTiming(step_num=i) for i in range(self.num_steps)]
+
+        # Process step start/end events
+        step_times_map = {}
+        for step_num, start_event in self._step_start_events:
+            for end_step_num, end_event in self._step_end_events:
+                if step_num == end_step_num:
+                    elapsed_ms = start_event.elapsed_time(end_event)
+                    step_times_map[step_num] = elapsed_ms
+                    if step_num < len(self.step_timings):
+                        self.step_timings[step_num].total_time = elapsed_ms
+                    break
+
+        # Process all pending CUDA events
+        category_times_per_step = {}
+        for event_pair in self._pending_events:
+            elapsed_ms = event_pair.start.elapsed_time(event_pair.end)
+            step_num = event_pair.step_num
+            category = event_pair.category
+
+            if step_num not in category_times_per_step:
+                category_times_per_step[step_num] = {}
+            if category not in category_times_per_step[step_num]:
+                category_times_per_step[step_num][category] = 0.0
+            category_times_per_step[step_num][category] += elapsed_ms
+
+        # Assign category times to step timings
+        for step_num, categories in category_times_per_step.items():
+            if step_num < 0 or step_num >= len(self.step_timings):
+                continue
+
+            step_timing = self.step_timings[step_num]
+            for category, total_ms in categories.items():
+                if category == "model_forward":
+                    step_timing.model_forward_time = total_ms
+                elif category == "ode_update":
+                    step_timing.ode_update_time = total_ms
+                elif category == "all_gather":
+                    step_timing.all_gather_time = total_ms
+                elif category == "cuda_sync":
+                    step_timing.sync_overhead += total_ms
+                elif category == "barrier":
+                    step_timing.barrier_overhead += total_ms
+                elif category == "empty_cache":
+                    step_timing.memory_overhead += total_ms
+                elif category == "device_transfer":
+                    step_timing.device_transfer_overhead += total_ms
+                else:
+                    step_timing.other_time += total_ms
+
+        # Add CPU timings (distributed across all steps)
+        for category, timings in self._cpu_timings.items():
+            total_ms = sum(timings)
+            per_step_ms = total_ms / self.num_steps if self.num_steps > 0 else 0
+
+            for step_timing in self.step_timings:
+                if category == "cuda_sync":
+                    step_timing.sync_overhead += per_step_ms
+                elif category == "barrier":
+                    step_timing.barrier_overhead += per_step_ms
+                elif category == "empty_cache":
+                    step_timing.memory_overhead += per_step_ms
+                else:
+                    step_timing.other_time += per_step_ms
+
+    def print_comprehensive_report(self):
+        """Generate detailed bottleneck analysis report."""
+        if not self.enabled:
+            return
+
+        # Only print from rank 0
+        if self.rank != 0:
+            return
+
+        if not self.step_timings:
+            print("[WARNING] No timing data collected. Call finalize_all_steps() first.")
+            return
+
+        # Compute statistics
+        valid_steps = [s for s in self.step_timings if s.total_time > 0]
+        if not valid_steps:
+            print("[WARNING] No valid step timings recorded.")
+            return
+
+        num_valid = len(valid_steps)
+
+        # Aggregate by category
+        def compute_stats(values):
+            if not values:
+                return 0, 0, 0, 0, 0
+            import statistics
+            total = sum(values)
+            mean = total / len(values)
+            std_dev = statistics.stdev(values) if len(values) > 1 else 0
+            min_val = min(values)
+            max_val = max(values)
+            return mean, std_dev, min_val, max_val, total
+
+        # Extract values for each category
+        total_times = [s.total_time for s in valid_steps]
+        model_forward_times = [s.model_forward_time for s in valid_steps]
+        ode_update_times = [s.ode_update_time for s in valid_steps]
+        all_gather_times = [s.all_gather_time for s in valid_steps]
+        sync_times = [s.sync_overhead for s in valid_steps]
+        barrier_times = [s.barrier_overhead for s in valid_steps]
+        memory_times = [s.memory_overhead for s in valid_steps]
+        transfer_times = [s.device_transfer_overhead for s in valid_steps]
+        other_times = [s.other_time for s in valid_steps]
+
+        # Compute stats
+        total_stats = compute_stats(total_times)
+        model_forward_stats = compute_stats(model_forward_times)
+        ode_update_stats = compute_stats(ode_update_times)
+        all_gather_stats = compute_stats(all_gather_times)
+        sync_stats = compute_stats(sync_times)
+        barrier_stats = compute_stats(barrier_times)
+        memory_stats = compute_stats(memory_times)
+        transfer_stats = compute_stats(transfer_times)
+        other_stats = compute_stats(other_times)
+
+        # Print report
+        print("\n" + "="*100)
+        print("=== RFD3 COMPREHENSIVE TIMING ANALYSIS ===")
+        print("="*100)
+        print(f"Configuration:")
+        print(f"  GPUs:                  {self.world_size}")
+        print(f"  Steps measured:        {num_valid}/{self.num_steps}")
+
+        print(f"\n=== PER-STEP STATISTICS ({num_valid} steps) ===")
+        header = f"{'Category':<22} | {'Mean':>8} | {'Std Dev':>8} | {'Min':>8} | {'Max':>8} | {'Total':>10} | {'% Total':>8}"
+        print(header)
+        print("-" * len(header))
+
+        def print_row(name, stats):
+            mean, std_dev, min_val, max_val, total = stats
+            total_sec = total / 1000
+            pct = (total / (total_stats[4] + 1e-9)) * 100
+            print(f"{name:<22} | {mean:>7.0f}ms | {std_dev:>7.0f}ms | {min_val:>7.0f}ms | {max_val:>7.0f}ms | {total_sec:>9.1f}s | {pct:>7.1f}%")
+
+        print_row("Model Forward", model_forward_stats)
+        print_row("ODE Update", ode_update_stats)
+        print_row("All-Gather", all_gather_stats)
+        print_row("CUDA Synchronize", sync_stats)
+        print_row("Dist Barrier", barrier_stats)
+        print_row("Empty Cache", memory_stats)
+        print_row("Device Transfer", transfer_stats)
+        print_row("Other", other_stats)
+        print("-" * len(header))
+        print_row("Total Step Time", total_stats)
+
+        # Compute interval analysis
+        if self.compute_intervals:
+            intervals = [interval for _, _, interval in self.compute_intervals]
+            avg_interval = sum(intervals) / len(intervals)
+            syncs_per_step = len(self.compute_intervals) / num_valid
+
+            total_compute = sum(intervals)
+            total_sync = sum(all_gather_times) + sum(sync_times) + sum(barrier_times)
+            compute_efficiency = (total_compute / (total_compute + total_sync + 1e-9)) * 100
+
+            print(f"\n=== COMPUTE INTERVAL ANALYSIS ===")
+            print(f"Average time between syncs:     {avg_interval:.1f}ms")
+            print(f"Sync frequency:                 {syncs_per_step:.1f} syncs/step")
+            print(f"Pure compute efficiency:        {compute_efficiency:.1f}% (time not blocked on sync)")
+
+        # Bottleneck identification
+        print(f"\n=== BOTTLENECK IDENTIFICATION ===")
+
+        # Find primary bottleneck
+        categories = [
+            ("Model Forward", model_forward_stats[4]),
+            ("ODE Update", ode_update_stats[4]),
+            ("All-Gather", all_gather_stats[4]),
+            ("CUDA Synchronize", sync_stats[4]),
+            ("Dist Barrier", barrier_stats[4]),
+            ("Empty Cache", memory_stats[4]),
+            ("Device Transfer", transfer_stats[4]),
+        ]
+        categories.sort(key=lambda x: x[1], reverse=True)
+
+        primary = categories[0]
+        secondary = categories[1]
+
+        print(f"PRIMARY BOTTLENECK: {primary[0]} ({primary[1]/1000:.1f}s, {(primary[1]/(total_stats[4]+1e-9))*100:.1f}% of time)")
+        print(f"SECONDARY BOTTLENECK: {secondary[0]} ({secondary[1]/1000:.1f}s, {(secondary[1]/(total_stats[4]+1e-9))*100:.1f}% of time)")
+
+        # Sync overhead summary
+        total_sync_ms = all_gather_stats[4] + sync_stats[4] + barrier_stats[4]
+        sync_pct = (total_sync_ms / (total_stats[4] + 1e-9)) * 100
+
+        print(f"\nSYNC OVERHEAD: {sync_pct:.1f}% total")
+        print(f"  All-gather:      {(all_gather_stats[4]/(total_stats[4]+1e-9))*100:.1f}%")
+        print(f"  Explicit syncs:  {(sync_stats[4]/(total_stats[4]+1e-9))*100:.1f}%")
+        print(f"  Barriers:        {(barrier_stats[4]/(total_stats[4]+1e-9))*100:.1f}%")
+
+        # Recommendations
+        print(f"\n=== NEXT STEPS FOR INVESTIGATION ===")
+        if model_forward_stats[4] > total_stats[4] * 0.5:
+            print("Since model_forward dominates:")
+            print("1. Check debug_ctx.print_timing_summary() for encoder/decoder/transformer breakdown")
+            print("2. Profile individual operations within model forward")
+            print("3. Check for hidden O(N) loops in parallel blocks")
+            print("4. Measure GPU utilization during model forward")
+
+        if sync_pct > 10:
+            print("\nSync overhead is significant:")
+            print("1. Consider reducing all_gather frequency")
+            print("2. Investigate async communication patterns")
+            print("3. Check for unnecessary barriers")
+
+        print("="*100 + "\n")
+
+
+# ALL_GATHER TIMING (for parallel synchronization overhead analysis)
+# =============================================================================
+
+def timed_all_gather(
+    output_or_list,
+    input_tensor,
+    category: str,
+    name: str,
+    gather_type: str = "all_gather",
+    timing_instrument=None,
+) -> float:
+    """
+    Wrapper for dist.all_gather operations with timing.
+    Only activates when debug_ctx.time_enabled or memory_enabled is True.
+
+    Args:
+        output_or_list: Output tensor or list for all_gather
+        input_tensor: Input tensor to gather
+        category: Debug category (e.g., "ENCODER", "TRANSFORMER")
+        name: Operation name (e.g., "S_I_gather_block3", "Q_L_chunk_sync")
+        gather_type: "all_gather" or "all_gather_into_tensor"
+        timing_instrument: Optional TimingInstrument for zero-overhead timing
+
+    Returns:
+        elapsed_ms: Time taken for the all_gather operation in milliseconds
+    """
+    # Skip timing if debug not enabled
+    if not (debug_ctx.time_enabled or debug_ctx.memory_enabled):
+        if gather_type == "all_gather":
+            dist.all_gather(output_or_list, input_tensor)
+        elif gather_type == "all_gather_into_tensor":
+            dist.all_gather_into_tensor(output_or_list, input_tensor)
+        return 0.0
+
+    # Use CUDA events for accurate timing
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+
+    start.record()
+
+    # Execute the actual all_gather
+    if gather_type == "all_gather":
+        dist.all_gather(output_or_list, input_tensor)
+    elif gather_type == "all_gather_into_tensor":
+        dist.all_gather_into_tensor(output_or_list, input_tensor)
+    else:
+        raise ValueError(f"Unknown gather_type: {gather_type}")
+
+    end.record()
+
+    # If using comprehensive timing instrument, don't synchronize here!
+    # Record events for deferred processing to avoid double sync overhead
+    if timing_instrument and timing_instrument.enabled:
+        timing_instrument._pending_events.append(EventPair(
+            category="all_gather",
+            start=start,
+            end=end,
+            step_num=timing_instrument.current_step
+        ))
+        # Return 0 since we don't have the timing yet (deferred)
+        return 0.0
+
+    # Legacy path: synchronize immediately (doubles sync overhead)
+    torch.cuda.synchronize()  # FIXME: This doubles sync overhead!
+    elapsed_ms = start.elapsed_time(end)
+
+    # Record timing
+    debug_ctx.record_allgather_time(category, name, elapsed_ms)
+
+    # Optionally log immediately (if verbose_stats)
+    if debug_ctx.stats_enabled:
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        debug_log(category, f"all_gather_timing",
+                  f"{name}: {elapsed_ms:.2f}ms [rank {rank}/{world_size}]")
+
+    return elapsed_ms

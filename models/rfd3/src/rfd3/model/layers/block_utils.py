@@ -5,6 +5,7 @@ from typing import Tuple
 import torch
 import torch.nn.functional as F
 from jaxtyping import Float, Int
+from rfd3.model.debug_context import debug_ctx
 
 logger = logging.getLogger(__name__)
 
@@ -467,14 +468,14 @@ def _build_index_mask_chunked(
     # Final mask: only include atoms from fully-included tokens
     mask = mask & full_token_per_atom
 
-    # DEBUG: Show mask statistics for different chunks
-    if chunk_start == 0 or chunk_start == 16800:
+    # DEBUG: Show mask statistics for different chunks (only if stats logging enabled)
+    if debug_ctx.stats_enabled and (chunk_start == 0 or chunk_start == 16800):
         print(f"[DEBUG-MASK] chunk={chunk_start}-{chunk_end}: mask.sum()={mask.sum().item()}, "
               f"full_token_mask_QI.sum()={full_token_mask_QI.sum().item()}, "
               f"query_tokens[:3]={query_tokens[:3].tolist()}")
 
-    # DEBUG: Print mask info for atom 100 if in this chunk
-    if chunk_start <= 100 < chunk_end:
+    # DEBUG: Print mask info for atom 100 if in this chunk (only if stats logging enabled)
+    if debug_ctx.stats_enabled and chunk_start <= 100 < chunk_end:
         local_100 = 100 - chunk_start
         mask_sum_100 = mask[local_100].sum().item()
         print(f"[DEBUG-MASK-PARALLEL] atom100: mask.sum()={mask_sum_100}, k_max={k_max}")

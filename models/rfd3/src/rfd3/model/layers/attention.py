@@ -670,8 +670,8 @@ def sparse_cross_attention(Q, K, V, B, indices, H, G=None):
         raise ValueError(f"B must have 3 or 4 dims, got {B.ndim}")
     B_gathered = B_gathered.contiguous()
     
-    # Debug (rank 0 only, once per call site)
-    do_debug = (not dist.is_initialized()) or dist.get_rank() == 0
+    # Debug (rank 0 only, once per call site, only if stats enabled)
+    do_debug = debug_ctx.stats_enabled and ((not dist.is_initialized()) or dist.get_rank() == 0)
     if do_debug:
         with torch.no_grad():
             def _stat(t):

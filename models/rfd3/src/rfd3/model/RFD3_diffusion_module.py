@@ -27,7 +27,8 @@ from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
 from rfd3.model.layers.streaming import compute_chunk_ranges
 from rfd3.model.debug_context import (
     debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks,
-    verify_tensor_sync, debug_memory, debug_tensor_memory, debug_time, debug_chunking
+    verify_tensor_sync, debug_memory, debug_tensor_memory, debug_time, debug_chunking,
+    timed_all_gather
 )
 
 from foundry.model.layers.blocks import (
@@ -36,15 +37,10 @@ from foundry.model.layers.blocks import (
 
 logger = logging.getLogger(__name__)
 
-# Diagnostic flag - set to True to enable detailed parallel debugging
-PARALLEL_DEBUG = True  # Hardcoded for debugging
-
-
 def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
-    """Log tensor statistics for debugging parallel vs non-parallel differences."""
-    if not PARALLEL_DEBUG:
+    """Log tensor statistics for debugging parallel vs non-parallel differences. Controlled by verbose_stats config flag."""
+    if not debug_ctx.stats_enabled:
         return
-    # Use centralized debug context for consistent formatting
     debug_tensor("MODEL", name, tensor, rank)
 
 
@@ -105,7 +101,9 @@ def _all_gather_along_dim(
     local_size = tensor.shape[dim]
     local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=tensor.device)
     all_sizes = [torch.zeros(1, dtype=torch.long, device=tensor.device) for _ in range(world_size)]
-    dist.all_gather(all_sizes, local_size_tensor)
+    timed_all_gather(all_sizes, local_size_tensor,
+                     "ALL_GATHER", "diffusion_module._all_gather_along_dim.sizes",
+                     gather_type="all_gather")
     all_sizes = [s.item() for s in all_sizes]
     max_size = max(all_sizes)
     actual_total = sum(all_sizes)
@@ -123,7 +121,9 @@ def _all_gather_along_dim(
 
     # Gather from all ranks (all tensors now have same size = max_size)
     gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
+    timed_all_gather(gathered, tensor,
+                     "ALL_GATHER", "diffusion_module._all_gather_along_dim.data",
+                     gather_type="all_gather")
     result = torch.cat(gathered, dim=dim)
 
     # Slice to correct total size (remove padding)
@@ -411,7 +411,7 @@ class RFD3DiffusionModule(nn.Module):
         
         # Run cross-attention transformer
         # Queries from A_I_chunk, Keys/Values from A_I, Bias from Z_II_chunk
-        if gpu_rank == 0:
+        if gpu_rank == 0 and debug_ctx.stats_enabled:
             with torch.no_grad():
                 print(
                     f"{debug_ctx.prefix('DIFF')} xattn input shapes:",
@@ -898,7 +898,9 @@ class RFD3DiffusionModule(nn.Module):
                     # Use single flat output tensor instead of list of ws tensors
                     flat_input = tensor.view(-1)
                     flat_output = torch.empty(flat_input.numel() * ws, dtype=tensor.dtype, device=tensor.device)
-                    dist.all_gather_into_tensor(flat_output, flat_input)
+                    timed_all_gather(flat_output, flat_input,
+                                     "ALL_GATHER", "diffusion_module.all_gather_concat.data",
+                                     gather_type="all_gather_into_tensor")
 
                     # Reshape back to proper dimensions
                     chunk_shape = list(tensor.shape)
@@ -918,7 +920,9 @@ class RFD3DiffusionModule(nn.Module):
                 else:
                     # Fallback with explicit cleanup
                     gathered = [torch.zeros_like(tensor) for _ in range(ws)]
-                    dist.all_gather(gathered, tensor)
+                    timed_all_gather(gathered, tensor,
+                                     "ALL_GATHER", "diffusion_module.all_gather_concat.data_fallback",
+                                     gather_type="all_gather")
                     result = torch.cat(gathered, dim=dim)
                     del gathered  # Free ws tensors immediately
                     return result

@@ -18,7 +18,7 @@ from foundry.utils.rotation_augmentation import (
     rot_vec_mul,
     uniform_random_rotation,
 )
-from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks, debug_time, debug_time_log
+from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks, debug_time, debug_time_log, TimingInstrument
 from rfd3.model.layers.streaming import compute_chunk_ranges
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
@@ -319,6 +319,18 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
         coord_atom_lvl_to_be_noised: torch.Tensor,
         is_motif_atom_with_fixed_coord,
     ) -> torch.Tensor:
+        """Generates the initial noisy structure for diffusion sampling.
+        
+        Args:
+            c0: Initial noise scale from the noise schedule
+            D: Diffusion batch size
+            L: Number of atoms
+            coord_atom_lvl_to_be_noised: [L, 3] coordinates to be noised
+            is_motif_atom_with_fixed_coord: Boolean mask for motif atoms with fixed coords
+
+        Returns:
+            X_L: Initial noisy coordinates [D, L, 3]
+        """
         noise = c0 * torch.normal(mean=0.0, std=1.0, size=(D, L, 3), device=c0.device)
         # NOTE: Initial noise is NOT broadcast here because tensors may not be on
         # correct local devices yet. Initial noise synchronization relies on
@@ -408,6 +420,14 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
         threshold_step = (len(noise_schedule) - 1) * self.fraction_of_steps_to_fix_motif
 
+        # Initialize comprehensive timing instrumentation
+        timing = TimingInstrument(
+            enabled=debug_ctx.time_enabled or debug_ctx.memory_enabled,
+            rank=gpu_rank,
+            world_size=world_size,
+            num_steps=len(noise_schedule) - 1
+        )
+
         # Only show progress bar on rank 0 to avoid duplicate output
         is_main_rank = not dist.is_initialized() or dist.get_rank() == 0
         num_steps = len(noise_schedule) - 1
@@ -417,10 +437,13 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             desc="Sampling",
             disable=not is_main_rank,
         )
-        
+
         for step_num, (c_t_minus_1, c_t) in pbar:
             # Update debug context with current step
             debug_ctx.set_step(step_num)
+
+            # Mark start of timing for this step
+            timing.mark_step_start(step_num)
 
             # =======================================================================
             # MEMORY OPTIMIZATION: Clean memory at start of each step
@@ -430,8 +453,13 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             if streaming_mode and step_num > 0:
                 import gc
                 gc.collect()
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
+
+                timing.mark_sync_point("cuda_sync")
+                with timing.time_operation("cuda_sync", use_cuda_events=False):
+                    torch.cuda.synchronize()
+
+                with timing.time_operation("empty_cache", use_cuda_events=False):
+                    torch.cuda.empty_cache()
 
             # Assert no grads on X_L
             assert not torch.is_grad_enabled(), "Computation graph should not be active"
@@ -483,32 +511,33 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             chunked_embedder = initializer_outputs.get("chunked_pairwise_embedder", None)
 
             with debug_time("SAMPLER", f"diffusion_step_{step_num}"):
-                if chunked_embedder is not None or streaming_mode:
-                    # Chunked/streaming mode: explicitly provide P_LL=None
-                    other_outputs = {
-                        k: v
-                        for k, v in initializer_outputs.items()
-                        if k not in ("chunked_pairwise_embedder", "streaming_mode")
-                    }
+                with timing.time_operation("model_forward", use_cuda_events=True):
+                    if chunked_embedder is not None or streaming_mode:
+                        # Chunked/streaming mode: explicitly provide P_LL=None
+                        other_outputs = {
+                            k: v
+                            for k, v in initializer_outputs.items()
+                            if k not in ("chunked_pairwise_embedder", "streaming_mode")
+                        }
 
-                    outs = diffusion_module(
-                        X_noisy_L=X_noisy_L,                   # [D, L, 3]
-                        t=t_hat.tile(D),                       # [D]
-                        f=f,
-                        P_LL=None,                             # Not used in chunked/streaming mode
-                        chunked_pairwise_embedder=chunked_embedder,
-                        initializer_outputs=other_outputs,
-                        streaming_mode=streaming_mode,         # Pass streaming flag!
-                        **other_outputs,
-                    )
-                else:
-                    # Standard mode: P_LL is included in initializer_outputs
-                    outs = diffusion_module(
-                        X_noisy_L=X_noisy_L,                   # [D, L, 3]
-                        t=t_hat.tile(D),                       # [D]
-                        f=f,
-                        **initializer_outputs,
-                    )
+                        outs = diffusion_module(
+                            X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                            t=t_hat.tile(D),                       # [D]
+                            f=f,
+                            P_LL=None,                             # Not used in chunked/streaming mode
+                            chunked_pairwise_embedder=chunked_embedder,
+                            initializer_outputs=other_outputs,
+                            streaming_mode=streaming_mode,         # Pass streaming flag!
+                            **other_outputs,
+                        )
+                    else:
+                        # Standard mode: P_LL is included in initializer_outputs
+                        outs = diffusion_module(
+                            X_noisy_L=X_noisy_L,                   # [D, L, 3]
+                            t=t_hat.tile(D),                       # [D]
+                            f=f,
+                            **initializer_outputs,
+                        )
 
             X_denoised_L = outs["X_L"] if "X_L" in outs else outs  # [D, L, 3]
 
@@ -521,17 +550,19 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # - X_L should be identical across GPUs, but we sync to ensure consistency
             if streaming_mode and world_size > 1:
                 # Barrier to ensure all GPUs have finished this step
-                dist.barrier()
-                
+                timing.mark_sync_point("barrier")
+                with timing.time_operation("barrier", use_cuda_events=False):
+                    dist.barrier()
+
                 # Broadcast X_L from rank 0 to ensure exact consistency
                 # (should be identical, but floating point differences can accumulate)
                 _broadcast_tensor(X_denoised_L, src=0)
-                
+
                 # Sync sequence predictions
                 if "sequence_logits_I" in outs and outs["sequence_logits_I"] is not None:
                     _broadcast_tensor(outs["sequence_logits_I"], src=0)
 
-            # Compute the delta between the noisy and denoised coordinates, scaled by t_hat
+            # Compute the delta (will be updated by CFG if enabled)
             delta_L = (X_noisy_L - X_denoised_L) / t_hat   # [D, L, 3]
             d_t = c_t - t_hat
 
@@ -599,7 +630,8 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 sequence_entropy_traj.append(seq_entropy)
 
             # Update the coordinates, scaled by the step size
-            X_L = X_noisy_L + step_scale * d_t * delta_L   # [D, L, 3]
+            with timing.time_operation("ode_update", use_cuda_events=True):
+                X_L = X_noisy_L + step_scale * d_t * delta_L   # [D, L, 3]
 
             # Append the results to the trajectory (for visualization of the diffusion process)
             X_noisy_L_scaled = (
@@ -636,15 +668,29 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 del epsilon_L, X_noisy_L_scaled, delta_L, X_denoised_L
                 # Force Python garbage collection to release any dangling references
                 gc.collect()
+
                 # Synchronize CUDA to ensure all operations are complete
-                torch.cuda.synchronize()
+                timing.mark_sync_point("cuda_sync")
+                with timing.time_operation("cuda_sync", use_cuda_events=False):
+                    torch.cuda.synchronize()
+
                 # Clear CUDA cache to defragment and release unused memory
-                torch.cuda.empty_cache()
+                with timing.time_operation("empty_cache", use_cuda_events=False):
+                    torch.cuda.empty_cache()
+
+            # Mark end of timing for this step
+            timing.mark_step_end()
 
         # ================================================================
         # Print timing summary at end of diffusion loop
         # ================================================================
         debug_ctx.print_timing_summary()
+
+        # ================================================================
+        # Comprehensive timing analysis
+        # ================================================================
+        timing.finalize_all_steps()
+        timing.print_comprehensive_report()
 
         # ================================================================
         # Post-processing: motif alignment
@@ -664,6 +710,10 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 X_L,
                 X_exists_L=is_motif_atom_with_fixed_coord,
             )
+
+        # Print all_gather synchronization summary (if timing enabled)
+        debug_ctx.print_allgather_summary()
+        debug_ctx.print_allgather_per_step_summary(num_steps=self.num_timesteps)
 
         return dict(
             X_L=X_L,                                       # [D, L, 3]
@@ -757,11 +807,12 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
         L = f["ref_element"].shape[0]                      # Number of atoms
         D = diffusion_batch_size                           # Diffusion batch size
 
-        # DIAGNOSTIC: Log input shapes
-        attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-        print(f"[DIAG] SymmetryInferenceSampler START: L={L}, D={D}, attn_parallel={attn_parallel}", flush=True)
-        print(f"[DIAG]   coord_atom_lvl_to_be_noised.shape={coord_atom_lvl_to_be_noised.shape}", flush=True)
-        print(f"[DIAG]   f['is_ca'].sum()={f['is_ca'].sum().item()} (number of tokens I)", flush=True)
+        # DIAGNOSTIC: Log input shapes (only if stats logging enabled)
+        if debug_ctx.stats_enabled:
+            attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
+            print(f"[DIAG] SymmetryInferenceSampler START: L={L}, D={D}, attn_parallel={attn_parallel}", flush=True)
+            print(f"[DIAG]   coord_atom_lvl_to_be_noised.shape={coord_atom_lvl_to_be_noised.shape}", flush=True)
+            print(f"[DIAG]   f['is_ca'].sum()={f['is_ca'].sum().item()} (number of tokens I)", flush=True)
 
         # RNG diagnostic: log state before initial structure generation
         _rng_diagnostic("SampleDiffusionWithSymmetry.before_initial_noise")
@@ -1044,8 +1095,13 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 X_exists_L=is_motif_atom_with_fixed_coord,
             )
 
-        # DIAGNOSTIC: Log output shapes
-        print(f"[DIAG] SymmetryInferenceSampler END: X_L.shape={X_L.shape}", flush=True)
+        # DIAGNOSTIC: Log output shapes (only if stats logging enabled)
+        if debug_ctx.stats_enabled:
+            print(f"[DIAG] SymmetryInferenceSampler END: X_L.shape={X_L.shape}", flush=True)
+
+        # Print all_gather synchronization summary (if timing enabled)
+        debug_ctx.print_allgather_summary()
+        debug_ctx.print_allgather_per_step_summary(num_steps=self.num_timesteps)
 
         return dict(
             X_L=X_L,                                       # [D, L, 3]

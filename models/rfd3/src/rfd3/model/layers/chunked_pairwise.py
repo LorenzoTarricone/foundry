@@ -18,15 +18,10 @@ from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_e
 
 logger = logging.getLogger(__name__)
 
-# Diagnostic flag
-PARALLEL_DEBUG = True  # Hardcoded for debugging
-
-
 def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
-    """Log tensor statistics for debugging."""
-    if not PARALLEL_DEBUG:
+    """Log tensor statistics for debugging. Controlled by verbose_stats config flag."""
+    if not debug_ctx.stats_enabled:
         return
-    # Use centralized debug context for consistent formatting
     debug_tensor("PAIRWISE", name, tensor, rank)
 
 
@@ -406,7 +401,7 @@ class ChunkedPairwiseEmbedder(nn.Module):
 
         # DEBUG: Log streaming mode check
         import torch.distributed as dist
-        if dist.is_initialized():
+        if debug_ctx.stats_enabled and dist.is_initialized():
             rank = dist.get_rank()
             print(f"[DEBUG-STREAMING] RANK{rank}: streaming_mode={streaming_mode}, z_chunk_range={z_chunk_range}, "
                   f"Z_init_II.shape={list(Z_init_II.shape)}, kwargs.keys()={list(kwargs.keys())}", flush=True)
@@ -621,7 +616,7 @@ class ChunkedPairwiseEmbedder(nn.Module):
 
             # DEBUG: Log streaming_mode check to diagnose encoder path issue
             import torch.distributed as dist
-            if dist.is_initialized():
+            if debug_ctx.stats_enabled and dist.is_initialized():
                 rank = dist.get_rank()
                 print(f"[DEBUG-STREAMING-CHECK] RANK{rank}: streaming_mode={streaming_mode}, "
                       f"z_chunk_range={z_chunk_range}, "
@@ -637,9 +632,9 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 tq = tok_queries_chunk[0]  # [L_par, k]
                 tk = tok_keys_chunk[0]     # [L_par, k]
 
-                # DEBUG: Log tq range to diagnose RANK1 issue
+                # DEBUG: Log tq range to diagnose RANK1 issue (only if stats logging enabled)
                 import torch.distributed as dist
-                if dist.is_initialized():
+                if debug_ctx.stats_enabled and dist.is_initialized():
                     rank = dist.get_rank()
                     world_size = dist.get_world_size()
                     tq_min, tq_max = tq.min().item(), tq.max().item()

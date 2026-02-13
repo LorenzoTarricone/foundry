@@ -26,7 +26,7 @@
 # =============================================================================
 # Configuration - Modify these as needed
 # =============================================================================
-CONFIG_FILE="configs/design_parallel.yaml"
+CONFIG_FILE="${1:-configs/design_parallel.yaml}"
 CONDA_ENV="foundry"  # Your conda environment name
 
 # =============================================================================
@@ -108,19 +108,37 @@ TOTAL_ALLOCATED=$((NUM_NODES * GPUS_PER_NODE))
 echo "GPUs requested: $REQUESTED_GPUS"
 echo "Nodes allocated: $NUM_NODES (with $TOTAL_ALLOCATED GPUs total)"
 
-# Calculate tasks per node for uneven distribution
-# E.g., 5 GPUs on 2 nodes: node1 gets 3 tasks, node2 gets 2 tasks
-# We use --ntasks instead of --ntasks-per-node to allow uneven distribution
+# Calculate tasks per node for distribution across nodes
+# For NCCL to work correctly, we use the TRADITIONAL approach:
+# - Each node sees all its GPUs (not --gpus-per-task=1)
+# - LOCAL_RANK = SLURM_LOCALID selects which GPU each task uses
 TOTAL_TASKS=$REQUESTED_GPUS
+REMAINDER=$((REQUESTED_GPUS % NUM_NODES))
+
+# GPUs per node: ceiling division to ensure enough GPUs on each node
+GPUS_PER_NODE_ACTUAL=$(( (REQUESTED_GPUS + NUM_NODES - 1) / NUM_NODES ))
+
+if [ "$REMAINDER" -eq 0 ]; then
+    # Even distribution: e.g., 6 GPUs on 2 nodes = 3 tasks per node
+    TASKS_PER_NODE=$((REQUESTED_GPUS / NUM_NODES))
+    echo "Even distribution: $TASKS_PER_NODE tasks/GPUs per node"
+    SRUN_TASK_ARGS="--ntasks-per-node=$TASKS_PER_NODE"
+else
+    # Uneven distribution: e.g., 5 GPUs on 2 nodes
+    # Cannot use --ntasks-per-node for uneven, use --ntasks only
+    echo "Uneven distribution: $REQUESTED_GPUS tasks across $NUM_NODES nodes (max $GPUS_PER_NODE_ACTUAL GPUs per node)"
+    SRUN_TASK_ARGS="--ntasks=$TOTAL_TASKS"
+fi
 
 echo "Launching $TOTAL_TASKS tasks across $NUM_NODES nodes"
 
-# Use srun with exact task count
-# --gpus-per-node ensures all GPUs on each node are visible
-# LOCAL_RANK is computed from global rank to handle uneven distribution
+# TRADITIONAL MULTI-GPU APPROACH:
+# - --gpus-per-node: each node sees all its allocated GPUs
+# - Each task uses SLURM_LOCALID to select its GPU
+# This works correctly with NCCL which expects to see the full GPU topology.
 srun --nodes=$NUM_NODES \
-     --ntasks=$TOTAL_TASKS \
-     --gpus-per-node=$GPUS_PER_NODE \
+     $SRUN_TASK_ARGS \
+     --gpus-per-node=$GPUS_PER_NODE_ACTUAL \
      --mpi=pmi2 \
      --export=ALL \
      bash -c '
@@ -132,16 +150,16 @@ srun --nodes=$NUM_NODES \
         # Set distributed environment variables
         export WORLD_SIZE=$SLURM_NTASKS
         export RANK=$PMI_RANK
-        # Compute LOCAL_RANK from SLURM_LOCALID (task index within node)
+        # LOCAL_RANK = which GPU on this node (0, 1, 2, ...)
+        # SLURM_LOCALID gives the local task ID on the node
         export LOCAL_RANK=$SLURM_LOCALID
 
         # Workaround for Lightning Fabric SLURM validation
-        # Fabric checks that SLURM_NTASKS_PER_NODE is set when SLURM_NTASKS is used.
-        # We compute an approximate value (rounded up) since we handle distribution ourselves.
-        export SLURM_NTASKS_PER_NODE=$(( (${SLURM_NTASKS:-1} + ${SLURM_JOB_NUM_NODES:-1} - 1) / ${SLURM_JOB_NUM_NODES:-1} ))
+        # Use ceiling of tasks/nodes for uneven distribution
+        export SLURM_NTASKS_PER_NODE='"$GPUS_PER_NODE_ACTUAL"'
 
         # Debug output
-        echo "[Rank $RANK] Starting on $(hostname), LOCAL_RANK=$LOCAL_RANK, WORLD_SIZE=$WORLD_SIZE, NTASKS_PER_NODE=$SLURM_NTASKS_PER_NODE"
+        echo "[Rank $RANK] Starting on $(hostname), LOCAL_RANK=$LOCAL_RANK, WORLD_SIZE=$WORLD_SIZE, CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 
         # Run the design script as a worker (skip internal torchrun)
         python scripts/design_parallel.py \
