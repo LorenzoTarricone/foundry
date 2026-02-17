@@ -19,54 +19,16 @@ from foundry.utils.rotation_augmentation import (
     uniform_random_rotation,
 )
 from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks, debug_time, debug_time_log, TimingInstrument
-from rfd3.model.layers.streaming import compute_chunk_ranges
+from rfd3.model.parallel.utils import compute_chunk_ranges
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
-
-
-# =============================================================================
-# RNG Diagnostic Utilities (for debugging reproducibility issues)
-# =============================================================================
-
-def _rng_diagnostic(checkpoint_name: str, sample_size: int = 3) -> str:
-    """
-    Log RNG state at a checkpoint WITHOUT consuming random numbers.
-    Returns a short hash of the RNG state for comparison.
-    """
-    import hashlib
-
-    # Get current RNG state
-    cpu_state = torch.get_rng_state()
-    cuda_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else torch.tensor([])
-
-    # Compute hash
-    combined = cpu_state.numpy().tobytes() + cuda_state.numpy().tobytes()
-    state_hash = hashlib.md5(combined).hexdigest()[:12]
-
-    # Sample without advancing (save/restore)
-    cuda_state_saved = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
-    samples = torch.randn(sample_size).tolist()
-    torch.set_rng_state(cpu_state)
-    if cuda_state_saved is not None:
-        torch.cuda.set_rng_state(cuda_state_saved)
-
-    samples_str = ", ".join(f"{s:.4f}" for s in samples)
-
-    # Only log from rank 0
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    attn_par = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    mode = "PAR" if attn_par not in ("0", "", "false", "False") else "STD"
-    if rank == 0:
-        print(f"[RNG-{mode}] {checkpoint_name}: hash={state_hash}, next=[{samples_str}]", flush=True)
-
-    return state_hash
 
 
 # =============================================================================
 # Multi-GPU Parallel Inference Utilities
 # =============================================================================
 
-def _is_streaming_mode() -> bool:
+def _is_parallel_mode() -> bool:
     """
     Check if streaming/parallel attention mode is enabled.
 
@@ -374,13 +336,13 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             dict with X_L, trajectories, sequence predictions
         """
         # Check for streaming/parallel mode
-        streaming_mode = initializer_outputs.get("streaming_mode", False)
+        parallel_mode = initializer_outputs.get("parallel_mode", False)
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
 
         # RNG diagnostic: log state at start of diffusion sampling
-        _rng_diagnostic("SampleDiffusionWithMotif.sample_start")
+        # _rng_diagnostic("SampleDiffusionWithMotif.sample_start")
 
-        if streaming_mode and world_size > 1:
+        if parallel_mode and world_size > 1:
             ranked_logger.info(
                 f"Parallel diffusion sampling: GPU {gpu_rank}/{world_size}"
             )
@@ -450,7 +412,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # Force garbage collection and CUDA cache clear to ensure consistent
             # memory state. This prevents fragmentation from accumulating.
             # =======================================================================
-            if streaming_mode and step_num > 0:
+            if parallel_mode and step_num > 0:
                 import gc
                 gc.collect()
 
@@ -498,7 +460,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # CRITICAL: In multi-GPU mode, broadcast noise from rank 0 to ensure
             # all GPUs use identical noise. Otherwise each GPU generates different
             # random noise, causing X_noisy_L to diverge across GPUs.
-            if streaming_mode and world_size > 1:
+            if parallel_mode and world_size > 1:
                 _broadcast_tensor(epsilon_L, src=0)
 
             epsilon_L[..., is_motif_atom_with_fixed_coord, :] = 0  # No noise for fixed atoms
@@ -512,12 +474,12 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
 
             with debug_time("SAMPLER", f"diffusion_step_{step_num}"):
                 with timing.time_operation("model_forward", use_cuda_events=True):
-                    if chunked_embedder is not None or streaming_mode:
+                    if chunked_embedder is not None or parallel_mode:
                         # Chunked/streaming mode: explicitly provide P_LL=None
                         other_outputs = {
                             k: v
                             for k, v in initializer_outputs.items()
-                            if k not in ("chunked_pairwise_embedder", "streaming_mode")
+                            if k not in ("chunked_pairwise_embedder", "parallel_mode")
                         }
 
                         outs = diffusion_module(
@@ -527,7 +489,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                             P_LL=None,                             # Not used in chunked/streaming mode
                             chunked_pairwise_embedder=chunked_embedder,
                             initializer_outputs=other_outputs,
-                            streaming_mode=streaming_mode,         # Pass streaming flag!
+                            parallel_mode=parallel_mode,         # Pass streaming flag!
                             **other_outputs,
                         )
                     else:
@@ -548,7 +510,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # - Token features (S_I, A_I) are all_gathered within the encoder
             # - Each GPU computes full X_L from the synced token features
             # - X_L should be identical across GPUs, but we sync to ensure consistency
-            if streaming_mode and world_size > 1:
+            if parallel_mode and world_size > 1:
                 # Barrier to ensure all GPUs have finished this step
                 timing.mark_sync_point("barrier")
                 with timing.time_operation("barrier", use_cuda_events=False):
@@ -575,11 +537,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 X_noisy_L_stripped = strip_X(X_noisy_L, f_ref)
 
                 # Unconditional forward pass
-                if chunked_embedder is not None or streaming_mode:
+                if chunked_embedder is not None or parallel_mode:
                     ref_other = {
                         k: v
                         for k, v in ref_initializer_outputs.items()
-                        if k not in ("chunked_pairwise_embedder", "streaming_mode")
+                        if k not in ("chunked_pairwise_embedder", "parallel_mode")
                     }
                     outs_ref = diffusion_module(
                         X_noisy_L=X_noisy_L_stripped,
@@ -589,7 +551,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                         chunked_pairwise_embedder=ref_initializer_outputs.get(
                             "chunked_pairwise_embedder"
                         ),
-                        streaming_mode=ref_initializer_outputs.get("streaming_mode", False),
+                        parallel_mode=ref_initializer_outputs.get("parallel_mode", False),
                         **ref_other,
                     )
                 else:
@@ -603,7 +565,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 X_denoised_L_stripped = outs_ref["X_L"]
 
                 # Sync CFG outputs if distributed
-                if streaming_mode and world_size > 1:
+                if parallel_mode and world_size > 1:
                     dist.all_reduce(X_denoised_L_stripped, op=dist.ReduceOp.AVG)
 
                 delta_L_ref = (X_noisy_L_stripped - X_denoised_L_stripped) / t_hat
@@ -642,7 +604,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # memory accumulation. Over 99 steps, keeping these on GPU causes
             # ~300MB+ accumulation that contributes to fragmentation and OOM.
             # =======================================================================
-            if streaming_mode:
+            if parallel_mode:
                 X_noisy_L_traj.append(X_noisy_L_scaled.cpu())
                 X_denoised_L_traj.append(X_denoised_L.cpu())
                 t_hats.append(t_hat.cpu())
@@ -662,7 +624,7 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             # This ensures that if step N succeeds, step N+1 will too.
             # NOTE: Do NOT delete 'outs' - it's used after the loop for return values
             # =======================================================================
-            if streaming_mode:
+            if parallel_mode:
                 import gc
                 # Delete temporary tensors from this step
                 del epsilon_L, X_noisy_L_scaled, delta_L, X_denoised_L
@@ -784,13 +746,13 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             dict with X_L, trajectories, sequence predictions
         """
         # Check for streaming/parallel mode
-        streaming_mode = initializer_outputs.get("streaming_mode", False)
+        parallel_mode = initializer_outputs.get("parallel_mode", False)
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
 
         # RNG diagnostic: log state at start of symmetry diffusion sampling
-        _rng_diagnostic("SampleDiffusionWithSymmetry.sample_start")
+        # _rng_diagnostic("SampleDiffusionWithSymmetry.sample_start")
 
-        if streaming_mode and world_size > 1:
+        if parallel_mode and world_size > 1:
             ranked_logger.info(
                 f"Parallel symmetry diffusion: GPU {gpu_rank}/{world_size}"
             )
@@ -815,7 +777,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             print(f"[DIAG]   f['is_ca'].sum()={f['is_ca'].sum().item()} (number of tokens I)", flush=True)
 
         # RNG diagnostic: log state before initial structure generation
-        _rng_diagnostic("SampleDiffusionWithSymmetry.before_initial_noise")
+        # _rng_diagnostic("SampleDiffusionWithSymmetry.before_initial_noise")
 
         X_L = self._get_initial_structure(
             c0=noise_schedule[0],
@@ -827,7 +789,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
 
         # CRITICAL: In multi-GPU mode, broadcast initial X_L from rank 0 to all ranks
         # Each rank generates different random noise, so we must synchronize the initial structure
-        if streaming_mode and world_size > 1:
+        if parallel_mode and world_size > 1:
             local_rank = int(os.environ.get("LOCAL_RANK", gpu_rank))
             local_device = torch.device(f"cuda:{local_rank}")
             # Move X_L to local device before broadcast (NCCL requires tensors on local GPU)
@@ -869,7 +831,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # Force garbage collection and CUDA cache clear to ensure consistent
             # memory state. This prevents fragmentation from accumulating.
             # =======================================================================
-            if streaming_mode and step_num > 0:
+            if parallel_mode and step_num > 0:
                 import gc
                 gc.collect()
                 torch.cuda.synchronize()
@@ -878,7 +840,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # CRITICAL: In multi-GPU mode, ensure X_L is on the correct LOCAL device
             # X_L is initially created on cuda:0 for all ranks, but NCCL requires each rank
             # to have tensors on its own device (rank 0 → cuda:0, rank 1 → cuda:1)
-            if streaming_mode and world_size > 1:
+            if parallel_mode and world_size > 1:
                 local_rank = int(os.environ.get("LOCAL_RANK", gpu_rank))
                 local_device = torch.device(f"cuda:{local_rank}")
                 if X_L.device != local_device:
@@ -935,7 +897,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # CRITICAL: In multi-GPU mode, broadcast noise from rank 0 to ensure
             # all GPUs use identical noise. Otherwise each GPU generates different
             # random noise, causing X_noisy_L to diverge across GPUs.
-            if streaming_mode and world_size > 1:
+            if parallel_mode and world_size > 1:
                 debug_log_all_ranks("SAMPLER", "BEFORE_BROADCAST", f"epsilon_L.device={epsilon_L.device}")
                 _broadcast_tensor(epsilon_L, src=0)
                 debug_log_all_ranks("SAMPLER", "AFTER_BROADCAST", f"epsilon_L.mean={epsilon_L.mean().item():.6f}")
@@ -956,14 +918,14 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             chunked_embedder = initializer_outputs.get("chunked_pairwise_embedder", None)
 
             # DEBUG: Track before model forward
-            debug_log_all_ranks("SAMPLER", "BEFORE_MODEL_FORWARD", f"streaming={streaming_mode}, chunked={chunked_embedder is not None}")
+            debug_log_all_ranks("SAMPLER", "BEFORE_MODEL_FORWARD", f"streaming={parallel_mode}, chunked={chunked_embedder is not None}")
 
-            if chunked_embedder is not None or streaming_mode:
+            if chunked_embedder is not None or parallel_mode:
                 # Chunked/streaming mode: explicitly provide P_LL=None
                 other_outputs = {
                     k: v
                     for k, v in initializer_outputs.items()
-                    if k not in ("chunked_pairwise_embedder", "streaming_mode")
+                    if k not in ("chunked_pairwise_embedder", "parallel_mode")
                 }
                 
                 outs = diffusion_module(
@@ -973,14 +935,14 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     P_LL=None,
                     chunked_pairwise_embedder=chunked_embedder,
                     initializer_outputs=other_outputs,
-                    streaming_mode=streaming_mode,         # Pass streaming flag!
+                    parallel_mode=parallel_mode,         # Pass streaming flag!
                     **other_outputs,
                 )
                 
                 toc = time.time()
                 if step_num == 0:
                     ranked_logger.info(
-                        f"{'Streaming' if streaming_mode else 'Chunked'} symmetry mode step time: {toc - tic:.2f}s"
+                        f"{'Streaming' if parallel_mode else 'Chunked'} symmetry mode step time: {toc - tic:.2f}s"
                     )
             else:
                 # Standard mode: P_LL is included in initializer_outputs
@@ -997,7 +959,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # ================================================================
             # Multi-GPU synchronization
             # ================================================================
-            if streaming_mode and world_size > 1:
+            if parallel_mode and world_size > 1:
                 debug_log_all_ranks("SAMPLER", "BEFORE_BARRIER", "entering barrier")
                 dist.barrier()
                 debug_log_all_ranks("SAMPLER", "AFTER_BARRIER", "barrier complete")
@@ -1042,7 +1004,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # memory accumulation. Over 99 steps, keeping these on GPU causes
             # ~300MB+ accumulation that contributes to fragmentation and OOM.
             # =======================================================================
-            if streaming_mode:
+            if parallel_mode:
                 X_noisy_L_traj.append(X_noisy_L_scaled.cpu())
                 X_denoised_L_traj.append(X_denoised_L.cpu())
                 t_hats.append(t_hat.cpu())
@@ -1062,7 +1024,7 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
             # This ensures that if step N succeeds, step N+1 will too.
             # NOTE: Do NOT delete 'outs' - it's used after the loop for return values
             # =======================================================================
-            if streaming_mode:
+            if parallel_mode:
                 import gc
                 # Delete temporary tensors from this step
                 del epsilon_L, X_noisy_L_scaled, delta_L, X_denoised_L

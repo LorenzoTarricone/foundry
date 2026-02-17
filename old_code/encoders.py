@@ -29,12 +29,29 @@ from rfd3.model.layers.layer_utils import (
     linearNoBias,
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
+from rfd3.model.layers.streaming import compute_chunk_ranges
 
 from foundry.common import exists
 from foundry.training.checkpoint import activation_checkpointing
-from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks, verify_tensor_sync
+from rfd3.model.debug_context import (
+    debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks,
+    verify_tensor_sync, debug_memory, debug_gpu_memory_snapshot, debug_chunking, debug_time,
+    timed_all_gather
+)
 
 logger = logging.getLogger(__name__)
+
+# =============================================================================
+# EXTRA_CHUNKING: Control sequential loop behavior in parallel mode
+# =============================================================================
+# Default False = vectorized operation (fast, O(1) scaling, more memory)
+# Set True = chunked operation (slower, O(N) scaling, less memory)
+#
+# In parallel mode, the chunked functions loop over the full I dimension which
+# causes O(N) time scaling. Setting EXTRA_CHUNKING=False (default) bypasses
+# these loops and uses vectorized operations instead.
+# =============================================================================
+EXTRA_CHUNKING = os.environ.get("RFD3_EXTRA_CHUNKING", "0") == "1"
 
 
 def _is_streaming_mode() -> bool:
@@ -43,11 +60,14 @@ def _is_streaming_mode() -> bool:
 
     Env var scheme:
       - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
-      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+      - RFD3_ATTENTION_PARALLEL=1 or any non-zero value → parallel mode (True)
+
+    NOTE: design_parallel.py sets this to world_size (e.g., "4" for 4 GPUs),
+    so we check for any truthy non-zero value, not just "1".
     """
     val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    return val == "1"
-
+    # Enable streaming if value is any non-zero number (1, 2, 4, etc.)
+    return val not in ("0", "", "false", "False")
 
 def _get_world_size() -> int:
     """Get actual GPU count from distributed runtime."""
@@ -57,95 +77,151 @@ def _get_world_size() -> int:
     return 1
 
 
-def _compute_chunk_ranges(total: int, n_par: int) -> List[Tuple[int, int]]:
-    """Compute (start, end) ranges for chunked processing."""
-    chunk_size = (total + n_par - 1) // n_par
-    ranges = []
-    for i in range(n_par):
-        start = i * chunk_size
-        end = min((i + 1) * chunk_size, total)
-        if start < total:
-            ranges.append((start, end))
-    return ranges
 
 
-def _z_transition_chunked(Z: torch.Tensor, transition_fn, key_chunk: int = 512) -> torch.Tensor:
+def _z_transition_chunked(Z: torch.Tensor, transition_fn, key_chunk: int = 512, extra_chunking: bool = None) -> torch.Tensor:
     """
-    Apply z_transition in sub-chunks along key dimension to reduce peak memory.
-    
-    SwiGLU creates 4x intermediate: [I_par, I, c] -> [I_par, I, 4*c] -> [I_par, I, c]
-    By chunking keys: [I_par, chunk, c] -> [I_par, chunk, 4*c] reduces memory 4x.
-    
+    Apply z_transition, optionally with chunking for memory efficiency.
+
+    By default (extra_chunking=False), uses a single vectorized operation for O(1) scaling.
+    If extra_chunking=True, processes in sub-chunks to reduce peak memory (O(N) scaling).
+
     Args:
         Z: [I_par, I, c_z] or [B, I_par, I, c_z]
         transition_fn: z_transition module
-        key_chunk: chunk size along key dimension
-    
+        key_chunk: chunk size along key dimension (only used if extra_chunking=True)
+        extra_chunking: If True, use chunked processing. If None, uses EXTRA_CHUNKING env var.
+
     Returns:
-        Z + transition_fn(Z), computed memory-efficiently
+        Z + transition_fn(Z)
     """
+    # Determine if chunking is enabled (default: use global EXTRA_CHUNKING)
+    use_chunking = extra_chunking if extra_chunking is not None else EXTRA_CHUNKING
+
+    # DEFAULT: Vectorized operation (fast, O(1) scaling)
+    if not use_chunking or Z.dim() not in [3, 4]:
+        if debug_ctx.memory_enabled and Z.dim() in [3, 4]:
+            I = Z.shape[1] if Z.dim() == 3 else Z.shape[2]
+            z_mem_gb = Z.numel() * Z.element_size() / 1e9
+            # SwiGLU creates 4x intermediate: c_z -> 4*c_z -> c_z
+            swiglu_peak_gb = Z.numel() * 4 * Z.element_size() / 1e9  # 4x expansion
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9
+                free_mem, total_mem = torch.cuda.mem_get_info()
+                free_gb = free_mem / 1e9
+                debug_chunking(f"_z_transition_chunked: VECTORIZED, I={I}")
+                debug_chunking(f"  Z shape={list(Z.shape)}, Z_mem={z_mem_gb:.2f}GB")
+                debug_chunking(f"  SwiGLU 4x expansion will need ~{swiglu_peak_gb:.2f}GB")
+                debug_chunking(f"  GPU: allocated={allocated:.2f}GB, free={free_gb:.2f}GB")
+                if swiglu_peak_gb > free_gb:
+                    debug_chunking(f"  WARNING: SwiGLU peak ({swiglu_peak_gb:.2f}GB) > free ({free_gb:.2f}GB) - OOM likely!")
+                    # Take a full memory snapshot to see what's consuming memory
+                    debug_gpu_memory_snapshot("OOM_DEBUG", f"before_z_transition_I={I}", min_size_mb=50.0)
+            else:
+                debug_chunking(f"_z_transition_chunked: VECTORIZED, I={I}, Z_mem={z_mem_gb:.2f}GB, SwiGLU_peak={swiglu_peak_gb:.2f}GB")
+        return Z + transition_fn(Z)
+
+    # OPTIONAL: Chunked operation (slow, O(N) scaling, less memory)
     if Z.dim() == 3:
         # [I_par, I, c_z]
         I = Z.shape[1]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_z_transition_chunked(3D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, k_start:k_end, :]
             out_chunks.append(Z_sub + transition_fn(Z_sub))
-        return torch.cat(out_chunks, dim=1)
-    elif Z.dim() == 4:
+        result = torch.cat(out_chunks, dim=1)
+        del out_chunks
+        return result
+    else:  # Z.dim() == 4
         # [B, I_par, I, c_z]
         I = Z.shape[2]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_z_transition_chunked(4D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, :, k_start:k_end, :]
             out_chunks.append(Z_sub + transition_fn(Z_sub))
-        return torch.cat(out_chunks, dim=2)
-    else:
-        return Z + transition_fn(Z)
+        result = torch.cat(out_chunks, dim=2)
+        del out_chunks
+        return result
 
 
-def _process_z_chunked(Z: torch.Tensor, process_fn, key_chunk: int = 512) -> torch.Tensor:
+def _process_z_chunked(Z: torch.Tensor, process_fn, key_chunk: int = 512, extra_chunking: bool = None) -> torch.Tensor:
     """
-    Apply process_z (Linear) in sub-chunks along key dimension to reduce peak memory.
+    Apply process_z (Linear), optionally with chunking for memory efficiency.
 
-    process_z transforms [I_par, I, c_in] -> [I_par, I, c_out].
-    For I=8100, c_in=258, c_out=128, full tensor is 22 GB.
-    By chunking keys: [I_par, chunk, c_in] -> [I_par, chunk, c_out] reduces memory.
-
-    Unlike _z_transition_chunked, this has NO residual connection - just applies process_fn.
+    By default (extra_chunking=False), uses a single vectorized operation for O(1) scaling.
+    If extra_chunking=True, processes in sub-chunks to reduce peak memory (O(N) scaling).
 
     Args:
         Z: [I_par, I, c_in] or [B, I_par, I, c_in]
         process_fn: process_z module (typically nn.Sequential with RMSNorm + Linear)
-        key_chunk: chunk size along key dimension
+        key_chunk: chunk size along key dimension (only used if extra_chunking=True)
+        extra_chunking: If True, use chunked processing. If None, uses EXTRA_CHUNKING env var.
 
     Returns:
-        process_fn(Z) computed memory-efficiently
+        process_fn(Z)
     """
+    # Determine if chunking is enabled (default: use global EXTRA_CHUNKING)
+    use_chunking = extra_chunking if extra_chunking is not None else EXTRA_CHUNKING
+
+    # DEFAULT: Vectorized operation (fast, O(1) scaling)
+    if not use_chunking or Z.dim() not in [3, 4]:
+        if debug_ctx.memory_enabled and Z.dim() in [3, 4]:
+            I = Z.shape[1] if Z.dim() == 3 else Z.shape[2]
+            z_mem_gb = Z.numel() * Z.element_size() / 1e9
+            # process_fn is typically RMSNorm + Linear, output similar size to input
+            # But the Linear may have different output dimension - estimate 2x peak
+            peak_gb = z_mem_gb * 2
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1e9
+                free_mem, total_mem = torch.cuda.mem_get_info()
+                free_gb = free_mem / 1e9
+                debug_chunking(f"_process_z_chunked: VECTORIZED, I={I}")
+                debug_chunking(f"  Z shape={list(Z.shape)}, Z_mem={z_mem_gb:.2f}GB")
+                debug_chunking(f"  Estimated peak ~{peak_gb:.2f}GB")
+                debug_chunking(f"  GPU: allocated={allocated:.2f}GB, free={free_gb:.2f}GB")
+            else:
+                debug_chunking(f"_process_z_chunked: VECTORIZED, I={I}, Z_mem={z_mem_gb:.2f}GB")
+        return process_fn(Z)
+
+    # OPTIONAL: Chunked operation (slow, O(N) scaling, less memory)
     if Z.dim() == 3:
         # [I_par, I, c_in]
         I = Z.shape[1]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_process_z_chunked(3D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, k_start:k_end, :]
             out_chunks.append(process_fn(Z_sub))
-            del Z_sub  # Free memory immediately
-        return torch.cat(out_chunks, dim=1)
-    elif Z.dim() == 4:
+            del Z_sub
+        result = torch.cat(out_chunks, dim=1)
+        del out_chunks
+        return result
+    else:  # Z.dim() == 4
         # [B, I_par, I, c_in]
         I = Z.shape[2]
+        n_chunks = (I + key_chunk - 1) // key_chunk
+        if debug_ctx.memory_enabled:
+            debug_chunking(f"_process_z_chunked(4D): CHUNKED, I={I}, chunk={key_chunk}, n_iter={n_chunks} (O(N) scaling!)")
         out_chunks = []
         for k_start in range(0, I, key_chunk):
             k_end = min(k_start + key_chunk, I)
             Z_sub = Z[:, :, k_start:k_end, :]
             out_chunks.append(process_fn(Z_sub))
-            del Z_sub  # Free memory immediately
-        return torch.cat(out_chunks, dim=2)
-    else:
-        return process_fn(Z)
+            del Z_sub
+        result = torch.cat(out_chunks, dim=2)
+        del out_chunks
+        return result
 
 
 def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
@@ -159,119 +235,135 @@ def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
 def _compute_gpu_query_range(total: int, rank: int, world_size: int) -> Tuple[int, int]:
     """
     Compute the query index range for a specific GPU.
-    
-    Each GPU handles a contiguous chunk of queries (tokens).
-    This ensures no GPU ever needs to compute full I×I tensors.
-    
+
+    Uses compute_chunk_ranges to ensure consistent chunk distribution
+    across all code paths (encoder, transformer, decoder).
+
     Args:
         total: Total number of queries (I tokens)
         rank: This GPU's rank (0 to world_size-1)
         world_size: Total number of GPUs
-        
+
     Returns:
         (start_idx, end_idx): Query range [start, end) for this GPU
     """
-    chunk_size = total // world_size
-    remainder = total % world_size
-    
-    if rank < remainder:
-        start = rank * (chunk_size + 1)
-        end = start + chunk_size + 1
-    else:
-        start = rank * chunk_size + remainder
-        end = start + chunk_size
-    
-    return start, end
+    chunk_ranges = compute_chunk_ranges(total, world_size)
+    if rank >= len(chunk_ranges):
+        return total, total  # No tokens for this rank
+    return chunk_ranges[rank]
 
 
-def _all_gather_concat(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+def _all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = None) -> torch.Tensor:
     """
     Gather tensors from all GPUs and concatenate along specified dimension.
-    
+
+    IMPORTANT: Handles uneven chunk sizes across GPUs. When dividing N elements
+    across W GPUs, the last GPU may have fewer elements (N % W != 0). This function
+    pads the smaller chunk before gathering and slices to the correct total size.
+
     Args:
         tensor: Local tensor chunk to gather
         dim: Dimension to concatenate along
-        
+        total_size: The expected total size along `dim` after gathering.
+                    If provided, the output is sliced to this exact size.
+                    This handles uneven chunk sizes (e.g., 13800 / 7 GPUs).
+
     Returns:
-        Full tensor reassembled from all GPUs
+        Full tensor reassembled from all GPUs (size = total_size along dim)
     """
     import torch.distributed as dist
     import os
-    
+
     if not dist.is_initialized():
         return tensor
-    
+
     world_size = dist.get_world_size()
+    rank = dist.get_rank()
+
     if world_size == 1:
         return tensor
-    
+
     # Ensure tensor is on the correct device for this rank
-    # This is critical for distributed training - each rank must use its assigned GPU
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     expected_device = torch.device(f"cuda:{local_rank}")
     if tensor.device != expected_device:
         tensor = tensor.to(expected_device)
-    
+
+    # ===========================================================================
+    # HANDLE UNEVEN CHUNK SIZES: When dividing N by W, the last chunk may be smaller
+    # e.g., 13800 / 7 = 1971.4, so ranks 0-5 get 1972, rank 6 gets 1968
+    # Solution: Find max chunk size, pad smaller chunks, gather, then slice
+    # ===========================================================================
+
+    local_size = tensor.shape[dim]
+
+    # Gather all chunk sizes to find the max
+    local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=tensor.device)
+    all_sizes = [torch.zeros(1, dtype=torch.long, device=tensor.device) for _ in range(world_size)]
+    timed_all_gather(all_sizes, local_size_tensor,
+                     "ALL_GATHER", "encoders._all_gather_concat.sizes",
+                     gather_type="all_gather")
+    all_sizes = [s.item() for s in all_sizes]
+    max_size = max(all_sizes)
+    actual_total = sum(all_sizes)
+
+    # Pad tensor if needed (only the last rank typically needs padding)
+    if local_size < max_size:
+        pad_size = max_size - local_size
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_size
+        padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        tensor = torch.cat([tensor, padding], dim=dim)
+
     # Ensure tensor is contiguous (required for NCCL)
     tensor = tensor.contiguous()
 
-    # ===========================================================================
-    # MEMORY OPTIMIZATION: Use all_gather_into_tensor for better memory scaling
-    # Old implementation created world_size copies on EACH GPU, causing O(n²)
-    # memory growth with GPU count. New version uses single pre-allocated output.
-    # Commented out old code preserved for rollback if needed.
-    # ===========================================================================
-
-    # --- OLD IMPLEMENTATION (creates world_size tensors per GPU) ---
-    # gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    # dist.all_gather(gathered, tensor)
-    # return torch.cat(gathered, dim=dim)
-    # --- END OLD IMPLEMENTATION ---
-
-    # --- NEW MEMORY-EFFICIENT IMPLEMENTATION ---
-    # Pre-allocate single output tensor instead of world_size separate tensors
-    # This reduces peak memory from O(world_size) to O(1) temporary allocations
-
-    # Calculate output shape: expand the gather dimension by world_size
-    output_shape = list(tensor.shape)
-    output_shape[dim] = output_shape[dim] * world_size
-    output_tensor = torch.empty(output_shape, dtype=tensor.dtype, device=tensor.device)
-
-    # Use all_gather_into_tensor if available (PyTorch >= 1.13), else fallback
+    # Now all tensors have the same size (max_size), gather them
     if hasattr(dist, 'all_gather_into_tensor'):
-        # Flatten for all_gather_into_tensor, then reshape
-        # all_gather_into_tensor expects flat output tensor
+        # Flatten for all_gather_into_tensor
         flat_input = tensor.contiguous().view(-1)
         flat_output = torch.empty(flat_input.numel() * world_size, dtype=tensor.dtype, device=tensor.device)
-        dist.all_gather_into_tensor(flat_output, flat_input)
+        timed_all_gather(flat_output, flat_input,
+                         "ALL_GATHER", "encoders._all_gather_concat.data",
+                         gather_type="all_gather_into_tensor")
 
-        # Reshape: split into world_size chunks along dim 0, then move to correct dim
-        chunk_shape = list(tensor.shape)
+        # Reshape: split into world_size chunks, then merge along dim
+        chunk_shape = list(tensor.shape)  # [max_size, ...]
         reshaped = flat_output.view(world_size, *chunk_shape)
 
-        # Move the world_size dimension to position `dim` and merge
-        # e.g., for dim=0: [W, I_par, c] -> [W*I_par, c]
-        # e.g., for dim=1: [W, B, L_par, c] -> [B, W*L_par, c]
         if dim == 0:
             output_tensor = reshaped.view(-1, *chunk_shape[1:])
         else:
-            # Transpose world_size dim to target position, then flatten
             perm = list(range(1, dim + 1)) + [0] + list(range(dim + 1, len(chunk_shape) + 1))
             transposed = reshaped.permute(*perm)
             final_shape = list(tensor.shape)
             final_shape[dim] = final_shape[dim] * world_size
             output_tensor = transposed.contiguous().view(*final_shape)
 
-        del flat_input, flat_output, reshaped  # Explicit cleanup
+        del flat_input, flat_output, reshaped
     else:
-        # Fallback for older PyTorch: use list-based all_gather but cleanup immediately
+        # Fallback for older PyTorch
         gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-        dist.all_gather(gathered, tensor)
+        timed_all_gather(gathered, tensor,
+                         "ALL_GATHER", "encoders._all_gather_concat.data_fallback",
+                         gather_type="all_gather")
         output_tensor = torch.cat(gathered, dim=dim)
-        del gathered  # Explicit cleanup to free world_size tensors
+        del gathered
+
+    # ===========================================================================
+    # SLICE TO CORRECT SIZE: Remove padding to get exact total_size
+    # If total_size is provided, use it; otherwise use the sum of actual chunk sizes
+    # ===========================================================================
+    final_size = total_size if total_size is not None else actual_total
+    current_size = output_tensor.shape[dim]
+
+    if current_size > final_size:
+        # Slice to remove padding (take first `final_size` elements along dim)
+        indices = [slice(None)] * output_tensor.dim()
+        indices[dim] = slice(0, final_size)
+        output_tensor = output_tensor[tuple(indices)].contiguous()
 
     return output_tensor
-    # --- END NEW IMPLEMENTATION ---
 
 
 # NOTE: StreamingZContainer has been removed. Z chunks are now computed
@@ -317,8 +409,11 @@ class TokenInitializer(nn.Module):
         self.use_chunked_pll = use_chunked_pll
         
         # Check for streaming mode (no full I×I/L×L tensors)
-        # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
+        # Parallel mode: =0 or unset → standard, any non-zero value → parallel
+        env_val = os.environ.get("RFD3_ATTENTION_PARALLEL", "NOT_SET")
         self.use_streaming = _is_streaming_mode()
+        if debug_ctx.stats_enabled:
+            debug_log("INIT", "TokenInitializer", f"RFD3_ATTENTION_PARALLEL={env_val}, use_streaming={self.use_streaming}")
         if self.use_streaming:
             logger.info(
                 f"TokenInitializer: Streaming mode enabled. "
@@ -485,12 +580,16 @@ class TokenInitializer(nn.Module):
             expected_device = device
         
         # Get GPU range for chunking
+        # CRITICAL: Use actual S_I.shape[0] instead of I parameter!
+        # I comes from len(f["restype"]) which may include special tokens,
+        # but S_I comes from token_1d_embedder which produces length × symmetry tokens.
+        actual_I = S_I.shape[0]
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
-        chunk_ranges = _compute_chunk_ranges(I, world_size)
-        
+        chunk_ranges = compute_chunk_ranges(actual_I, world_size)
+
         if gpu_rank >= len(chunk_ranges):
             return S_I  # Edge case: more GPUs than tokens
-        
+
         start_i, end_i = chunk_ranges[gpu_rank]
         I_par = end_i - start_i
         
@@ -521,7 +620,7 @@ class TokenInitializer(nn.Module):
         S_I_chunk = S_I[start_i:end_i]                        # [I_par, c_s]
         
         # DEBUG: Print S_I_chunk used for Z_chunk computation
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_COMPUTATION: S_I_chunk={_stat_tensor(S_I_chunk)}, Z_j={_stat_tensor(Z_j)}", flush=True)
         
         Z_i = self.to_z_init_i(S_I_chunk).unsqueeze(-2)       # [I_par, 1, c_z]
@@ -529,7 +628,7 @@ class TokenInitializer(nn.Module):
         Z_chunk = Z_i + Z_j_full                              # [I_par, I, c_z]
         
         # DEBUG: Print initial Z_chunk
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_INITIAL: Z_chunk={_stat_tensor(Z_chunk)}", flush=True)
         
         # Add RPE
@@ -561,7 +660,7 @@ class TokenInitializer(nn.Module):
         
         for block_idx, block in enumerate(self.transformer_stack):
             # DEBUG: Print S_I stats at start of each block to verify it's being updated
-            if is_rank0:
+            if is_rank0 and debug_ctx.stats_enabled:
                 print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} START: S_I={_stat_tensor(S_I)}, device={S_I.device}", flush=True)
             
             # Step 1: Apply z_transition (ACCUMULATES across blocks)
@@ -574,7 +673,7 @@ class TokenInitializer(nn.Module):
                 S_I_chunk = S_I[start_i:end_i].clone()        # [I_par, c_s] - clone to ensure fresh tensor
                 
                 # DEBUG: Print S_I_chunk stats after slicing
-                if is_rank0:
+                if is_rank0 and debug_ctx.stats_enabled:
                     print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_SLICE: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
                 
                 S_I_chunk = S_I_chunk + block.attention_pair_bias.forward_chunked(
@@ -586,13 +685,14 @@ class TokenInitializer(nn.Module):
                 S_I_chunk = S_I_chunk + block.s_transition(S_I_chunk)
                 
                 # DEBUG: Print S_I_chunk stats after processing
-                if is_rank0:
+                if is_rank0 and debug_ctx.stats_enabled:
                     print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_PROCESS: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
             
                 # Step 3: All-gather S_I chunks to update full S_I for next block
                 # CRITICAL: This updates S_I for the next iteration
+                # Pass total_size=actual_I to handle uneven chunk sizes across GPUs
                 if world_size > 1:
-                    S_I_gathered = _all_gather_concat(S_I_chunk, dim=0)  # [I, c_s]
+                    S_I_gathered = _all_gather_concat(S_I_chunk, dim=0, total_size=actual_I)  # [I, c_s]
                     # Ensure S_I is on the correct device after all_gather
                     if S_I_gathered.device != expected_device:
                         S_I_gathered = S_I_gathered.to(expected_device)
@@ -608,8 +708,13 @@ class TokenInitializer(nn.Module):
                 else:
                     S_I = S_I_chunk
                     # DEBUG: Single GPU case
-                    if is_rank0:
+                    if is_rank0 and debug_ctx.stats_enabled:
                         print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} SINGLE_GPU: S_I={_stat_tensor(S_I)}", flush=True)
+
+                # Memory cleanup after each block to prevent excessive accumulation
+                # (parallel mode memory optimization)
+                del S_I_chunk
+                torch.cuda.empty_cache()
 
         # MULTI-GPU DIAGNOSTIC: Final S_I sync check
         if world_size > 1:
@@ -635,7 +740,21 @@ class TokenInitializer(nn.Module):
         L = len(tok_idx)
         f["ref_atom_name_chars"] = f["ref_atom_name_chars"].reshape(L, -1)
         I = len(f["restype"])
-        
+
+        # DIAGNOSTIC: Print streaming mode status and env var
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        env_val = os.environ.get("RFD3_ATTENTION_PARALLEL", "NOT_SET")
+
+        # DIAGNOSTIC: Print feature sizes to debug dimension mismatch
+        if rank == 0 and debug_ctx.stats_enabled:
+            print(f"[Rank {rank}] TokenInitializer.forward: L={L}, I=len(f['restype'])={I}", flush=True)
+            print(f"[Rank {rank}]   f['token_bonds'].shape = {f['token_bonds'].shape}", flush=True)
+            print(f"[Rank {rank}]   f['is_ca'].sum() = {f['is_ca'].sum().item()}", flush=True)
+            print(f"[Rank {rank}]   f['asym_id'].shape = {f['asym_id'].shape if 'asym_id' in f else 'N/A'}", flush=True)
+            print(f"[Rank {rank}]   use_streaming={self.use_streaming}, RFD3_ATTENTION_PARALLEL={env_val}", flush=True)
+        debug_memory("TOKEN_INIT", f"forward_start_L{L}_I{I}")
+
         # Use streaming mode if enabled (no full I×I tensors)
         if self.use_streaming:
             return self._forward_streaming(f, tok_idx, L, I)
@@ -674,8 +793,18 @@ class TokenInitializer(nn.Module):
         # ============================================================
         # Step 1: Compute S_I (single token features) - no I×I here
         # ============================================================
+        debug_memory("ENCODER", f"start_streaming_L{L}_I{I}")
         S_I = self.token_1d_embedder(f, I)                # [I, c_s]
         S_I = S_I + self.transition_post_token(S_I)       # [I, c_s]
+
+        # DIAGNOSTIC: Check if S_I.shape[0] matches I (expected to match)
+        # Define is_rank0 early for diagnostics
+        is_rank0 = not dist.is_initialized() or dist.get_rank() == 0
+        actual_S_I_size = S_I.shape[0]
+        if actual_S_I_size != I and is_rank0 and debug_ctx.stats_enabled:
+            print(f"[Rank 0] WARNING: S_I.shape[0]={actual_S_I_size} != I={I} - DIMENSION MISMATCH!", flush=True)
+        elif is_rank0 and debug_ctx.stats_enabled:
+            print(f"[Rank 0] S_I.shape[0]={actual_S_I_size} == I={I} (no mismatch)", flush=True)
 
         # Embed atom features and downcast to token features
         S_I = self.downcast_atom(
@@ -696,7 +825,7 @@ class TokenInitializer(nn.Module):
                 "min": float(t.float().min().item()),
                 "max": float(t.float().max().item()),
             }
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} INITIAL_AFTER_PROCESS_S_INIT: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
         
         # ============================================================
@@ -717,7 +846,7 @@ class TokenInitializer(nn.Module):
         # is computed BEFORE the transformer_stack loop
         Z_j = self.to_z_init_j(S_I_initial)              # [I, c_z] from INITIAL S_I
         
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_j computed from INITIAL S_I: Z_j={_stat(Z_j)}", flush=True)
         
         # ============================================================
@@ -726,7 +855,7 @@ class TokenInitializer(nn.Module):
         # In standard mode, transformer_stack processes BOTH S_I and Z_II.
         # In streaming mode, we must also process S_I through the attention
         # layers, using chunked Z computation to avoid full I×I tensor.
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} BEFORE_TRANSFORMER_STACK: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
 
         # CRITICAL FIX: On single GPU, use standard transformer_stack to ensure
@@ -767,7 +896,7 @@ class TokenInitializer(nn.Module):
             for b in range(2):
                 Z_init_II = Z_init_II + self.transition_1[b](Z_init_II)  # [I, I, c_z]
 
-            if is_rank0:
+            if is_rank0 and debug_ctx.stats_enabled:
                 print(f"{debug_ctx.prefix('ENCODER-S_I')} SINGLE_GPU_STANDARD_PATH: S_I={_stat(S_I)}", flush=True)
                 print(f"{debug_ctx.prefix('ENCODER-S_I')} SINGLE_GPU_Z_init_II: mean={Z_init_II.float().mean():.6f}", flush=True)
 
@@ -795,7 +924,7 @@ class TokenInitializer(nn.Module):
             )
 
         # DEBUG: Print S_I after processing
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER-S_I')} AFTER_TRANSFORMER_STACK: S_I={_stat(S_I)}, device={S_I.device}", flush=True)
 
         # CRITICAL: Ensure S_I is synchronized across all ranks before continuing
@@ -803,19 +932,38 @@ class TokenInitializer(nn.Module):
             dist.barrier()
 
         # ============================================================
+        # MEMORY OPTIMIZATION FOR PARALLEL MODE:
+        # After _process_s_through_transformer_stack, PyTorch has ~80GB reserved
+        # but only ~2GB allocated (heavily fragmented). The Z_chunk computation
+        # needs ~6GB contiguous memory. Without clearing the cache, PyTorch may
+        # try to allocate a new large block (24.81 GiB = full [I,I,c_z] tensor)
+        # instead of reusing the fragmented reserved memory.
+        # ============================================================
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        debug_memory("ENCODER", "after_cache_clear")
+
+        # ============================================================
         # Step 4: Compute Z chunk [I_par, I, c_z] for this GPU directly
         # ============================================================
         # Each GPU computes its portion of Z [I_par, I, c_z].
         # This is equivalent to Z_init_II[start_i:end_i, :, :] but never
         # materializes the full [I, I, c_z] tensor.
+        debug_memory("ENCODER", "before_Z_chunk")
 
         # Get this GPU's query range
-        start_i, end_i = _compute_gpu_query_range(I, gpu_rank, world_size)
+        # CRITICAL: Use actual S_I shape instead of I parameter!
+        # I comes from len(f["restype"]) which may include special tokens,
+        # but S_I comes from token_1d_embedder which produces length × symmetry tokens.
+        actual_I = S_I_initial.shape[0]
+        start_i, end_i = _compute_gpu_query_range(actual_I, gpu_rank, world_size)
         I_par = end_i - start_i
         qs = slice(start_i, end_i)
 
-        if is_rank0:
-            print(f"{debug_ctx.prefix('ENCODER')} Computing Z chunk [{start_i}:{end_i}] (I_par={I_par}) for GPU {gpu_rank}/{world_size}", flush=True)
+        if is_rank0 and debug_ctx.stats_enabled:
+            print(f"{debug_ctx.prefix('ENCODER')} Computing Z chunk [{start_i}:{end_i}] (I_par={I_par}) for GPU {gpu_rank}/{world_size}, actual_I={actual_I}", flush=True)
 
         # Step 4a: Base Z = Z_i + Z_j (cross-attention style)
         # Use S_I_initial (before transformer_stack) to match standard mode
@@ -824,20 +972,28 @@ class TokenInitializer(nn.Module):
         Z_j_expanded = Z_j.unsqueeze(0)                    # [1, I, c_z]
         Z_chunk = Z_i + Z_j_expanded                       # [I_par, I, c_z]
 
+        # MEMORY CLEANUP: Free intermediate tensors from step 4a
+        del S_I_chunk, Z_i, Z_j_expanded
+
         # Log Z_chunk step1 from ALL ranks for debugging
         debug_log_all_ranks("ENCODER", "Z_chunk_step1",
                   f"[{start_i}:{end_i}] Z_i+Z_j mean={Z_chunk.float().mean():.6f}")
 
         # Step 4b: Add RPE (chunked)
-        Z_chunk = Z_chunk + self.relative_position_encoding.forward_chunk(f, start_i, end_i)
+        # NOTE: RPE creates large one-hot tensors (~7GB each x3 = ~21GB for one call)
+        rpe1_result = self.relative_position_encoding.forward_chunk(f, start_i, end_i)
+        Z_chunk = Z_chunk + rpe1_result
+        del rpe1_result  # Free RPE result immediately
+        gc.collect()
+        torch.cuda.empty_cache()
         debug_log("ENCODER", "Z_chunk_step2_rpe",
                   f"after RPE mean={Z_chunk.float().mean():.6f}")
 
         # Step 4c: Add token bonds
-        token_bonds_chunk = f["token_bonds"][qs, :]       # [I_par, I]
-        Z_chunk = Z_chunk + self.process_token_bonds(
-            token_bonds_chunk.unsqueeze(-1).float()
-        )
+        token_bonds_chunk = f["token_bonds"][qs, :]          # [I_par, I]
+        bonds_result = self.process_token_bonds(token_bonds_chunk.unsqueeze(-1).float())
+        Z_chunk = Z_chunk + bonds_result
+        del token_bonds_chunk, bonds_result  # Free bond tensors
         debug_log("ENCODER", "Z_chunk_step3_bonds",
                   f"after token_bonds mean={Z_chunk.float().mean():.6f}")
 
@@ -851,9 +1007,11 @@ class TokenInitializer(nn.Module):
             ref_space_uid_chunk.unsqueeze(-1) == ref_space_uid.unsqueeze(0)
         ).unsqueeze(-1)                                    # [I_par, I, 1]
 
-        Z_chunk = Z_chunk + self.ref_pos_embedder_tok.forward_chunk(
+        refpos_result = self.ref_pos_embedder_tok.forward_chunk(
             ref_pos_chunk, ref_pos, valid_mask
         )
+        Z_chunk = Z_chunk + refpos_result
+        del ref_pos_chunk, ref_space_uid_chunk, valid_mask, refpos_result  # Free refpos tensors
         debug_log("ENCODER", "Z_chunk_step4_refpos",
                   f"after ref_pos mean={Z_chunk.float().mean():.6f}")
 
@@ -863,13 +1021,27 @@ class TokenInitializer(nn.Module):
             debug_log("ENCODER", f"Z_chunk_step5_block{block_idx}",
                       f"after block mean={Z_chunk.float().mean():.6f}")
 
+        # MEMORY CLEANUP: Clear cache before second RPE (which creates ~21GB of one-hot tensors)
+        gc.collect()
+        torch.cuda.empty_cache()
+
         # Step 4f: Concatenate with second RPE and process
+        # NOTE: RPE creates large one-hot tensors (~7GB each x3 = ~21GB for one call)
         rpe2_chunk = self.relative_position_encoding2.forward_chunk(f, start_i, end_i)
         Z_chunk = torch.cat([Z_chunk, rpe2_chunk], dim=-1)  # [I_par, I, 2*c_z]
+        del rpe2_chunk  # Free RPE2 result immediately
+        gc.collect()
+        torch.cuda.empty_cache()
         debug_log("ENCODER", "Z_chunk_step6_rpe2cat",
                   f"after rpe2 concat mean={Z_chunk.float().mean():.6f}")
 
-        Z_chunk = self.process_z_init(Z_chunk)              # [I_par, I, c_z]
+        # =======================================================================
+        # MEMORY OPTIMIZATION: Use key-chunking for process_z_init to avoid OOM
+        # Z_chunk is [I_par, I, 2*c_z] - for I=10200, I_par=2550, c_z=128:
+        # Full tensor = 2550 × 10200 × 256 × 4 bytes = 26.7 GB
+        # Processing in key-chunks of 512: 2550 × 512 × 256 × 4 = 1.34 GB
+        # =======================================================================
+        Z_chunk = _process_z_chunked(Z_chunk, self.process_z_init)  # [I_par, I, c_z]
         debug_log("ENCODER", "Z_chunk_step7_processzinit",
                   f"after process_z_init mean={Z_chunk.float().mean():.6f}")
 
@@ -883,8 +1055,9 @@ class TokenInitializer(nn.Module):
         debug_log_all_ranks("ENCODER", "Z_chunk_FINAL",
                   f"[{start_i}:{end_i}] shape={list(Z_chunk.shape)}, mean={Z_chunk.float().mean():.6f}")
 
-        if is_rank0:
+        if is_rank0 and debug_ctx.stats_enabled:
             print(f"{debug_ctx.prefix('ENCODER')} Z_chunk computed: shape={list(Z_chunk.shape)}, mean={Z_chunk.float().mean():.6f}", flush=True)
+        debug_memory("ENCODER", "after_Z_chunk")
 
         # ============================================================
         # Step 5: Compute atom features (Q_L_init, C_L)
@@ -1149,8 +1322,11 @@ class DiffusionTokenEncoder(nn.Module):
         )
         
         # Check for streaming mode
-        # Parallel mode: =0 or unset → standard, =1 → parallel
+        # Parallel mode: =0 or unset → standard, any non-zero value → parallel
+        env_val = os.environ.get("RFD3_ATTENTION_PARALLEL", "NOT_SET")
         self.use_streaming = _is_streaming_mode()
+        if debug_ctx.stats_enabled:
+            debug_log("INIT", "DiffusionTokenEncoder", f"RFD3_ATTENTION_PARALLEL={env_val}, use_streaming={self.use_streaming}")
 
     def forward(self, f, R_L, S_init_I, Z_init_II, C_L, P_LL, **kwargs):
         """
@@ -1198,94 +1374,275 @@ class DiffusionTokenEncoder(nn.Module):
         device = R_L.device
         dtype = R_L.dtype
 
-        # Ensure encoder modules are on the correct device for this rank
+        # CRITICAL: Set CUDA device context for this rank BEFORE any operations
+        # In multi-GPU setups, operations may default to cuda:0 unless explicitly set.
+        # This ensures all tensor allocations go to the correct device.
+        torch.cuda.set_device(device)
+
+        debug_memory("DIFF_ENCODER", "start_streaming")
+
+        # CRITICAL: Ensure encoder modules are on the correct device for this rank
+        # In multi-node setups, the model may have been placed on cuda:0 by Fabric
+        # but each rank needs parameters on its local device (cuda:LOCAL_RANK)
+        import torch.distributed as dist
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+        # Diagnostic: Log device information for debugging multi-GPU issues
+        if hasattr(self, 'process_z') and hasattr(self.process_z, 'parameters'):
+            try:
+                first_param = next(self.process_z.parameters())
+                if first_param.device != device:
+                    print(f"[RANK{rank}] DEVICE_MISMATCH: process_z on {first_param.device}, expected {device}", flush=True)
+            except StopIteration:
+                pass
+
         self.to(device)
 
+        # Verify move was successful and synchronize
+        torch.cuda.synchronize(device)
+
+        # CRITICAL: Move feature dict tensors to correct device (multi-node fix)
+        # In multi-node setups, f tensors may have been created on a different device
+        # They are used at lines 1360 (f["is_ca"]) and 1366 (f["is_motif_atom_with_fixed_coord"])
+        for key, val in f.items():
+            if isinstance(val, torch.Tensor) and val.device != device:
+                f[key] = val.to(device)
+
         # Z_init_II is a pre-computed chunk tensor [I_par, I, c_z]
-        Z_chunk = Z_init_II
+        Z_init_chunk = Z_init_II  # Rename to clarify it's the input
+
+        # CRITICAL: Ensure Z_init_chunk is on the same device as R_L
+        # In multi-node setups, Z_init_II may have been left on a different device
+        if Z_init_chunk.device != device:
+            Z_init_chunk = Z_init_chunk.to(device)
+
         z_chunk_range = kwargs.get("z_chunk_range")
         if z_chunk_range is None:
             raise ValueError("streaming_mode=True requires z_chunk_range in kwargs")
         gpu_start, gpu_end = z_chunk_range
-        I = Z_chunk.shape[1]                            # Second dim is full I
+        I = Z_init_chunk.shape[1]                       # Second dim is full I
         _, world_size = _get_gpu_rank_and_world_size()
-        base_z_dim = Z_chunk.shape[-1]                  # c_z from tensor
+        base_z_dim = Z_init_chunk.shape[-1]             # c_z from tensor
 
         I_par = gpu_end - gpu_start
 
         # Step 1: Update S_I (operates on full I, no I×I)
-        S_I = S_init_I
+        # Ensure S_init_I is on the correct device (may differ in multi-node)
+        S_I = S_init_I.to(device) if S_init_I.device != device else S_init_I
         has_batch_S = S_I.dim() == 3
         for b in range(2):
             S_I = S_I + self.transition_1[b](S_I)
 
-        # Step 2: Expand Z chunk for batch dimension
-        Z_chunk = Z_chunk.unsqueeze(0).expand(B, -1, -1, -1)  # [B, I_par, I, c_z]
+        # =======================================================================
+        # MEMORY OPTIMIZATION: Pre-allocate Z_final and copy slices instead of cat
+        #
+        # The old approach used torch.cat() which causes massive memory spikes:
+        #   - cat([Z_chunk, D_chunk]): peak = 13.3 + 13.3 + 26.6 = ~53 GB
+        #   - cat([Z_chunk, D_self]): peak = 26.6 + 6.7 + 26.8 = ~60 GB
+        #
+        # New approach: pre-allocate final tensor, copy slices in-place:
+        #   - Peak = Z_final (26.8 GB) + D_chunk (13.3 GB) = ~40 GB
+        # This saves ~20 GB of peak memory!
+        # =======================================================================
 
-        # Step 3: Add distogram for this GPU's query chunk
+        # Calculate final feature dimension
+        final_dim = base_z_dim  # c_z from TokenInitializer
         if self.use_distogram:
-            R_ca = R_L[..., f["is_ca"], :]                 # [B, I, 3]
+            if self.use_sinusoidal_distogram_embedder:
+                final_dim += self.c_z  # sinusoidal uses DiffusionTokenEncoder.c_z
+            else:
+                final_dim += self.n_bins_distogram
+        if self.use_self:
+            final_dim += self.n_bins_distogram
+
+        # Pre-allocate the final Z tensor (avoids cat operations)
+        Z_chunk = torch.empty(B, I_par, I, final_dim, device=device, dtype=dtype)
+        debug_memory("DIFF_ENCODER", f"after_preallocate_Zfinal_shape{list(Z_chunk.shape)}")
+
+        # Copy Z_init_chunk into the first slice (expand for batch)
+        # NOTE: Z_init_chunk is [I_par, I, c_z], expand to [B, I_par, I, c_z]
+        offset = 0
+
+        # DIAGNOSTIC: Verify device consistency before copy
+        if Z_init_chunk.device != device:
+            print(f"[RANK{rank}] ERROR: Z_init_chunk on {Z_init_chunk.device}, Z_chunk on {device}", flush=True)
+            Z_init_chunk = Z_init_chunk.to(device)
+
+        # Perform the copy with explicit synchronization for multi-GPU stability
+        try:
+            Z_chunk[:, :, :, :base_z_dim] = Z_init_chunk.unsqueeze(0).expand(B, -1, -1, -1)
+            torch.cuda.synchronize(device)  # Ensure copy completes before proceeding
+            debug_memory("DIFF_ENCODER", "after_Z_init_copy")
+        except RuntimeError as e:
+            print(f"[RANK{rank}] COPY_ERROR: {e}", flush=True)
+            print(f"[RANK{rank}] Z_chunk.device={Z_chunk.device}, Z_init_chunk.device={Z_init_chunk.device}", flush=True)
+            raise
+
+        offset += base_z_dim
+        del Z_init_chunk  # Free Z_init_chunk - no longer needed after copy
+        torch.cuda.empty_cache()  # Clean up before computing distogram
+
+        # Step 3: Compute distogram and copy into pre-allocated slice
+        if self.use_distogram:
+            # DIAGNOSTIC: Log before boolean indexing (common source of cross-device errors)
+            debug_memory("DIFF_ENCODER", "before_distogram")
+
+            # Verify f["is_ca"] device before boolean indexing
+            is_ca = f["is_ca"]
+            if is_ca.device != device:
+                print(f"[RANK{rank}] DEVICE_FIX: is_ca on {is_ca.device}, moving to {device}", flush=True)
+                is_ca = is_ca.to(device)
+                f["is_ca"] = is_ca
+
+            try:
+                R_ca = R_L[..., is_ca, :]                 # [B, I, 3]
+                torch.cuda.synchronize(device)  # Ensure indexing completes
+                debug_memory("DIFF_ENCODER", "after_R_ca_indexing")
+            except RuntimeError as e:
+                print(f"[RANK{rank}] R_ca_INDEXING_ERROR: {e}", flush=True)
+                print(f"[RANK{rank}] R_L.device={R_L.device}, is_ca.device={is_ca.device}", flush=True)
+                raise
 
             if self.use_sinusoidal_distogram_embedder:
                 R_ca_query = R_ca[:, gpu_start:gpu_end, :] # [B, I_par, 3]
 
                 # Mask: [I_par, I, 1] - query chunk vs all keys
-                motif_mask = f["is_motif_atom_with_fixed_coord"][f["is_ca"]]  # [I]
+                # Verify motif mask device
+                motif_full = f["is_motif_atom_with_fixed_coord"]
+                if motif_full.device != device:
+                    print(f"[RANK{rank}] DEVICE_FIX: motif on {motif_full.device}, moving to {device}", flush=True)
+                    motif_full = motif_full.to(device)
+                    f["is_motif_atom_with_fixed_coord"] = motif_full
+
+                motif_mask = motif_full[is_ca]  # [I]
                 motif_query = motif_mask[gpu_start:gpu_end]                    # [I_par]
                 mask_chunk = (motif_query[:, None] != motif_mask[None, :]).unsqueeze(-1)
 
+                debug_memory("DIFF_ENCODER", "after_mask_computation")
+
+                # CRITICAL: Verify dist_embedder is on the correct device (multi-GPU fix)
+                # In multi-node setups, self.to(device) may not fully move all parameters
+                # due to Fabric wrapping or other issues. Explicitly move and verify.
+                if hasattr(self, 'dist_embedder'):
+                    # Check the output_proj Linear layer's weight device
+                    embedder_device = self.dist_embedder.output_proj.weight.device
+                    if embedder_device != device:
+                        print(f"[RANK{rank}] WARNING: dist_embedder on {embedder_device}, moving to {device}", flush=True)
+                        self.dist_embedder = self.dist_embedder.to(device)
+                        # Synchronize to ensure move is complete before use
+                        torch.cuda.synchronize(device)
+
                 # Sinusoidal distance embedding for this chunk
-                D_chunk = self.dist_embedder.forward_chunk(
-                    R_ca_query, R_ca, ~mask_chunk
-                )                                          # [B, I_par, I, c_z]
+                try:
+                    D_chunk = self.dist_embedder.forward_chunk(
+                        R_ca_query, R_ca, ~mask_chunk
+                    )                                          # [B, I_par, I, c_z]
+                    torch.cuda.synchronize(device)  # Ensure forward completes
+                    debug_memory("DIFF_ENCODER", "after_dist_embedder")
+                except RuntimeError as e:
+                    print(f"[RANK{rank}] DIST_EMBEDDER_ERROR: {e}", flush=True)
+                    print(f"[RANK{rank}] R_ca_query.device={R_ca_query.device}, R_ca.device={R_ca.device}, mask_chunk.device={mask_chunk.device}", flush=True)
+                    raise
+
+                distogram_dim = self.c_z
             else:
                 # Bucketized distogram - compute for query chunk vs all atoms
-                D_chunk = bucketize_scaled_distogram_chunked(
-                    R_ca, gpu_start, gpu_end,
-                    min_dist=1, max_dist=30, sigma_data=16,  # default sigma_data
-                    n_bins=self.n_bins_distogram
-                )                                          # [B, I_par, I, n_bins]
-            Z_chunk = torch.cat([Z_chunk, D_chunk], dim=-1)
-            del D_chunk  # Free memory immediately - no longer needed after cat
+                # DIAGNOSTIC: Log before bucketized distogram
+                debug_memory("DIFF_ENCODER", f"before_bucketized_distogram_Rca{list(R_ca.shape)}")
+                if R_ca.device != device:
+                    print(f"[RANK{rank}] WARNING: R_ca on {R_ca.device}, expected {device}", flush=True)
+                    R_ca = R_ca.to(device)
+                    torch.cuda.synchronize(device)
 
-        # Step 4: Add self-conditioning for this GPU's chunk
-        expected_dim = base_z_dim
-        if self.use_distogram:
-            if self.use_sinusoidal_distogram_embedder:
-                expected_dim += self.c_z  # sinusoidal uses DiffusionTokenEncoder.c_z
-            else:
-                expected_dim += self.n_bins_distogram
+                try:
+                    D_chunk = bucketize_scaled_distogram_chunked(
+                        R_ca, gpu_start, gpu_end,
+                        min_dist=1, max_dist=30, sigma_data=16,  # default sigma_data
+                        n_bins=self.n_bins_distogram
+                    )                                          # [B, I_par, I, n_bins]
+                    torch.cuda.synchronize(device)  # Ensure distogram computation completes
+                    debug_memory("DIFF_ENCODER", f"after_bucketized_distogram_Dchunk{list(D_chunk.shape)}")
+                except RuntimeError as e:
+                    print(f"[RANK{rank}] BUCKETIZED_DISTOGRAM_ERROR: {e}", flush=True)
+                    print(f"[RANK{rank}] R_ca.device={R_ca.device}, shape={R_ca.shape}", flush=True)
+                    raise
+
+                distogram_dim = self.n_bins_distogram
+
+            # DIAGNOSTIC: Log before copy into Z_chunk
+            debug_memory("DIFF_ENCODER", "before_D_chunk_copy")
+            if D_chunk.device != device:
+                print(f"[RANK{rank}] WARNING: D_chunk on {D_chunk.device}, Z_chunk on {device}", flush=True)
+                D_chunk = D_chunk.to(device)
+                torch.cuda.synchronize(device)
+
+            # Copy into pre-allocated slice (avoids cat)
+            try:
+                Z_chunk[:, :, :, offset:offset+distogram_dim] = D_chunk
+                torch.cuda.synchronize(device)  # Ensure copy completes
+                debug_memory("DIFF_ENCODER", "after_D_chunk_copy")
+            except RuntimeError as e:
+                print(f"[RANK{rank}] D_CHUNK_COPY_ERROR: {e}", flush=True)
+                print(f"[RANK{rank}] Z_chunk.device={Z_chunk.device}, D_chunk.device={D_chunk.device}", flush=True)
+                raise
+
+            offset += distogram_dim
+            del D_chunk  # Free distogram tensor immediately
+            torch.cuda.empty_cache()
+
+        # Step 4: Compute self-conditioning and copy into pre-allocated slice
         if self.use_self:
-            expected_dim += self.n_bins_distogram
-        
-        if self.use_self:
+            debug_memory("DIFF_ENCODER", "before_self_cond")
             D_II_self = kwargs.get("D_II_self")
             if D_II_self is not None:
+                # CRITICAL: Ensure D_II_self is on the correct device (multi-node fix)
+                if D_II_self.device != device:
+                    print(f"[RANK{rank}] WARNING: D_II_self on {D_II_self.device}, moving to {device}", flush=True)
+                    D_II_self = D_II_self.to(device)
+                    torch.cuda.synchronize(device)
                 # =======================================================================
                 # MEMORY OPTIMIZATION: D_II_self may already be chunked [B, I_par, I, n_bins]
                 # In multi-GPU mode, RFD3_diffusion_module now returns the chunk directly
                 # instead of gathering to full [B, I, I, n_bins] to save 12-21 GB per GPU.
                 # =======================================================================
-
-                # --- OLD IMPLEMENTATION (assumed full [B, I, I, n_bins]) ---
-                # D_self_chunk = D_II_self[:, gpu_start:gpu_end, :]  # [B, I_par, I, n_bins]
-                # --- END OLD IMPLEMENTATION ---
-
-                # --- NEW IMPLEMENTATION: Check if already chunked ---
                 if D_II_self.shape[1] == I_par:
                     # Already chunked [B, I_par, I, n_bins] - use directly
                     D_self_chunk = D_II_self
                 else:
                     # Full tensor [B, I, I, n_bins] (standard mode) - slice it
                     D_self_chunk = D_II_self[:, gpu_start:gpu_end, :]  # [B, I_par, I, n_bins]
-                # --- END NEW IMPLEMENTATION ---
+                debug_memory("DIFF_ENCODER", f"D_II_self_provided_shape{list(D_self_chunk.shape)}")
             else:
-                D_self_chunk = torch.zeros(
-                    B, I_par, I, self.n_bins_distogram,
-                    device=device, dtype=dtype
-                )                                          # [B, I_par, I, n_bins]
-            Z_chunk = torch.cat([Z_chunk, D_self_chunk], dim=-1)
-            del D_self_chunk  # Free memory immediately - no longer needed after cat
+                debug_memory("DIFF_ENCODER", f"before_zeros_B{B}_Ipar{I_par}_I{I}_nbins{self.n_bins_distogram}")
+                try:
+                    D_self_chunk = torch.zeros(
+                        B, I_par, I, self.n_bins_distogram,
+                        device=device, dtype=dtype
+                    )                                          # [B, I_par, I, n_bins]
+                    torch.cuda.synchronize(device)
+                    debug_memory("DIFF_ENCODER", f"after_zeros_D_self_chunk{list(D_self_chunk.shape)}")
+                except RuntimeError as e:
+                    print(f"[RANK{rank}] ZEROS_ERROR: {e}", flush=True)
+                    print(f"[RANK{rank}] device={device}, dtype={dtype}", flush=True)
+                    raise
+
+            # Copy into pre-allocated slice (avoids cat)
+            debug_memory("DIFF_ENCODER", "before_D_self_copy")
+            try:
+                Z_chunk[:, :, :, offset:offset+self.n_bins_distogram] = D_self_chunk
+                torch.cuda.synchronize(device)
+                debug_memory("DIFF_ENCODER", "after_D_self_copy")
+            except RuntimeError as e:
+                print(f"[RANK{rank}] D_SELF_COPY_ERROR: {e}", flush=True)
+                print(f"[RANK{rank}] Z_chunk.device={Z_chunk.device}, D_self_chunk.device={D_self_chunk.device}", flush=True)
+                raise
+
+            offset += self.n_bins_distogram
+            del D_self_chunk  # Free self-conditioning tensor immediately
+            torch.cuda.empty_cache()
+
+        debug_memory("DIFF_ENCODER", f"after_fill_Zchunk_offset{offset}")
 
         # Verify dimensions before process_z (diagnostic)
         actual_dim = Z_chunk.shape[-1]
@@ -1321,7 +1678,9 @@ class DiffusionTokenEncoder(nn.Module):
         # For I=8100, c_in=258, full tensor = 22 GB which causes OOM.
         # Processing in key-chunks of 512: [B, I_par, 512, c_in] = ~1.4 GB
         # =======================================================================
+        debug_memory("DIFF_ENCODER", f"before_process_z_Zshape{list(Z_chunk.shape)}")
         Z_chunk = _process_z_chunked(Z_chunk, self.process_z)  # [B, I_par, I, c_z]
+        debug_memory("DIFF_ENCODER", "after_process_z")
         
         # Match standard: Z_II = Z_II + self.transition_2[b](Z_II)
         # Use key-chunking to reduce peak memory from SwiGLU 4x expansion
@@ -1341,7 +1700,18 @@ class DiffusionTokenEncoder(nn.Module):
             # S_I is [I, c_s] - slice directly
             S_I_chunk = S_I[gpu_start:gpu_end]                    # [I_par, c_s]
             S_I_unbatched = S_I                                   # [I, c_s]
-        
+
+        # =======================================================================
+        # MEMORY OPTIMIZATION: Clean memory before pairformer loop
+        # The pairformer's ln_0(Z_chunk) creates a full copy of Z_chunk (~14 GB).
+        # Ensure maximum free memory before this operation.
+        # =======================================================================
+        import gc
+        gc.collect()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        debug_memory("DIFF_ENCODER", "before_pairformer_after_cleanup")
+
         for block in self.pairformer_stack:
             # Z transition (key-chunked to reduce memory)
             Z_chunk = _z_transition_chunked(Z_chunk, block.z_transition)  # [B, I_par, I, c_z]
@@ -1361,15 +1731,20 @@ class DiffusionTokenEncoder(nn.Module):
             # CRITICAL: All-gather S_I_chunk to update keys for next block!
             # In standard mode, S_I is updated in each iteration and used as both
             # queries and keys in the next block. We must do the same here.
+            # Pass total_size=I to handle uneven chunk sizes across GPUs
             if world_size > 1:
-                S_I_unbatched = _all_gather_concat(S_I_chunk, dim=0)  # [I, c_s]
+                S_I_unbatched = _all_gather_concat(S_I_chunk, dim=0, total_size=I)  # [I, c_s]
             else:
                 S_I_unbatched = S_I_chunk
-        
+
+            # Clean up after each pairformer block to release temp tensors
+            torch.cuda.empty_cache()
+
         # Step 7: All-gather S_I chunks from all GPUs (final)
         # Each GPU has [I_par, c_s], gather to get full [I, c_s]
+        # Pass total_size=I to handle uneven chunk sizes across GPUs
         if world_size > 1:
-            S_I = _all_gather_concat(S_I_chunk, dim=0)     # [I, c_s]
+            S_I = _all_gather_concat(S_I_chunk, dim=0, total_size=I)     # [I, c_s]
         else:
             # Single GPU: just use the chunk (which is full I in this case)
             S_I = S_I_chunk

@@ -1,3 +1,4 @@
+
 """
 Chunked pairwise embedding implementation for memory-efficient large structure processing.
 
@@ -511,3 +512,185 @@ class ChunkedPairwiseEmbedder(nn.Module):
         debug_log("PAIRWISE", "forward_chunked", f"query_start={query_start}, L_par={L_par}, L_full={L_full}")
         
         return P_LL_sparse.contiguous()
+    
+    def forward_chunked_parallel(
+        self,
+        indices_chunk,              # [B, L_par, k] - THIS GPU's sparse indices
+        query_start,                # int - start atom index for this GPU
+        query_end,                  # int - end atom index for this GPU
+        f,                          # feature dict
+        initializer_outputs,        # dict with embedder state
+    ):
+        """
+        Compute P_LL_sparse for a CHUNK of queries only.
+        
+        For multi-GPU parallelization:
+        - Only computes [L_par, k, c_atompair] instead of [L, k, c_atompair]
+        - Memory: O(L_par * k) instead of O(L * k) per GPU
+        - Each GPU calls this with its query_start:query_end range
+        
+        Args:
+            indices_chunk: [B, L_par, k] - sparse neighbor indices for this chunk
+            query_start: Start index of this GPU's queries
+            query_end: End index of this GPU's queries
+            f: Feature dict with atom positions, masks, etc.
+            initializer_outputs: Dict with tok_idx, Z_init_II, etc.
+            
+        Returns:
+            P_LL_sparse_chunk: [B, L_par, k, c_atompair]
+        """
+        B = indices_chunk.shape[0]
+        L_par = query_end - query_start
+        k = indices_chunk.shape[2]
+        device = indices_chunk.device
+        
+        # Ensure embedder modules are on the correct device for this rank
+        self.to(device)
+        
+        # Get full data from initializer_outputs and move to correct device
+        tok_idx = f.get("atom_to_token_map", initializer_outputs.get("tok_idx"))
+        if tok_idx is not None:
+            tok_idx = tok_idx.to(device)
+        Z_init_II = initializer_outputs.get("Z_II", initializer_outputs.get("Z_init_II"))
+        # Note: Z_init_II may be [I_par, I, c_z] (chunked) in streaming mode
+        if Z_init_II is not None and hasattr(Z_init_II, 'to'):
+            Z_init_II = Z_init_II.to(device)
+        C_L = initializer_outputs.get("C_L")
+        if C_L is not None:
+            C_L = C_L.to(device)
+        
+        # Get dtype from available tensor
+        dtype = C_L.dtype if C_L is not None else torch.bfloat16
+        
+        # Initialize output for this chunk
+        P_LL_sparse_chunk = torch.zeros(
+            B, L_par, k, self.c_atompair, device=device, dtype=dtype
+        )
+        
+        # Ensure indices_chunk is properly batched
+        if indices_chunk.dim() == 2:
+            indices_chunk = indices_chunk.unsqueeze(0).expand(B, -1, -1)
+        
+        # SKIP motif/ref position embeddings in parallel mode for now
+        # They use slow for loops that cause rank desynchronization
+        # The single embeddings and Z features are the main contributors
+        
+        # 1. Single embeddings for chunk (VECTORIZED - no for loops)
+        if C_L is not None:
+            if C_L.dim() == 2:
+                C_L = C_L.unsqueeze(0)
+            if C_L.shape[0] != B:
+                C_L = C_L.expand(B, -1, -1)
+            
+            C_L_chunk = C_L[:, query_start:query_end, :]  # [B, L_par, c]
+            C_L_queries = C_L_chunk.unsqueeze(2).expand(-1, -1, k, -1)  # [B, L_par, k, c]
+            
+            # Gather key features - VECTORIZED
+            indices_for_gather = indices_chunk.unsqueeze(-1).expand(-1, -1, -1, C_L.shape[-1])
+            indices_clamped = torch.clamp(indices_for_gather, 0, C_L.shape[1] - 1)
+            C_L_keys = torch.gather(C_L.unsqueeze(2).expand(-1, -1, k, -1), 1, indices_clamped)  # [B, L_par, k, c]
+            
+            single_l = self._get_process_single_l()(C_L_queries)  # [B, L_par, k, c_atompair]
+            single_m = self._get_process_single_m()(C_L_keys)     # [B, L_par, k, c_atompair]
+            P_LL_sparse_chunk = P_LL_sparse_chunk + single_l + single_m
+
+        # 2. Token pair features Z for chunk (VECTORIZED - no for loops)
+        if tok_idx is not None and Z_init_II is not None:
+            if tok_idx.dim() == 1:
+                tok_idx_expanded = tok_idx.unsqueeze(0).expand(B, -1)
+            else:
+                tok_idx_expanded = tok_idx
+                if tok_idx_expanded.shape[0] != B:
+                    tok_idx_expanded = tok_idx_expanded.expand(B, -1)
+
+            # Token indices for this chunk's queries
+            tok_queries_chunk = tok_idx_expanded[:, query_start:query_end].unsqueeze(2).expand(-1, -1, k)  # [B, L_par, k]
+
+            # Get token indices for keys via gather - VECTORIZED
+            tok_idx_for_keys = tok_idx_expanded.unsqueeze(2).expand(-1, -1, k)  # [B, L, k]
+            indices_clamped = torch.clamp(indices_chunk, 0, tok_idx_expanded.shape[1] - 1)
+            tok_keys_chunk = torch.gather(tok_idx_for_keys, 1, indices_clamped)  # [B, L_par, k]
+
+            # Check for streaming mode via initializer_outputs (Z_init_II is a chunked tensor)
+            streaming_mode = initializer_outputs.get("streaming_mode", False)
+            z_chunk_range = initializer_outputs.get("z_chunk_range")
+
+            # DEBUG: Log streaming_mode check to diagnose encoder path issue
+            import torch.distributed as dist
+            if debug_ctx.stats_enabled and dist.is_initialized():
+                rank = dist.get_rank()
+                print(f"[DEBUG-STREAMING-CHECK] RANK{rank}: streaming_mode={streaming_mode}, "
+                      f"z_chunk_range={z_chunk_range}, "
+                      f"Z_init_II.shape={list(Z_init_II.shape)}, "
+                      f"initializer_outputs.keys()={list(initializer_outputs.keys())}", flush=True)
+
+            if streaming_mode and z_chunk_range is not None:
+                # Streaming mode: Z_init_II is pre-computed [I_par, I, c_z] chunk
+                start_i, end_i = z_chunk_range
+                I_par_z = Z_init_II.shape[0]
+                I_z = Z_init_II.shape[1]
+
+                tq = tok_queries_chunk[0]  # [L_par, k]
+                tk = tok_keys_chunk[0]     # [L_par, k]
+
+                # DEBUG: Log tq range to diagnose RANK1 issue (only if stats logging enabled)
+                import torch.distributed as dist
+                if debug_ctx.stats_enabled and dist.is_initialized():
+                    rank = dist.get_rank()
+                    world_size = dist.get_world_size()
+                    tq_min, tq_max = tq.min().item(), tq.max().item()
+                    tk_min, tk_max = tk.min().item(), tk.max().item()
+                    out_of_range = ((tq < start_i) | (tq >= end_i)).sum().item()
+                    print(f"[DEBUG-Z_LOOKUP] [RANK{rank}/{world_size}] z_chunk_range=[{start_i},{end_i}), "
+                          f"tq range=[{tq_min},{tq_max}], tk range=[{tk_min},{tk_max}], "
+                          f"tq out_of_range={out_of_range}/{tq.numel()}", flush=True)
+
+                # Map to local chunk indices
+                local_tq = torch.clamp(tq - start_i, 0, I_par_z - 1)
+                tk = torch.clamp(tk, 0, I_z - 1)
+
+                # Index into chunked Z
+                Z_pairs_full = Z_init_II[
+                    local_tq.flatten(),
+                    tk.flatten()
+                ].view(L_par, k, -1)  # [L_par, k, c_z]
+
+                Z_pairs_processed = self._get_process_z()(Z_pairs_full)
+                Z_pairs_processed_chunk = Z_pairs_processed.unsqueeze(0).expand(B, -1, -1, -1)
+            else:
+                # Standard mode: full Z tensor [I, I, c_z]
+                I_z = Z_init_II.shape[0]
+                Z_processed = self._get_process_z()(Z_init_II)  # [I, I, c_atompair]
+
+                # VECTORIZED gather for Z pairs
+                tq_flat = torch.clamp(tok_queries_chunk.reshape(-1), 0, I_z - 1)  # [B*L_par*k]
+                tk_flat = torch.clamp(tok_keys_chunk.reshape(-1), 0, I_z - 1)      # [B*L_par*k]
+                Z_pairs_flat = Z_processed[tq_flat, tk_flat, :]  # [B*L_par*k, c_atompair]
+                Z_pairs_processed_chunk = Z_pairs_flat.reshape(B, L_par, k, -1)
+
+            # Add Z_pairs to P_LL (matching original: P_LL_sparse += Z_pairs_processed)
+            P_LL_sparse_chunk = P_LL_sparse_chunk + Z_pairs_processed_chunk
+
+        # Final MLP (matching original: P_LL_sparse + self.pair_mlp(P_LL_sparse))
+        P_LL_sparse_chunk = P_LL_sparse_chunk + self._get_pair_mlp()(P_LL_sparse_chunk)
+
+        # MULTI-GPU DIAGNOSTIC: Log P_LL_sparse_chunk stats from ALL ranks
+        debug_tensor_all_ranks("P_LL_SPARSE", f"forward_chunked_parallel_q{query_start}-{query_end}", P_LL_sparse_chunk)
+
+        return P_LL_sparse_chunk.contiguous()
+
+
+def create_chunked_embedders(
+    c_atompair: int, embed_frame: bool = True
+) -> ChunkedPairwiseEmbedder:
+    """
+    Factory function to create chunked pairwise embedder with standard components.
+    """
+    motif_pos_embedder = ChunkedPositionPairDistEmbedder(c_atompair, embed_frame)
+    ref_pos_embedder = ChunkedPositionPairDistEmbedder(c_atompair, embed_frame)
+
+    return ChunkedPairwiseEmbedder(
+        c_atompair=c_atompair,
+        motif_pos_embedder=motif_pos_embedder,
+        ref_pos_embedder=ref_pos_embedder,
+    )

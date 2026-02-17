@@ -25,7 +25,11 @@ from rfd3.model.layers.encoders import (
 )
 from rfd3.model.layers.layer_utils import RMSNorm, linearNoBias
 from rfd3.model.layers.streaming import compute_chunk_ranges
-from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks, verify_tensor_sync
+from rfd3.model.debug_context import (
+    debug_ctx, debug_tensor, debug_log, debug_tensor_all_ranks, debug_log_all_ranks,
+    verify_tensor_sync, debug_memory, debug_tensor_memory, debug_time, debug_chunking,
+    timed_all_gather
+)
 
 from foundry.model.layers.blocks import (
     FourierEmbedding,
@@ -33,15 +37,10 @@ from foundry.model.layers.blocks import (
 
 logger = logging.getLogger(__name__)
 
-# Diagnostic flag - set to True to enable detailed parallel debugging
-PARALLEL_DEBUG = True  # Hardcoded for debugging
-
-
 def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
-    """Log tensor statistics for debugging parallel vs non-parallel differences."""
-    if not PARALLEL_DEBUG:
+    """Log tensor statistics for debugging parallel vs non-parallel differences. Controlled by verbose_stats config flag."""
+    if not debug_ctx.stats_enabled:
         return
-    # Use centralized debug context for consistent formatting
     debug_tensor("MODEL", name, tensor, rank)
 
 
@@ -51,10 +50,13 @@ def _is_streaming_mode() -> bool:
 
     Env var scheme:
       - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
-      - RFD3_ATTENTION_PARALLEL=1 → parallel mode (True)
+      - RFD3_ATTENTION_PARALLEL=1 or any non-zero value → parallel mode (True)
+
+    NOTE: design_parallel.py sets this to world_size (e.g., "4" for 4 GPUs),
+    so we check for any truthy non-zero value, not just "1".
     """
     val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    return val == "1"
+    return val not in ("0", "", "false", "False")
 
 
 def _get_gpu_rank_and_world_size() -> tuple[int, int]:
@@ -74,28 +76,64 @@ def _all_gather_along_dim(
     tensor: torch.Tensor,
     world_size: int,
     dim: int = 0,
+    total_size: int = None,
 ) -> torch.Tensor:
     """
     Gather tensor chunks from all GPUs and concatenate along specified dimension.
-    
+
+    Handles uneven chunk sizes: with floor-division-with-remainder algorithm,
+    early ranks have larger chunks. This function pads smaller chunks before
+    gathering and slices to the correct total size.
+
     Args:
         tensor: Local tensor chunk
         world_size: Total number of GPUs
         dim: Dimension to concatenate along
-        
+        total_size: Expected total size (if known, for precise slicing)
+
     Returns:
         Concatenated tensor from all GPUs [... sum(chunk_sizes) ...]
     """
     if world_size == 1:
         return tensor
-    
+
+    # Gather chunk sizes from all ranks to handle uneven distribution
+    local_size = tensor.shape[dim]
+    local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=tensor.device)
+    all_sizes = [torch.zeros(1, dtype=torch.long, device=tensor.device) for _ in range(world_size)]
+    timed_all_gather(all_sizes, local_size_tensor,
+                     "ALL_GATHER", "diffusion_module._all_gather_along_dim.sizes",
+                     gather_type="all_gather")
+    all_sizes = [s.item() for s in all_sizes]
+    max_size = max(all_sizes)
+    actual_total = sum(all_sizes)
+
+    # Pad tensor to max_size if this rank has a smaller chunk
+    if local_size < max_size:
+        pad_size = max_size - local_size
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_size
+        padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        tensor = torch.cat([tensor, padding], dim=dim)
+
     # Ensure tensor is contiguous (required for NCCL)
     tensor = tensor.contiguous()
-    
-    # Gather from all ranks
+
+    # Gather from all ranks (all tensors now have same size = max_size)
     gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
-    return torch.cat(gathered, dim=dim)
+    timed_all_gather(gathered, tensor,
+                     "ALL_GATHER", "diffusion_module._all_gather_along_dim.data",
+                     gather_type="all_gather")
+    result = torch.cat(gathered, dim=dim)
+
+    # Slice to correct total size (remove padding)
+    final_size = total_size if total_size is not None else actual_total
+    if result.shape[dim] > final_size:
+        indices = [slice(None)] * result.dim()
+        indices[dim] = slice(0, final_size)
+        result = result[tuple(indices)].contiguous()
+
+    return result
 
 
 
@@ -108,20 +146,56 @@ def _get_gpu_rank_and_world_size():
     return 0, 1
 
 
-def _all_gather_concat(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-    """Gather tensors from all GPUs and concatenate along specified dimension."""
+def _all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = None) -> torch.Tensor:
+    """
+    Gather tensors from all GPUs and concatenate along specified dimension.
+
+    Handles uneven chunk sizes: when dividing N elements across W GPUs,
+    the last GPU may have fewer elements. This function pads smaller chunks
+    before gathering and slices to the correct total size.
+
+    Args:
+        tensor: Local tensor chunk to gather
+        dim: Dimension to concatenate along
+        total_size: Expected total size after gathering (handles uneven chunks)
+    """
     import torch.distributed as dist
     if not dist.is_initialized():
         return tensor
-    
+
     world_size = dist.get_world_size()
     if world_size == 1:
         return tensor
-    
+
+    # Handle uneven chunk sizes by finding max size and padding
+    local_size = tensor.shape[dim]
+    local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=tensor.device)
+    all_sizes = [torch.zeros(1, dtype=torch.long, device=tensor.device) for _ in range(world_size)]
+    dist.all_gather(all_sizes, local_size_tensor)
+    all_sizes = [s.item() for s in all_sizes]
+    max_size = max(all_sizes)
+    actual_total = sum(all_sizes)
+
+    # Pad tensor if needed
+    if local_size < max_size:
+        pad_size = max_size - local_size
+        pad_shape = list(tensor.shape)
+        pad_shape[dim] = pad_size
+        padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
+        tensor = torch.cat([tensor, padding], dim=dim)
+
     gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
     dist.all_gather(gathered, tensor)
-    
-    return torch.cat(gathered, dim=dim)
+    result = torch.cat(gathered, dim=dim)
+
+    # Slice to correct size
+    final_size = total_size if total_size is not None else actual_total
+    if result.shape[dim] > final_size:
+        indices = [slice(None)] * result.dim()
+        indices[dim] = slice(0, final_size)
+        result = result[tuple(indices)].contiguous()
+
+    return result
 
 
 class RFD3DiffusionModule(nn.Module):
@@ -337,7 +411,7 @@ class RFD3DiffusionModule(nn.Module):
         
         # Run cross-attention transformer
         # Queries from A_I_chunk, Keys/Values from A_I, Bias from Z_II_chunk
-        if gpu_rank == 0:
+        if gpu_rank == 0 and debug_ctx.stats_enabled:
             with torch.no_grad():
                 print(
                     f"{debug_ctx.prefix('DIFF')} xattn input shapes:",
@@ -366,7 +440,8 @@ class RFD3DiffusionModule(nn.Module):
         debug_tensor_all_ranks("DIFF_XATTN", f"A_I_chunk_q{start_i}-{end_i}", A_I_chunk)
 
         # Gather chunks from all GPUs along token dimension (dim=1)
-        A_I = _all_gather_along_dim(A_I_chunk, world_size, dim=1)  # [B, I, c_token]
+        # Pass total_size=I to handle uneven chunk sizes from floor-division-with-remainder
+        A_I = _all_gather_along_dim(A_I_chunk, world_size, dim=1, total_size=I)  # [B, I, c_token]
 
         # MULTI-GPU DIAGNOSTIC: Verify A_I is synchronized after all_gather
         debug_tensor_all_ranks("DIFF_XATTN", "A_I_after_gather", A_I)
@@ -721,7 +796,10 @@ class RFD3DiffusionModule(nn.Module):
         
         tok_idx = f["atom_to_token_map"]                   # [L]
         L = len(tok_idx)
-        I = tok_idx.max() + 1                              # Number of tokens
+        # Use S_I.shape[0] as canonical token count instead of tok_idx.max() + 1
+        # tok_idx.max() can give wrong count if there are special tokens or padding
+        # S_I comes from the encoder and has the correct token dimension
+        I = S_I.shape[0]                                   # Number of tokens
 
         # DIAGNOSTIC: Log input shapes at model entry (auto-detects mode from env)
         debug_ctx.auto_detect_mode()
@@ -764,7 +842,8 @@ class RFD3DiffusionModule(nn.Module):
         R_noisy_L = self.scale_positions_in(X_noisy_L, t_L)  # [B, L, 3]
 
         # ... Pool initial representation to sequence level
-        A_I = self.process_a(R_noisy_L, tok_idx=tok_idx)   # [B, I, c_token]
+        # Pass I explicitly to ensure consistent token count with S_I
+        A_I = self.process_a(R_noisy_L, tok_idx=tok_idx, I=I)   # [B, I, c_token]
         S_I = self.downcast_c(C_L, S_I, tok_idx=tok_idx)   # [I, c_s]
 
         # ... Add batch-wise features to inputs
@@ -773,11 +852,17 @@ class RFD3DiffusionModule(nn.Module):
         S_I = S_I.unsqueeze(0) + self.process_time_(t_I, i=1)    # [B, I, c_s]
         C_L = C_L + self.process_c(C_L)                          # [B, L, c_atom]
 
+        # MEMORY TRACKING: Log key tensor memory usage to verify bottleneck hypothesis
+        debug_memory("DIFFUSION", "after_atom_features")
+        debug_tensor_memory("DIFFUSION", "Q_L", Q_L)
+        debug_tensor_memory("DIFFUSION", "C_L", C_L)
+        debug_tensor_memory("DIFFUSION", "S_I", S_I)
+
         # ... Run Local-Atom Self Attention and Pool
-        # Parallel mode: =0 or unset → standard, =1 → parallel (GPU count auto-detected)
+        # Parallel mode: =0 or unset → standard, any non-zero value → parallel
         attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
         attn_parallel_enabled = (
-            attn_parallel == "1"
+            attn_parallel not in ("0", "", "false", "False")
             and dist.is_initialized()
             and dist.get_world_size() > 1
         )
@@ -788,9 +873,9 @@ class RFD3DiffusionModule(nn.Module):
             rank = dist.get_rank()
             world_size = dist.get_world_size()
             L = Q_L.shape[1]
-            L_par = (L + world_size - 1) // world_size
-            query_start = rank * L_par
-            query_end = min(query_start + L_par, L)
+            chunk_ranges = compute_chunk_ranges(L, world_size)
+            query_start, query_end = chunk_ranges[rank] if rank < len(chunk_ranges) else (L, L)
+            L_par = query_end - query_start
             
             def all_gather_concat(tensor, ws, dim):
                 # =======================================================================
@@ -813,7 +898,9 @@ class RFD3DiffusionModule(nn.Module):
                     # Use single flat output tensor instead of list of ws tensors
                     flat_input = tensor.view(-1)
                     flat_output = torch.empty(flat_input.numel() * ws, dtype=tensor.dtype, device=tensor.device)
-                    dist.all_gather_into_tensor(flat_output, flat_input)
+                    timed_all_gather(flat_output, flat_input,
+                                     "ALL_GATHER", "diffusion_module.all_gather_concat.data",
+                                     gather_type="all_gather_into_tensor")
 
                     # Reshape back to proper dimensions
                     chunk_shape = list(tensor.shape)
@@ -833,30 +920,53 @@ class RFD3DiffusionModule(nn.Module):
                 else:
                     # Fallback with explicit cleanup
                     gathered = [torch.zeros_like(tensor) for _ in range(ws)]
-                    dist.all_gather(gathered, tensor)
+                    timed_all_gather(gathered, tensor,
+                                     "ALL_GATHER", "diffusion_module.all_gather_concat.data_fallback",
+                                     gather_type="all_gather")
                     result = torch.cat(gathered, dim=dim)
                     del gathered  # Free ws tensors immediately
                     return result
                 # --- END NEW IMPLEMENTATION ---
             
             # Use parallel encoder - each GPU handles L_par atoms
-            Q_L = self.encoder.forward_parallel(
-                Q_L=Q_L,
-                C_L=C_L,
-                indices=f["attn_indices"],
-                query_start=query_start,
-                query_end=query_end,
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-                all_gather_fn=all_gather_concat,
-                world_size=world_size,
-            )                                              # [B, L, c_atom]
+            with debug_time("DIFFUSION", "encoder_parallel"):
+                Q_L = self.encoder.forward_parallel(
+                    Q_L=Q_L,
+                    C_L=C_L,
+                    indices=f["attn_indices"],
+                    query_start=query_start,
+                    query_end=query_end,
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                    all_gather_fn=all_gather_concat,
+                    world_size=world_size,
+                )                                              # [B, L, c_atom]
             
             # Move all tensors and modules to this rank's device (Q_L is now on LOCAL_RANK's device)
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
             local_device = torch.device(f"cuda:{local_rank}")
-            self.to(local_device)  # Move all sub-modules (downcast_q, etc.) to local device
+
+            # CRITICAL: Explicitly move the model and verify the move completed
+            # In multi-node setups with EMA/Fabric wrapping, self.to() may not fully work
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+            # First, move self to the local device
+            self.to(local_device)
+
+            # Verify a sample parameter is now on the correct device
+            try:
+                sample_param = next(self.diffusion_token_encoder.parameters())
+                if sample_param.device != local_device:
+                    print(f"[RANK{rank}] WARNING: diffusion_token_encoder still on {sample_param.device} after self.to()", flush=True)
+                    # Force move the encoder specifically
+                    self.diffusion_token_encoder = self.diffusion_token_encoder.to(local_device)
+            except StopIteration:
+                pass
+
+            # Synchronize to ensure all device moves are complete
+            torch.cuda.synchronize(local_device)
+
             tok_idx = tok_idx.to(local_device)
             A_I = A_I.to(local_device)
             S_I = S_I.to(local_device)
@@ -864,16 +974,35 @@ class RFD3DiffusionModule(nn.Module):
             X_noisy_L = X_noisy_L.to(local_device)
             R_L_uniform = R_L_uniform.to(local_device)
             t_L = t_L.to(local_device)
+            # CRITICAL: Move f dict tensors to local_device (multi-node fix)
+            # f was moved to device=X_noisy_L.device earlier, but that may differ from local_device
+            # in multi-node setups where parallel encoder changes the device context
+            for key, val in f.items():
+                if isinstance(val, torch.Tensor) and val.device != local_device:
+                    f[key] = val.to(local_device)
+            # Also move Z_II to local_device if it's a tensor
+            if hasattr(Z_II, 'device') and Z_II.device != local_device:
+                Z_II = Z_II.to(local_device)
+            # CRITICAL: Update initializer_outputs with moved tensors
+            # initializer_outputs contains references to old tensors that must also be updated
+            if initializer_outputs is not None:
+                for key in ['Z_II', 'S_I', 'C_L', 'Q_L_init']:
+                    if key in initializer_outputs:
+                        val = initializer_outputs[key]
+                        if hasattr(val, 'device') and val.device != local_device:
+                            initializer_outputs[key] = val.to(local_device)
         elif chunked_pairwise_embedder is not None:
             # Low-memory mode: sparse P_LL but single GPU
-            Q_L = self.encoder(
-                Q_L, C_L, P_LL=None, indices=f["attn_indices"],
-                f=f, chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-            )                                              # [B, L, c_atom]
+            with debug_time("DIFFUSION", "encoder_low_memory"):
+                Q_L = self.encoder(
+                    Q_L, C_L, P_LL=None, indices=f["attn_indices"],
+                    f=f, chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                )                                              # [B, L, c_atom]
         else:
             # Standard mode: use full P_LL
-            Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])  # [B, L, c_atom]
+            with debug_time("DIFFUSION", "encoder_standard"):
+                Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])  # [B, L, c_atom]
         
         # DIAGNOSTIC: Log Q_L after encoder
         _log_tensor_stats("Q_L_after_encoder", Q_L)
@@ -1010,17 +1139,23 @@ class RFD3DiffusionModule(nn.Module):
             z_chunk_range = initializer_outputs.get("z_chunk_range")
 
         # ... Embed token level features with atom level encodings
-        S_I, Z_II = self.diffusion_token_encoder(
-            f=f,
-            R_L=R_L_uniform,                               # [B, L, 3]
-            D_II_self=D_II_self,                           # [B, I, I, n_bins] or None
-            S_init_I=S_I,                                  # [B, I, c_s]
-            Z_init_II=Z_II,                                # [I, I, c_z] or [I_par, I, c_z]
-            C_L=C_L,                                       # [B, L, c_atom]
-            P_LL=P_LL,                                     # [L, L, c_atompair] or None
-            streaming_mode=streaming_mode,
-            z_chunk_range=z_chunk_range,
-        )                                                  # Returns: [I, c_s], [I, I, c_z] or [I_par, I, c_z]
+        with debug_time("DIFFUSION", "diffusion_token_encoder"):
+            S_I, Z_II = self.diffusion_token_encoder(
+                f=f,
+                R_L=R_L_uniform,                               # [B, L, 3]
+                D_II_self=D_II_self,                           # [B, I, I, n_bins] or None
+                S_init_I=S_I,                                  # [B, I, c_s]
+                Z_init_II=Z_II,                                # [I, I, c_z] or [I_par, I, c_z]
+                C_L=C_L,                                       # [B, L, c_atom]
+                P_LL=P_LL,                                     # [L, L, c_atompair] or None
+                streaming_mode=streaming_mode,
+                z_chunk_range=z_chunk_range,
+            )                                                  # Returns: [I, c_s], [I, I, c_z] or [I_par, I, c_z]
+
+        # MEMORY TRACKING: Log token tensor memory after diffusion_token_encoder
+        debug_memory("DIFFUSION", "after_token_encoder")
+        debug_tensor_memory("DIFFUSION", "S_I_after_encoder", S_I)
+        debug_tensor_memory("DIFFUSION", "Z_II_after_encoder", Z_II)
 
         # Determine full mode for transformer
         gpu_rank, world_size = _get_gpu_rank_and_world_size()
@@ -1041,35 +1176,36 @@ class RFD3DiffusionModule(nn.Module):
             initializer_outputs["z_chunk_range"] = z_chunk_range
 
         # ... Diffusion transformer with GPU-parallel attention
-        if z_is_chunked:
-            # Multi-GPU parallel: each GPU processes its query chunk
-            A_I = self._diffusion_transformer_parallel(
-                A_I=A_I,                                   # [B, I, c_token]
-                S_I=S_I,                                   # [I, c_s]
-                Z_II_chunk=Z_II,                           # [I_par, I, c_z] - this GPU's rows
-                f=f,
-                X_L=(
-                    X_noisy_L[..., f["is_ca"], :]
-                    if X_L_self is None
-                    else X_L_self[..., f["is_ca"], :]
-                ),
-                gpu_rank=gpu_rank,
-                world_size=world_size,
-            )                                              # [B, I, c_token] (all_gathered)
-        else:
-            # Standard mode
-            A_I = self.diffusion_transformer(
-                A_I,                                       # [B, I, c_token]
-                S_I,                                       # [I, c_s] or [B, I, c_s]
-                Z_II,                                      # [I, I, c_z] or [B, I, I, c_z]
-                f=f,
-                X_L=(
-                    X_noisy_L[..., f["is_ca"], :]
-                    if X_L_self is None
-                    else X_L_self[..., f["is_ca"], :]
-                ),
-                full=use_full_attention,
-            )                                              # [B, I, c_token]
+        with debug_time("DIFFUSION", "diffusion_transformer"):
+            if z_is_chunked:
+                # Multi-GPU parallel: each GPU processes its query chunk
+                A_I = self._diffusion_transformer_parallel(
+                    A_I=A_I,                                   # [B, I, c_token]
+                    S_I=S_I,                                   # [I, c_s]
+                    Z_II_chunk=Z_II,                           # [I_par, I, c_z] - this GPU's rows
+                    f=f,
+                    X_L=(
+                        X_noisy_L[..., f["is_ca"], :]
+                        if X_L_self is None
+                        else X_L_self[..., f["is_ca"], :]
+                    ),
+                    gpu_rank=gpu_rank,
+                    world_size=world_size,
+                )                                              # [B, I, c_token] (all_gathered)
+            else:
+                # Standard mode
+                A_I = self.diffusion_transformer(
+                    A_I,                                       # [B, I, c_token]
+                    S_I,                                       # [I, c_s] or [B, I, c_s]
+                    Z_II,                                      # [I, I, c_z] or [B, I, I, c_z]
+                    f=f,
+                    X_L=(
+                        X_noisy_L[..., f["is_ca"], :]
+                        if X_L_self is None
+                        else X_L_self[..., f["is_ca"], :]
+                    ),
+                    full=use_full_attention,
+                )                                              # [B, I, c_token]
 
         # DIAGNOSTIC: Log A_I after diffusion transformer
         _log_tensor_stats("A_I_after_transformer", A_I)
@@ -1084,60 +1220,61 @@ class RFD3DiffusionModule(nn.Module):
         # | True         | None             | PARALLEL: P_chunk cross-attention |
         # | True         | Present          | BOTH: sparse P_LL across GPUs     |
         #
-        if z_is_chunked and chunked_pairwise_embedder is not None:
-            # BOTH modes: Sparse P_LL computation split across GPUs
-            # Most memory efficient: each GPU computes sparse P_LL for its L_par atoms
-            A_I, Q_L, o = self._decoder_parallel_sparse(
-                A_I=A_I,                                   # [B, I, c_token]
-                S_I=S_I,                                   # [I, c_s]
-                Q_L=Q_L,                                   # [B, L, c_atom]
-                C_L=C_L,                                   # [B, L, c_atom]
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-                gpu_rank=gpu_rank,
-                world_size=world_size,
-            )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
-        elif z_is_chunked:
-            # PARALLEL only: cross-attention with P_chunk [L_par, L]
-            # Each GPU computes full P for its query chunk
-            A_I, Q_L, o = self._decoder_parallel(
-                A_I=A_I,                                   # [B, I, c_token]
-                S_I=S_I,                                   # [I, c_s]
-                Q_L=Q_L,                                   # [B, L, c_atom]
-                C_L=C_L,                                   # [B, L, c_atom]
-                f=f,
-                initializer_outputs=initializer_outputs,
-                gpu_rank=gpu_rank,
-                world_size=world_size,
-            )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
-        elif chunked_pairwise_embedder is not None:
-            # LOW_MEM only: sparse P_LL via chunked_pairwise_embedder
-            A_I, Q_L, o = self.decoder(
-                A_I,                                       # [B, I, c_token]
-                S_I,                                       # [I, c_s] or [B, I, c_s]
-                None,                                      # Decoder doesn't use Z_II directly
-                Q_L,                                       # [B, L, c_atom]
-                C_L,                                       # [B, L, c_atom]
-                P_LL=None,
-                tok_idx=f["atom_to_token_map"],            # [L]
-                indices=f["attn_indices"],                 # [B, L, k]
-                f=f,
-                chunked_pairwise_embedder=chunked_pairwise_embedder,
-                initializer_outputs=initializer_outputs,
-            )
-        else:
-            # Standard mode: full P_LL [L, L, c_atompair]
-            A_I, Q_L, o = self.decoder(
-                A_I,
-                S_I,
-                Z_II,
-                Q_L,
-                C_L,
-                P_LL=P_LL,
-                tok_idx=f["atom_to_token_map"],
-                indices=f["attn_indices"],
-            )
+        with debug_time("DIFFUSION", "decoder"):
+            if z_is_chunked and chunked_pairwise_embedder is not None:
+                # BOTH modes: Sparse P_LL computation split across GPUs
+                # Most memory efficient: each GPU computes sparse P_LL for its L_par atoms
+                A_I, Q_L, o = self._decoder_parallel_sparse(
+                    A_I=A_I,                                   # [B, I, c_token]
+                    S_I=S_I,                                   # [I, c_s]
+                    Q_L=Q_L,                                   # [B, L, c_atom]
+                    C_L=C_L,                                   # [B, L, c_atom]
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                    gpu_rank=gpu_rank,
+                    world_size=world_size,
+                )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
+            elif z_is_chunked:
+                # PARALLEL only: cross-attention with P_chunk [L_par, L]
+                # Each GPU computes full P for its query chunk
+                A_I, Q_L, o = self._decoder_parallel(
+                    A_I=A_I,                                   # [B, I, c_token]
+                    S_I=S_I,                                   # [I, c_s]
+                    Q_L=Q_L,                                   # [B, L, c_atom]
+                    C_L=C_L,                                   # [B, L, c_atom]
+                    f=f,
+                    initializer_outputs=initializer_outputs,
+                    gpu_rank=gpu_rank,
+                    world_size=world_size,
+                )                                              # A_I: [B, I, c_token], Q_L: [B, L, c_atom]
+            elif chunked_pairwise_embedder is not None:
+                # LOW_MEM only: sparse P_LL via chunked_pairwise_embedder
+                A_I, Q_L, o = self.decoder(
+                    A_I,                                       # [B, I, c_token]
+                    S_I,                                       # [I, c_s] or [B, I, c_s]
+                    None,                                      # Decoder doesn't use Z_II directly
+                    Q_L,                                       # [B, L, c_atom]
+                    C_L,                                       # [B, L, c_atom]
+                    P_LL=None,
+                    tok_idx=f["atom_to_token_map"],            # [L]
+                    indices=f["attn_indices"],                 # [B, L, k]
+                    f=f,
+                    chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                )
+            else:
+                # Standard mode: full P_LL [L, L, c_atompair]
+                A_I, Q_L, o = self.decoder(
+                    A_I,
+                    S_I,
+                    Z_II,
+                    Q_L,
+                    C_L,
+                    P_LL=P_LL,
+                    tok_idx=f["atom_to_token_map"],
+                    indices=f["attn_indices"],
+                )
 
         # DIAGNOSTIC: Log Q_L after decoder
         _log_tensor_stats("Q_L_after_decoder", Q_L)

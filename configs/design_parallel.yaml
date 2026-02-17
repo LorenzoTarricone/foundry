@@ -5,15 +5,15 @@
 #
 # SETUP:
 #   1. Allocate GPUs:  srun --gpus=4 --time=03:00:00 --pty /bin/bash --login
-#   2. Run script:     python scripts/design_parallel.py --config config/design_parallel.yaml
+#   2. Run script:     python scripts/design_parallel.py --config configs/design_parallel.yaml
 #
 # Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
 
 # Output settings
-out_dir: "inference_outputs/design_I_173AAASU_parallel"
+out_dir: "inference_outputs/design_I_170AAASU_parallel"
 
 # Protein design parameters 
-length: 173  # Length of protein to design (in amino acids)
+length: 170  # Length of protein to design (in amino acids)
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)

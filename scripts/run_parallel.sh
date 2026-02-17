@@ -90,15 +90,25 @@ echo ""
 # Isambard has 4 GPUs per node
 GPUS_PER_NODE=4
 
-# Try to read attention_parallel_factor from config to determine exact GPU count
-REQUESTED_GPUS=${SLURM_GPUS:-8}
-if [ -f "$CONFIG_FILE" ]; then
-    # Extract attention_parallel_factor from YAML (if present)
+# Determine GPU count. Priority:
+#   1. sbatch --gpus=N  (SLURM_GPUS is set by sbatch CLI)
+#   2. attention_parallel_factor from config YAML
+#   3. Fallback: 8
+if [ -n "$SLURM_GPUS" ]; then
+    REQUESTED_GPUS=$SLURM_GPUS
+    echo "Using --gpus=$SLURM_GPUS from sbatch CLI"
+elif [ -f "$CONFIG_FILE" ]; then
     APF=$(grep -E "^attention_parallel_factor:" "$CONFIG_FILE" 2>/dev/null | awk '{print $2}')
     if [ -n "$APF" ] && [ "$APF" != "null" ] && [ "$APF" -gt 0 ] 2>/dev/null; then
         REQUESTED_GPUS=$APF
         echo "Using attention_parallel_factor=$APF from config"
+    else
+        REQUESTED_GPUS=8
+        echo "No GPU count specified, defaulting to 8"
     fi
+else
+    REQUESTED_GPUS=8
+    echo "No GPU count specified, defaulting to 8"
 fi
 
 # Calculate nodes needed (round up)

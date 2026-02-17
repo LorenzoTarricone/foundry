@@ -8,6 +8,7 @@ from rfd3.model.cfg_utils import (
 )
 from rfd3.model.inference_sampler import ConditionalDiffusionSampler
 from rfd3.model.layers.encoders import TokenInitializer
+from rfd3.model.RFD3_diffusion_module import RFD3DiffusionModule
 from torch import nn
 
 from foundry.utils.ddp import RankedLogger
@@ -75,20 +76,53 @@ class RFD3(nn.Module):
         if low_mem and attn_parallel:
             ranked_logger.info("  -> Combined: Sparse P_LL split across GPUs (maximum memory savings)")
 
-        # Simple constant-feature initializer
-        self.token_initializer = TokenInitializer(
-            c_s=c_s,
-            c_z=c_z,
-            c_atom=c_atom,
-            c_atompair=c_atompair,
-            use_chunked_pll=use_chunked_pll,
-            **token_initializer,
-        )
+        # Factory pattern: instantiate parallel vs standard classes based on attn_parallel
+        if attn_parallel:
+            # Import parallel classes only when needed
+            from rfd3.model.parallel.layers.encoders import ParallelTokenInitializer
+            from rfd3.model.parallel.diffusion_module import ParallelDiffusionModule
 
-        # Diffusion module instantiated to allow for config scripting
-        self.diffusion_module = hydra.utils.instantiate(
-            diffusion_module, c_atom=c_atom, c_atompair=c_atompair, c_s=c_s, c_z=c_z
-        )
+            ranked_logger.info("  -> Using parallel classes: ParallelTokenInitializer, ParallelDiffusionModule")
+
+            # Use parallel token initializer
+            self.token_initializer = ParallelTokenInitializer(
+                c_s=c_s,
+                c_z=c_z,
+                c_atom=c_atom,
+                c_atompair=c_atompair,
+                use_chunked_pll=use_chunked_pll,
+                **token_initializer,
+            )
+
+            # Manually instantiate parallel diffusion module
+            # (can't use hydra.utils.instantiate because we need ParallelDiffusionModule class)
+            diffusion_module_config = dict(diffusion_module)
+            diffusion_module_config.pop("_target_", None)  # Remove _target_ if present
+            self.diffusion_module = ParallelDiffusionModule(
+                c_atom=c_atom,
+                c_atompair=c_atompair,
+                c_s=c_s,
+                c_z=c_z,
+                **diffusion_module_config,
+            )
+        else:
+            # Use standard classes
+            ranked_logger.info("  -> Using standard classes: TokenInitializer, RFD3DiffusionModule")
+
+            # Simple constant-feature initializer
+            self.token_initializer = TokenInitializer(
+                c_s=c_s,
+                c_z=c_z,
+                c_atom=c_atom,
+                c_atompair=c_atompair,
+                use_chunked_pll=use_chunked_pll,
+                **token_initializer,
+            )
+
+            # Diffusion module instantiated to allow for config scripting
+            self.diffusion_module = hydra.utils.instantiate(
+                diffusion_module, c_atom=c_atom, c_atompair=c_atompair, c_s=c_s, c_z=c_z
+            )
 
         self.use_classifier_free_guidance = (
             inference_sampler["use_classifier_free_guidance"]

@@ -1,3 +1,4 @@
+
 import logging
 import math
 import os
@@ -29,20 +30,15 @@ from rfd3.model.layers.layer_utils import (
 )
 from rfd3.model.layers.pairformer_layers import PairformerBlock
 from rfd3.model.layers.streaming import compute_chunk_ranges
-from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log
+from rfd3.model.debug_context import debug_ctx, debug_tensor, debug_log, timed_all_gather
 from torch.nn.functional import one_hot
 
 logger = logging.getLogger(__name__)
 
-# Diagnostic flag
-PARALLEL_DEBUG = True  # Hardcoded for debugging
-
-
 def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
-    """Log tensor statistics for debugging."""
-    if not PARALLEL_DEBUG:
+    """Log tensor statistics for debugging. Controlled by verbose_stats config flag."""
+    if not debug_ctx.stats_enabled:
         return
-    # Use centralized debug context for consistent formatting
     debug_tensor("BLOCKS", name, tensor, rank)
 
 from foundry import DISABLE_CHECKPOINTING
@@ -340,9 +336,20 @@ class LinearEmbedWithPool(nn.Module):
         self.c_token = c_token
         self.linear = linearNoBias(3, c_token)
 
-    def forward(self, R_L, tok_idx):
+    def forward(self, R_L, tok_idx, I=None):
+        """
+        Pool atom features to token level.
+
+        Args:
+            R_L: [B, L, 3] atom positions
+            tok_idx: [L] atom-to-token mapping
+            I: Optional token count. If None, computed from tok_idx.max() + 1.
+               Pass explicitly when tok_idx may have inconsistent indices
+               (e.g., in parallel mode where S_I.shape[0] is the canonical count).
+        """
         B = R_L.shape[0]
-        I = int(tok_idx.max().item()) + 1
+        if I is None:
+            I = int(tok_idx.max().item()) + 1
         A_I_shape = (
             B,
             I,
@@ -432,10 +439,10 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             2 * self.num_tok_pos_bins + (2 * self.s_max + 2) + 1, c_z
         )
         self.chunk_size = None
-        # If attention parallel is enabled (=1), stream RPE computation to avoid full LxL materialization
+        # If attention parallel is enabled, stream RPE computation to avoid full LxL materialization
         # GPU count is auto-detected from dist.get_world_size() at runtime
         attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-        if attn_parallel == "1":
+        if attn_parallel not in ("0", "", "false", "False"):
             # Marker that chunking is enabled; actual chunk count determined at runtime
             self.chunk_size = -1  # Will use dist.get_world_size() in _forward_chunked
 
@@ -583,20 +590,25 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
     def forward_chunk(self, f: dict, start_i: int, end_i: int) -> torch.Tensor:
         """
         Compute RPE for a specific row range (query chunk) against all columns (keys).
-        
+
         For streaming mode: computes [I_par, I, c_z] instead of full [I, I, c_z].
-        
+
+        Memory optimization: Processes in sub-chunks to avoid creating ~21GB of
+        one-hot tensors at once. Each one-hot tensor is [I_par, I, ~66] in float32,
+        which is ~7GB for I_par=2550, I=10200. Processing in sub-chunks reduces
+        peak memory from ~21GB to ~5GB.
+
         Args:
             f: Feature dictionary containing asym_id, entity_id, residue_index, etc.
             start_i: Start index for query tokens
             end_i: End index for query tokens
-            
+
         Returns:
             rpe_chunk: [I_par, I, c_z] relative position encoding for query chunk
         """
         I_par = end_i - start_i  # Number of queries
         qs = slice(start_i, end_i)
-        
+
         # Get 1D arrays
         asym = f["asym_id"]           # [I]
         entity = f["entity_id"]       # [I]
@@ -604,11 +616,11 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
         token_idx = f["token_index"]  # [I]
         sym_id = f["sym_id"]          # [I]
         unindex_mask = f["unindexing_pair_mask"]  # [I, I]
-        
+
         # Compute pairwise comparisons: [I_par, I]
         b_samechain = asym[qs, None] == asym[None, :]     # [I_par, I]
         b_same_entity = entity[qs, None] == entity[None, :]  # [I_par, I]
-        
+
         # Residue distances: [I_par, I]
         res_diff = residue[qs, None] - residue[None, :]
         d_res = torch.where(
@@ -616,7 +628,7 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             torch.clip(res_diff + self.r_max, 0, 2 * self.r_max),
             2 * self.r_max + 1,
         )  # [I_par, I]
-        
+
         # Token distances: [I_par, I]
         b_sameres = residue[qs, None] == residue[None, :]
         tok_diff = token_idx[qs, None] - token_idx[None, :] + self.r_max
@@ -625,7 +637,7 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             torch.clip(tok_diff, 0, 2 * self.r_max),
             2 * self.r_max + 1,
         )  # [I_par, I]
-        
+
         # Chain distances: [I_par, I]
         sym_diff = sym_id[qs, None] - sym_id[None, :]
         d_chain = torch.where(
@@ -633,24 +645,48 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             torch.clip(sym_diff + self.s_max, 0, 2 * self.s_max),
             2 * self.s_max + 1,
         )  # [I_par, I]
-        
+
         # Apply unindexing mask: [I_par, I]
         unmask = unindex_mask[qs, :]
         d_tok[unmask] = self.num_tok_pos_bins - 1
         d_res[unmask] = self.num_tok_pos_bins - 1
-        
-        # One-hot encodings: [I_par, I, num_bins]
-        A_res = one_hot(d_res.long(), self.num_tok_pos_bins)    # [I_par, I, num_tok_pos_bins]
-        A_tok = one_hot(d_tok.long(), self.num_tok_pos_bins)    # [I_par, I, num_tok_pos_bins]
-        A_chain = one_hot(d_chain.long(), 2 * self.s_max + 2)   # [I_par, I, 2*s_max+2]
-        
-        # Concatenate features and project: [I_par, I, c_z]
-        feats = torch.cat(
-            [A_res, A_tok, b_same_entity.unsqueeze(-1).float(), A_chain], 
-            dim=-1
-        )  # [I_par, I, input_dim]
-        
-        return self.linear(feats)  # [I_par, I, c_z]
+
+        # Free intermediate tensors no longer needed
+        del b_samechain, b_sameres, res_diff, tok_diff, sym_diff, unmask
+
+        # ============================================================
+        # MEMORY OPTIMIZATION: Process one-hot encoding in sub-chunks
+        # ============================================================
+        # Each one-hot tensor is [sub_I_par, I, ~66] in float32.
+        # Without sub-chunking: 3 tensors * 7GB = ~21GB peak memory.
+        # With sub-chunking (4 sub-chunks): ~5GB peak memory.
+        # ============================================================
+        sub_chunk_size = max(1, I_par // 4)  # Process in 4 sub-chunks
+        outputs = []
+
+        for sub_start in range(0, I_par, sub_chunk_size):
+            sub_end = min(sub_start + sub_chunk_size, I_par)
+            sub_qs = slice(sub_start, sub_end)
+
+            # Create smaller one-hot tensors for this sub-chunk
+            A_res = one_hot(d_res[sub_qs].long(), self.num_tok_pos_bins)
+            A_tok = one_hot(d_tok[sub_qs].long(), self.num_tok_pos_bins)
+            A_chain = one_hot(d_chain[sub_qs].long(), 2 * self.s_max + 2)
+
+            # Concatenate features and project: [sub_I_par, I, c_z]
+            feats = torch.cat(
+                [A_res, A_tok, b_same_entity[sub_qs].unsqueeze(-1).float(), A_chain],
+                dim=-1
+            )
+            outputs.append(self.linear(feats))
+
+            # Free one-hot tensors immediately
+            del A_res, A_tok, A_chain, feats
+
+        # Free distance tensors
+        del d_res, d_tok, d_chain, b_same_entity
+
+        return torch.cat(outputs, dim=0)  # [I_par, I, c_z]
 
 
 class VirtualPredictor(nn.Module):
@@ -981,22 +1017,55 @@ class LocalTokenTransformer(nn.Module):
             
             local_len = torch.tensor([chunk.shape[1]], device=device, dtype=torch.long)
             lens = [torch.zeros_like(local_len) for _ in range(world_size)]
-            dist.all_gather(lens, local_len)
+            timed_all_gather(lens, local_len,
+                             "ALL_GATHER", f"blocks._gather_updated_tokens.lens.block{block_idx}",
+                             gather_type="all_gather")
             max_len = int(torch.stack(lens).max().item())
             
             if chunk.shape[1] < max_len:
                 pad_len = max_len - chunk.shape[1]
                 chunk = F.pad(chunk, (0, 0, 0, pad_len))  # pad length dim
             
-            gathered = [
-                torch.zeros_like(chunk) for _ in range(world_size)
-            ]
-            dist.all_gather(gathered, chunk)
-            
-            trimmed = []
-            for g, l in zip(gathered, lens):
-                trimmed.append(g[:, : int(l.item()), :])
-            
+            # --- OLD IMPLEMENTATION (creates world_size tensors per GPU) ---
+            # gathered = [
+            #     torch.zeros_like(chunk) for _ in range(world_size)
+            # ]
+            # dist.all_gather(gathered, chunk)
+            # trimmed = []
+            # for g, l in zip(gathered, lens):
+            #     trimmed.append(g[:, : int(l.item()), :])
+            # --- END OLD IMPLEMENTATION ---
+
+            # --- NEW MEMORY-EFFICIENT IMPLEMENTATION ---
+            # Uses all_gather_into_tensor to avoid O(world_size) tensor allocations per GPU
+            chunk = chunk.contiguous()
+
+            if hasattr(dist, 'all_gather_into_tensor'):
+                flat_input = chunk.view(-1)
+                flat_output = torch.empty(flat_input.numel() * world_size, dtype=chunk.dtype, device=chunk.device)
+                timed_all_gather(flat_output, flat_input,
+                                 "ALL_GATHER", f"blocks._gather_updated_tokens.data.block{block_idx}",
+                                 gather_type="all_gather_into_tensor")
+
+                B, _, C = chunk.shape
+                reshaped = flat_output.view(world_size, B, max_len, C)
+
+                trimmed = []
+                for i, l in enumerate(lens):
+                    trimmed.append(reshaped[i, :, : int(l.item()), :])
+                del flat_input, flat_output, reshaped  # Explicit cleanup
+            else:
+                # Fallback with explicit cleanup
+                gathered = [torch.zeros_like(chunk) for _ in range(world_size)]
+                timed_all_gather(gathered, chunk,
+                                 "ALL_GATHER", f"blocks._gather_updated_tokens.data_fallback.block{block_idx}",
+                                 gather_type="all_gather")
+                trimmed = []
+                for g, l in zip(gathered, lens):
+                    trimmed.append(g[:, : int(l.item()), :])
+                del gathered
+            # --- END NEW IMPLEMENTATION ---
+
             # Debug: log gather layout once (block 0, rank 0)
             if block_idx == 0 and rank == 0:
                 lens_py = [int(l.item()) for l in lens]
@@ -1040,7 +1109,7 @@ class LocalTokenTransformer(nn.Module):
         for block_idx, block in enumerate(self.blocks):
             block.attention_pair_bias.use_checkpointing = not DISABLE_CHECKPOINTING
             
-            if rank == 0:
+            if rank == 0 and debug_ctx.stats_enabled:
                 with torch.no_grad():
                     def _stat(t):
                         return {
@@ -1060,7 +1129,7 @@ class LocalTokenTransformer(nn.Module):
                         },
                         flush=True,
                     )
-            
+
             # Cross-attention: chunk queries → all keys
             A_I_chunk = block.forward_cross_attn(
                 Q_chunk=A_I_chunk,                  # [B, I_par, c_token]
@@ -1076,16 +1145,16 @@ class LocalTokenTransformer(nn.Module):
             # Refresh local chunk slice for next iteration
             query_start, query_end = chunk_ranges[rank]
             A_I_chunk = A_I_full[:, query_start:query_end, :]
-            # Refresh dependent slices to stay aligned
-            indices_chunk = _compute_indices_chunk(query_start, query_end)
-            S_I_chunk = _slice_S_I_chunk(query_start, query_end)
-            Z_local_chunk = _slice_Z_chunk(Z_chunk, query_start, query_end)
+            # NOTE: indices_chunk, S_I_chunk, Z_local_chunk are NOT recomputed here.
+            # They depend only on X_L, S_I_full, Z_chunk, and query_start/query_end —
+            # all of which are constant across block iterations. The values computed
+            # before the loop (lines 1097-1099) are reused.
             
             if block_idx == 0 and rank == 0:
                 debug_log("BLOCKS", "post-gather block0",
                           f"A_I_full.shape={list(A_I_full.shape)}, slice=({query_start},{query_end}), "
                           f"indices_chunk.shape={list(indices_chunk.shape)}, Z_local_chunk.shape={list(Z_local_chunk.shape)}")
-            if rank == 0:
+            if rank == 0 and debug_ctx.stats_enabled:
                 with torch.no_grad():
                     def _stat(t):
                         return {
