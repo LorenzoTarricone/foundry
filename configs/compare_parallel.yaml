@@ -22,8 +22,18 @@ symmetry: I
 mpnn_batch_size: 5
 
 # Parallel processing
-attention_parallel_factor: null  # Auto-detect from allocated GPUs
-low_memory_mode: true
+# The script auto-detects allocated GPUs from CUDA_VISIBLE_DEVICES
+# Set attention_parallel_factor to override (e.g., 2 to use only 2 of 4 allocated GPUs)
+attention_parallel_factor: 2
+low_memory_mode: true  # Use structure local sequence local attention indices
+extra_chunking: false  # Further chunking to reduce memory at cost of speed
+
+# Debug verbosity flags (controlled by debug_context.py)
+# All default to false for production runs
+verbose: false           # Master flag: enables ALL debug logging
+verbose_stats: true     # Tensor statistics (.float().mean()/.std() on large tensors - expensive!)
+verbose_time: false      # Timing for each pipeline phase
+verbose_memory: false     # GPU memory tracking at key stages
 
 # Reproducibility
 seed: 42

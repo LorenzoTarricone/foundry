@@ -180,13 +180,14 @@ def build_rfd3_spec(length: int, symmetry: str = None):
 
 
 def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sampler: dict,
-                       ckpt_path: str, seed: int) -> torch.Tensor:
+                       ckpt_path: str, seed: int, out_dir: Path = None) -> torch.Tensor:
     """Run standard (1 GPU) inference and return coordinates."""
     # CRITICAL: Set seed BEFORE any rfd3 imports to ensure deterministic behavior
     # Module imports can consume random numbers during initialization
     print(f"  Setting seed={seed} BEFORE imports...")
     set_seed(seed)
 
+    from atomworks.io.utils.io_utils import to_cif_file
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
     from rfd3.model.debug_context import debug_ctx
 
@@ -225,19 +226,26 @@ def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sample
                 if hasattr(rfd3_output, 'atom_array') and hasattr(rfd3_output.atom_array, 'coord'):
                     X = torch.from_numpy(rfd3_output.atom_array.coord).float()
                     print(f"  Extracted X_std: shape {X.shape}")
+                    if out_dir:
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        cif_path = str(out_dir / "standard_backbone.cif")
+                        to_cif_file(rfd3_output.atom_array, cif_path)
+                        print(f"  Saved standard backbone CIF to: {cif_path}")
                     break
 
     return X
 
 
 def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_inference_sampler: dict,
-                                   ckpt_path: str, seed: int, output_cache: str) -> int:
+                                   ckpt_path: str, seed: int, output_cache: str,
+                                   out_dir: Path = None) -> int:
     """Run parallel (N GPU) inference in distributed mode and save results."""
     # CRITICAL: Set seed BEFORE any rfd3 imports to ensure deterministic behavior
     # Module imports can consume random numbers during initialization
     # NOTE: set_seed uses torch which is already imported at module level
     set_seed(seed)
 
+    from atomworks.io.utils.io_utils import to_cif_file
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
     from rfd3.model.debug_context import debug_ctx
 
@@ -298,6 +306,11 @@ def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_infe
                     if hasattr(rfd3_output, 'atom_array') and hasattr(rfd3_output.atom_array, 'coord'):
                         X = torch.from_numpy(rfd3_output.atom_array.coord).float()
                         log(f"  Extracted X_par: shape {X.shape}")
+                        if out_dir:
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            cif_path = str(out_dir / "parallel_backbone.cif")
+                            to_cif_file(rfd3_output.atom_array, cif_path)
+                            log(f"  Saved parallel backbone CIF to: {cif_path}")
                         break
 
         # Save to output cache
@@ -356,6 +369,12 @@ def run_orchestrator(config: dict, config_path: str, num_gpus: int, log_dir: Pat
         ckpt_path = get_checkpoint_path(project_root)
         rfd3_spec, rfd3_inference_sampler = build_rfd3_spec(length, symmetry)
 
+        # Setup inference output directories for CIF files
+        inference_out_dir = project_root / "inference_outputs"
+        std_out_dir = inference_out_dir / "standard"
+        par_out_dir = inference_out_dir / "parallel"
+        print(f"Inference outputs: {inference_out_dir.resolve()}")
+
         # ========================================================================
         # PHASE 1: Run Standard Mode (1 GPU)
         # ========================================================================
@@ -363,7 +382,8 @@ def run_orchestrator(config: dict, config_path: str, num_gpus: int, log_dir: Pat
         print("PHASE 1: STANDARD mode (1 GPU)")
         print("="*70)
 
-        X_std = run_standard_mode(project_root, rfd3_spec, rfd3_inference_sampler, ckpt_path, seed)
+        X_std = run_standard_mode(project_root, rfd3_spec, rfd3_inference_sampler, ckpt_path, seed,
+                                  out_dir=std_out_dir)
 
         if X_std is None:
             print("  ERROR: Failed to get standard mode output")
@@ -390,6 +410,7 @@ def run_orchestrator(config: dict, config_path: str, num_gpus: int, log_dir: Pat
             str(Path(__file__).resolve()),
             '--parallel-subprocess',
             '--output-cache', str(par_cache),
+            '--inference-out-dir', str(par_out_dir),
             '--length', str(length),
             '--seed', str(seed),
         ]
@@ -501,6 +522,8 @@ def main():
                         help="[Internal] Run as torchrun subprocess for parallel mode")
     parser.add_argument("--output-cache", type=str, default=None,
                         help="[Internal] Path to save parallel output")
+    parser.add_argument("--inference-out-dir", type=str, default=None,
+                        help="[Internal] Path to save backbone CIF files")
 
     args = parser.parse_args()
 
@@ -538,9 +561,11 @@ def main():
         rfd3_spec, rfd3_inference_sampler = build_rfd3_spec(
             config['length'], config.get('symmetry')
         )
+        inference_out_dir = Path(args.inference_out_dir) if args.inference_out_dir else None
         return run_parallel_mode_distributed(
             project_root, rfd3_spec, rfd3_inference_sampler,
-            ckpt_path, config['seed'], args.output_cache
+            ckpt_path, config['seed'], args.output_cache,
+            out_dir=inference_out_dir
         )
     else:
         # Main orchestrator mode
