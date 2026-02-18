@@ -346,9 +346,19 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             ranked_logger.info(
                 f"Parallel diffusion sampling: GPU {gpu_rank}/{world_size}"
             )
-        
+
         # Motif setup to recenter the motif at every step
         is_motif_atom_with_fixed_coord = f["is_motif_atom_with_fixed_coord"]
+
+        # In multi-GPU mode, ensure tensors are on the correct device for this rank.
+        # fabric.to_device() may place everything on cuda:0, but NCCL expects each
+        # rank's tensors on cuda:{local_rank}.
+        if parallel_mode and world_size > 1:
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+            device = torch.device(f"cuda:{local_rank}")
+            coord_atom_lvl_to_be_noised = coord_atom_lvl_to_be_noised.to(device)
+            if isinstance(is_motif_atom_with_fixed_coord, torch.Tensor):
+                is_motif_atom_with_fixed_coord = is_motif_atom_with_fixed_coord.to(device)
 
         # Book-keeping
         noise_schedule = self._construct_inference_noise_schedule(

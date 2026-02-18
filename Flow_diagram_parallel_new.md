@@ -106,13 +106,17 @@ models/rfd3/src/rfd3/model/
     ├── __init__.py                      # Exports: ParallelTokenInitializer, ParallelDiffusionTokenEncoder, ParallelDiffusionModule
     ├── utils.py                         # Consolidated utilities: is_parallel_mode, all_gather_concat, z_transition_chunked, etc.
     ├── diffusion_module.py              # ParallelDiffusionModule(RFD3DiffusionModule)
+    │                                    #   Methods: _local_token_transformer_cross_attn(),
+    │                                    #            _compact_decoder_parallel(),
+    │                                    #            _compact_decoder_parallel_sparse()
     └── layers/
         ├── __init__.py
         ├── encoders.py                  # ParallelTokenInitializer(TokenInitializer), ParallelDiffusionTokenEncoder(DiffusionTokenEncoder)
-        ├── blocks.py                    # Free functions: local_token_transformer_cross_attn, compact_decoder_parallel, etc.
-        ├── attention.py                 # Free functions: local_attention_cross_attn, local_attention_sparse_cross_attn, sparse_cross_attention
-        ├── pairformer_layers.py         # Free function: attention_pair_bias_forward_chunked
-        └── chunked_pairwise.py          # Free function: chunked_pairwise_forward_parallel
+        ├── blocks.py                    # Free functions: structure_local_atom_block_cross_attn(block, ...),
+        │                                #                 structure_local_atom_block_sparse_cross_attn(block, ...)
+        ├── attention.py                 # Free functions: local_attention_cross_attn(attn, ...), local_attention_sparse_cross_attn(attn, ...), sparse_cross_attention, sparse_cross_attention_pregathered_bias
+        ├── pairformer_layers.py         # Free function: attention_pair_bias_forward_parallel(attn, ...)
+        └── chunked_pairwise.py          # Free function: chunked_pairwise_forward_parallel(embedder, ...)
 ```
 
 ---
@@ -130,7 +134,7 @@ models/rfd3/src/rfd3/model/
 | 3 | `RFD3.forward()` | `RFD3.py:136` | Entry point for inference | `input["f"]` |
 | 4 | `ParallelTokenInitializer.forward()` | `parallel/layers/encoders.py:227` | Computes Z_chunk [I_par, I, c_z], returns `parallel_mode=True` | `S_I`, `Z_II (chunk)`, `Q_L_init`, `C_L` |
 | 5 | `ParallelTokenInitializer._process_s_through_transformer_stack()` | `parallel/layers/encoders.py:34` | Chunked Pairformer on S_I with all_gather per block | `S_I`, `Z_chunk` |
-| 6 | `attention_pair_bias_forward_chunked()` | `parallel/layers/pairformer_layers.py:10` | Free function: chunked cross-attention Q[I_par] × K[I] | `S_I_chunk`, `S_I`, `Z_chunk` |
+| 6 | `attention_pair_bias_forward_parallel()` | `parallel/layers/pairformer_layers.py:10` | Free function: chunked cross-attention Q[I_par] × K[I] | `S_I_chunk`, `S_I`, `Z_chunk` |
 | 7 | `all_gather_concat()` | `parallel/utils.py` | Gathers S_I chunks from all GPUs → full S_I | `S_I_chunk` → `S_I` |
 | 8 | `ConditionalDiffusionSampler.sample_diffusion_like_af3()` | `inference_sampler.py:306` | Dispatches to `SampleDiffusionWithMotif` | — |
 | 9 | `SampleDiffusionWithMotif.sample_diffusion_like_af3()` | `inference_sampler.py:306` | Main diffusion loop (200 steps), passes `parallel_mode` to `diffusion_module()` | `X_L`, `X_noisy_L` |
@@ -141,17 +145,17 @@ models/rfd3/src/rfd3/model/
 | 14 | `ParallelDiffusionTokenEncoder.forward()` | `parallel/layers/encoders.py:376` | Process Z_chunk with distogram, Pairformer, all_gather S_I | `Z_chunk [B,I_par,I,c_z]` |
 | 15 | `process_z_chunked()` | `parallel/utils.py` | Key-chunked linear projection of concatenated Z features | `Z_chunk` |
 | 16 | `z_transition_chunked()` | `parallel/utils.py` | Key-chunked SwiGLU transition (avoids 4× memory spike) | `Z_chunk` |
-| 17 | `attention_pair_bias_forward_chunked()` | `parallel/layers/pairformer_layers.py:10` | Pairformer cross-attention Q[I_par] × K[I] with Z_chunk bias | `S_I_chunk`, `S_I` |
+| 17 | `attention_pair_bias_forward_parallel()` | `parallel/layers/pairformer_layers.py:10` | Pairformer cross-attention Q[I_par] × K[I] with Z_chunk bias | `S_I_chunk`, `S_I` |
 | 18 | `all_gather_concat()` | `parallel/utils.py` | Gathers S_I chunks after each Pairformer block | `S_I_chunk` → `S_I` |
 | 19 | `ParallelDiffusionModule._diffusion_transformer_parallel()` | `parallel/diffusion_module.py:55` | Cross-attention A_I transformer | `A_I`, `Z_II_chunk` |
-| 20 | `local_token_transformer_cross_attn()` | `parallel/layers/blocks.py:25` | Free function: chunk queries attend to all keys | `A_I_chunk`, `A_I`, `Z_chunk` |
-| 21 | `structure_local_atom_block_cross_attn()` | `parallel/layers/blocks.py` | Free function: atom-level cross-attention block | — |
-| 22 | `local_attention_cross_attn()` | `parallel/layers/attention.py` | Free function: local attention with cross-attention bias | — |
+| 20 | `ParallelDiffusionModule._local_token_transformer_cross_attn()` | `parallel/diffusion_module.py` | Method: chunk queries attend to all keys | `A_I_chunk`, `A_I`, `Z_chunk` |
+| 21 | `structure_local_atom_block_cross_attn(block, ...)` | `parallel/layers/blocks.py` | Free function: atom-level cross-attention block | — |
+| 22 | `local_attention_cross_attn(attn, ...)` | `parallel/layers/attention.py` | Free function: local attention with cross-attention bias | — |
 | 23 | `all_gather_along_dim()` | `parallel/utils.py` | Gathers A_I chunks → full A_I | `A_I_chunk` → `A_I` |
 | 24 | `ParallelDiffusionModule._decoder_parallel()` or `_decoder_parallel_sparse()` | `parallel/diffusion_module.py:168` / `:260` | Decoder with parallel P_LL computation | `A_I`, `Q_L`, `P_LL_chunk` |
-| 25 | `compact_decoder_parallel()` or `compact_decoder_parallel_sparse()` | `parallel/layers/blocks.py:385` / `:470` | Free functions: decoder cross-attention blocks | — |
-| 26 | `local_attention_sparse_cross_attn()` | `parallel/layers/attention.py` | Free function: sparse cross-attention with indices | — |
-| 27 | `chunked_pairwise_forward_parallel()` | `parallel/layers/chunked_pairwise.py:13` | Free function: sparse P_LL for GPU chunk only | `P_LL_sparse [L_par, k, c]` |
+| 25 | `ParallelDiffusionModule._compact_decoder_parallel()` or `_compact_decoder_parallel_sparse()` | `parallel/diffusion_module.py` | Methods: decoder cross-attention blocks | — |
+| 26 | `local_attention_sparse_cross_attn(attn, ...)` | `parallel/layers/attention.py` | Free function: sparse cross-attention with indices | — |
+| 27 | `chunked_pairwise_forward_parallel(embedder, ...)` | `parallel/layers/chunked_pairwise.py:13` | Free function: sparse P_LL for GPU chunk only | `P_LL_sparse [L_par, k, c]` |
 | 28 | `all_gather_along_dim()` | `parallel/utils.py` | Gathers Q_L, A_I chunks after decoder | `Q_L_chunk` → `Q_L` |
 | 29 | `bucketize_scaled_distogram_chunked()` | `layers/block_utils.py` | D_II_self computed as chunk [B, I_par, I, n_bins] | `D_II_self_chunk` |
 | 30 | `scale_positions_out()` | `RFD3_diffusion_module.py:170` | Inherited — denormalize positions | `X_out_L` |
@@ -251,7 +255,7 @@ RFD3.__init__()                                              # RFD3.py:28
         │   │   │   ├── Compute base Z_chunk from initial S_I  [I_par, I, c_z]
         │   │   │   └── for block in self.transformer_stack:
         │   │   │       ├── z_transition_chunked(Z_chunk)    # parallel/utils.py
-        │   │   │       ├── attention_pair_bias_forward_chunked()  # parallel/layers/pairformer_layers.py:10
+        │   │   │       ├── attention_pair_bias_forward_parallel()  # parallel/layers/pairformer_layers.py:10
         │   │   │       ├── block.s_transition(S_I_chunk)
         │   │   │       └── all_gather_concat(S_I_chunk)     # parallel/utils.py → S_I [I, c_s]
         │   │   │
@@ -297,7 +301,7 @@ RFD3.__init__()                                              # RFD3.py:28
                 │   │               │   │
                 │   │               │   ├── for block in self.pairformer_stack:    # 18 blocks
                 │   │               │   │   ├── z_transition_chunked(Z_chunk)
-                │   │               │   │   ├── attention_pair_bias_forward_chunked()  # parallel/layers/pairformer_layers.py
+                │   │               │   │   ├── attention_pair_bias_forward_parallel()  # parallel/layers/pairformer_layers.py
                 │   │               │   │   │     Q=S_I_chunk [I_par, c_s]
                 │   │               │   │   │     K=S_I [I, c_s]
                 │   │               │   │   │     Bias=Z_chunk [I_par, I, c_z]
@@ -308,10 +312,10 @@ RFD3.__init__()                                              # RFD3.py:28
                 │   │               │
                 │   │               ├── _diffusion_transformer_parallel()         # parallel/diffusion_module.py:55
                 │   │               │   ├── Slice A_I_chunk = A_I[:, start:end, :]
-                │   │               │   ├── local_token_transformer_cross_attn()  # parallel/layers/blocks.py:25
-                │   │               │   │   └── for block in self.blocks:
-                │   │               │   │       ├── structure_local_atom_block_cross_attn()  # parallel/layers/blocks.py
-                │   │               │   │       │   └── local_attention_cross_attn()         # parallel/layers/attention.py
+                │   │               │   ├── self._local_token_transformer_cross_attn()  # parallel/diffusion_module.py (method)
+                │   │               │   │   └── for block in transformer.blocks:
+                │   │               │   │       ├── structure_local_atom_block_cross_attn(block, ...)  # parallel/layers/blocks.py
+                │   │               │   │       │   └── local_attention_cross_attn(attn, ...)          # parallel/layers/attention.py
                 │   │               │   │       │         Q=A_I_chunk [B, I_par, c]
                 │   │               │   │       │         K,V=A_I [B, I, c]
                 │   │               │   │       │         Bias=Z_chunk [I_par, I, c_z]
@@ -324,18 +328,18 @@ RFD3.__init__()                                              # RFD3.py:28
                 │   │               │   ├── z_is_chunked + chunked_embedder:     # BOTH modes combined
                 │   │               │   │   └── _decoder_parallel_sparse()       # parallel/diffusion_module.py:260
                 │   │               │   │       ├── compute_chunk_ranges(L)
-                │   │               │   │       ├── compact_decoder_parallel_sparse()  # parallel/layers/blocks.py:470
-                │   │               │   │       │   └── for block in self.blocks:
-                │   │               │   │       │       ├── chunked_pairwise_forward_parallel()  # parallel/layers/chunked_pairwise.py:13
+                │   │               │   │       ├── self._compact_decoder_parallel_sparse()  # parallel/diffusion_module.py (method)
+                │   │               │   │       │   └── for block in decoder.atom_transformer.blocks:
+                │   │               │   │       │       ├── chunked_pairwise_forward_parallel(embedder, ...)  # parallel/layers/chunked_pairwise.py:13
                 │   │               │   │       │       │     → P_sparse [L_par, k, c_atompair]
-                │   │               │   │       │       └── local_attention_sparse_cross_attn()   # parallel/layers/attention.py
+                │   │               │   │       │       └── local_attention_sparse_cross_attn(attn, ...)      # parallel/layers/attention.py
                 │   │               │   │       └── all_gather_along_dim(Q_L_chunk → Q_L)
                 │   │               │   │
                 │   │               │   ├── z_is_chunked only:                   # PARALLEL only
                 │   │               │   │   └── _decoder_parallel()              # parallel/diffusion_module.py:168
                 │   │               │   │       ├── _compute_P_LL_chunk()        → P_LL_chunk [L_par, L, c]
-                │   │               │   │       ├── compact_decoder_parallel()   # parallel/layers/blocks.py:385
-                │   │               │   │       │   └── local_attention_cross_attn()
+                │   │               │   │       ├── self._compact_decoder_parallel()  # parallel/diffusion_module.py (method)
+                │   │               │   │       │   └── local_attention_cross_attn(attn, ...)
                 │   │               │   │       └── all_gather_along_dim(Q_L_chunk → Q_L)
                 │   │               │   │
                 │   │               │   ├── chunked_embedder only:               # LOW_MEM only
@@ -396,7 +400,7 @@ ParallelTokenInitializer.forward(f)                 # parallel/layers/encoders.p
 │   │   │
 │   │   └── for block in transformer_stack:
 │   │       Z_chunk ← z_transition_chunked(Z_chunk, block.z_transition)
-│   │       S_I_chunk ← attention_pair_bias_forward_chunked(block.attention_pair_bias, ...)
+│   │       S_I_chunk ← attention_pair_bias_forward_parallel(block.attention_pair_bias, ...)
 │   │       S_I_chunk ← S_I_chunk + block.s_transition(S_I_chunk)
 │   │       S_I ← all_gather_concat(S_I_chunk)      ← SYNC POINT
 │   │   → returns (S_I, Z_chunk)                     ← Z_chunk has ALL z_transitions!
@@ -443,7 +447,7 @@ ParallelDiffusionTokenEncoder.forward(f, R_L, S_init_I, Z_init_II=Z_chunk, ...)
 ├── Pairformer (18 blocks):
 │     for block in self.pairformer_stack:
 │       Z_chunk ← z_transition_chunked(Z_chunk, block.z_transition)
-│       S_I_chunk ← attention_pair_bias_forward_chunked(
+│       S_I_chunk ← attention_pair_bias_forward_parallel(
 │           block.attention_pair_bias,
 │           A_I_query=S_I_chunk,    [I_par, c_s]
 │           A_I_key=S_I,            [I, c_s]
@@ -474,7 +478,7 @@ process_(D_II_self, X_L_self, ..., parallel_mode=True)
 │       A_I,                          [B, I, c_token]
 │       Z_II_chunk=Z_II,             [I_par, I, c_z]
 │   )
-│   → Uses local_token_transformer_cross_attn()  (free function)
+│   → Uses self._local_token_transformer_cross_attn()  (method on ParallelDiffusionModule)
 │   → all_gather_along_dim(A_I_chunk) → A_I [B, I, c_token]
 │
 ├── 3. DECODER (4-way branch):
@@ -513,7 +517,7 @@ process_(D_II_self, X_L_self, ..., parallel_mode=True)
 | DiffusionTokenEncoder pairformer | `parallel/layers/encoders.py:747` | S_I | [I_par, c_s] → [I, c_s] | 18 |
 | DiffusionTokenEncoder final | `parallel/layers/encoders.py:758` | S_I | [I_par, c_s] → [I, c_s] | 1 |
 | Diffusion transformer | `parallel/diffusion_module.py:160` | A_I | [B, I_par, c_token] → [B, I, c_token] | 1 |
-| Decoder (parallel) | `parallel/layers/blocks.py` | Q_L, A_I | [B, L_par, c] → [B, L, c] | 2 |
+| Decoder (parallel) | `parallel/diffusion_module.py` | Q_L, A_I | [B, L_par, c] → [B, L, c] | 2 |
 
 ### Per Complete Generation (99 steps × 3 recycles)
 
@@ -528,20 +532,24 @@ This is the primary performance bottleneck (see CLAUDE.md timing analysis).
 
 ## 7. Free Function Dispatch Table
 
-After refactoring, parallel methods were extracted from base classes as **free functions** that take the base class instance as the first argument.
+After refactoring, parallel methods were extracted from base classes. Some have been promoted to **private methods** on `ParallelDiffusionModule`; the rest remain as **free functions** with descriptive first-parameter names (no `self`).
 
-| Free Function | Location | Replaces (removed from base) | Called by |
-|--------------|----------|------------------------------|-----------|
-| `local_token_transformer_cross_attn(self, ...)` | `parallel/layers/blocks.py:25` | `LocalTokenTransformer.forward_cross_attn()` | `ParallelDiffusionModule._diffusion_transformer_parallel()` |
-| `structure_local_atom_block_cross_attn(block, ...)` | `parallel/layers/blocks.py` | `StructureLocalAtomTransformerBlock.forward_cross_attn()` | `local_token_transformer_cross_attn()` |
-| `local_atom_transformer_parallel(self, ...)` | `parallel/layers/blocks.py` | `LocalAtomTransformer.forward_parallel()` | `compact_decoder_parallel()` |
-| `compact_decoder_parallel(self, ...)` | `parallel/layers/blocks.py:385` | `CompactDecoder.forward_parallel()` | `ParallelDiffusionModule._decoder_parallel()` |
-| `compact_decoder_parallel_sparse(self, ...)` | `parallel/layers/blocks.py:470` | `CompactDecoder.forward_parallel_sparse()` | `ParallelDiffusionModule._decoder_parallel_sparse()` |
-| `local_attention_cross_attn(self, ...)` | `parallel/layers/attention.py` | `LocalAttentionPairBias.forward_cross_attn()` | `structure_local_atom_block_cross_attn()` |
-| `local_attention_sparse_cross_attn(self, ...)` | `parallel/layers/attention.py` | `LocalAttentionPairBias.forward_sparse_cross_attn()` | `compact_decoder_parallel_sparse()` |
-| `sparse_cross_attention(Q, K, V, B, ...)` | `parallel/layers/attention.py:16` | (new helper) | `local_attention_sparse_cross_attn()` |
-| `attention_pair_bias_forward_chunked(self, ...)` | `parallel/layers/pairformer_layers.py:10` | `AttentionPairBiasPairformerDeepspeed.forward_chunked()` | `ParallelTokenInitializer`, `ParallelDiffusionTokenEncoder` |
-| `chunked_pairwise_forward_parallel(self, ...)` | `parallel/layers/chunked_pairwise.py:13` | `ChunkedPairwiseEmbedder.forward_chunked_parallel()` | `compact_decoder_parallel_sparse()` via `local_atom_transformer_parallel()` |
+| Function | Kind | Location | Called by |
+|----------|------|----------|-----------|
+| `_local_token_transformer_cross_attn(self, ...)` | **Method** on `ParallelDiffusionModule` | `parallel/diffusion_module.py` | `_diffusion_transformer_parallel()` |
+| `_compact_decoder_parallel(self, ...)` | **Method** on `ParallelDiffusionModule` | `parallel/diffusion_module.py` | `_decoder_parallel()` |
+| `_compact_decoder_parallel_sparse(self, ...)` | **Method** on `ParallelDiffusionModule` | `parallel/diffusion_module.py` | `_decoder_parallel_sparse()` |
+| `structure_local_atom_block_cross_attn(block, ...)` | Free function | `parallel/layers/blocks.py` | `_local_token_transformer_cross_attn()`, `_compact_decoder_parallel()` |
+| `structure_local_atom_block_sparse_cross_attn(block, ...)` | Free function | `parallel/layers/blocks.py` | `_compact_decoder_parallel_sparse()` |
+| `local_attention_cross_attn(attn, ...)` | Free function | `parallel/layers/attention.py` | `structure_local_atom_block_cross_attn()` |
+| `local_attention_sparse_cross_attn(attn, ...)` | Free function | `parallel/layers/attention.py` | `structure_local_atom_block_sparse_cross_attn()` |
+| `sparse_cross_attention(Q, K, V, B, ...)` | Free function (pure tensor) | `parallel/layers/attention.py` | `local_attention_cross_attn()` |
+| `sparse_cross_attention_pregathered_bias(Q, K, V, ...)` | Free function (pure tensor) | `parallel/layers/attention.py` | `local_attention_sparse_cross_attn()` |
+| `attention_pair_bias_forward_parallel(attn, ...)` | Free function | `parallel/layers/pairformer_layers.py` | `ParallelTokenInitializer`, `ParallelDiffusionTokenEncoder` |
+| `chunked_pairwise_forward_parallel(embedder, ...)` | Free function | `parallel/layers/chunked_pairwise.py` | `_compact_decoder_parallel_sparse()` |
+
+**Deleted:** `local_atom_transformer_parallel()` — was dead code, removed.
+**Deleted:** `local_token_transformer_cross_attn()`, `compact_decoder_parallel()`, `compact_decoder_parallel_sparse()` — promoted to methods on `ParallelDiffusionModule`.
 
 ### `forward_chunk` Methods Kept on Base Classes
 
@@ -603,7 +611,9 @@ DiffusionTokenEncoder                     (layers/encoders.py)
 RFD3DiffusionModule                       (RFD3_diffusion_module.py)
 └── ParallelDiffusionModule               (parallel/diffusion_module.py)
     Overrides: __init__(), process_()
-    Adds: _diffusion_transformer_parallel(), _decoder_parallel(), _decoder_parallel_sparse(), _compute_P_LL_chunk()
+    Adds: _diffusion_transformer_parallel(), _decoder_parallel(), _decoder_parallel_sparse(),
+          _compute_P_LL_chunk(), _local_token_transformer_cross_attn(),
+          _compact_decoder_parallel(), _compact_decoder_parallel_sparse()
     Inherits: forward(), forward_with_recycle(), scale_positions_in/out(), process_time_()
 
 Standard classes (NOT subclassed — used via free functions):
@@ -630,7 +640,7 @@ RFD3.py   → layers/          ✓  (standard classes)
 | Aspect | Before | After |
 |--------|--------|-------|
 | Parallel code location | Interleaved in base classes | Dedicated `parallel/` package |
-| Method dispatch | Instance methods on base classes (e.g., `self.decoder.forward_parallel()`) | Free functions (e.g., `compact_decoder_parallel(self.decoder, ...)`) |
+| Method dispatch | Instance methods on base classes (e.g., `self.decoder.forward_parallel()`) | Private methods on `ParallelDiffusionModule` + free functions with descriptive params (e.g., `block`, `attn`, `embedder`) |
 | Class selection | Runtime `if` checks in every `forward()` | Factory pattern in `RFD3.__init__()` + class hierarchy |
 | Utility functions | Duplicated across 3 files | Consolidated in `parallel/utils.py` |
 | `DiffusionTokenEncoder` | Had both `_forward_standard()` and `_forward_streaming()` | Base has only standard; `ParallelDiffusionTokenEncoder` overrides `forward()` |

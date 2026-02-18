@@ -237,7 +237,7 @@ def sparse_cross_attention_pregathered_bias(Q, K, V, B_sparse, indices, H, G=Non
 
 
 def local_attention_cross_attn(
-    self,  # LocalAttentionPairBias instance
+    attn,  # LocalAttentionPairBias instance
     Q_chunk,
     C_Q_chunk,
     K_V_full,
@@ -254,7 +254,7 @@ def local_attention_cross_attn(
     - P_chunk is [L_par, L] not [L, L]
 
     Args:
-        self: LocalAttentionPairBias instance
+        attn: LocalAttentionPairBias instance
         Q_chunk: Query features [D, L_par, c_a]
         C_Q_chunk: Query conditioning [D, L_par, c_s]
         K_V_full: Key/Value features [D, L, c_a]
@@ -270,32 +270,32 @@ def local_attention_cross_attn(
 
     # Normalize queries with conditioning
     if exists(C_Q_chunk):
-        Q_normed = self.ada_ln_1(Q_chunk, C_Q_chunk)
+        Q_normed = attn.ada_ln_1(Q_chunk, C_Q_chunk)
     else:
-        Q_normed = self.ln_1(Q_chunk)
+        Q_normed = attn.ln_1(Q_chunk)
 
     # Normalize K/V - use full input for keys/values
     if exists(C_KV_full):
-        KV_normed = self.ada_ln_1(K_V_full, C_KV_full)
+        KV_normed = attn.ada_ln_1(K_V_full, C_KV_full)
     else:
-        KV_normed = self.ln_1(K_V_full)
+        KV_normed = attn.ln_1(K_V_full)
 
     # Project to Q, K, V
-    q = self.to_q(Q_normed)
-    k = self.to_k(KV_normed)
-    v = self.to_v(KV_normed)
-    g = self.to_g(Q_normed)
+    q = attn.to_q(Q_normed)
+    k = attn.to_k(KV_normed)
+    v = attn.to_v(KV_normed)
+    g = attn.to_g(Q_normed)
 
     # Apply KQ norm if enabled
-    if self.kq_norm:
-        q = self.ln_q(q)
-        k = self.ln_k(k)
+    if attn.kq_norm:
+        q = attn.ln_q(q)
+        k = attn.ln_k(k)
 
     # Project pair bias
     if P_chunk.ndim == 3:
-        b = self.to_b(P_chunk)
+        b = attn.to_b(P_chunk)
     else:  # [D, L_par, L, c_pair]
-        b = self.to_b(P_chunk)
+        b = attn.to_b(P_chunk)
 
     # Cross-attention with sparse indices
     attn_out = sparse_cross_attention(
@@ -305,21 +305,21 @@ def local_attention_cross_attn(
         B=b,
         G=g,
         indices=indices_chunk,
-        H=self.n_head,
+        H=attn.n_head,
     )
 
     # Output projection
-    attn_out = self.to_o(attn_out)
+    attn_out = attn.to_o(attn_out)
 
     # Apply output gating with query conditioning
     if exists(C_Q_chunk):
-        attn_out = self.linear_output_project(C_Q_chunk) * attn_out
+        attn_out = attn.linear_output_project(C_Q_chunk) * attn_out
 
     return attn_out
 
 
 def local_attention_sparse_cross_attn(
-    self,  # LocalAttentionPairBias instance
+    attn,  # LocalAttentionPairBias instance
     Q_chunk,
     C_Q_chunk,
     K_V_full,
@@ -337,7 +337,7 @@ def local_attention_sparse_cross_attn(
     Memory: O(L_par * k) instead of O(L_par * L) or O(L²)
 
     Args:
-        self: LocalAttentionPairBias instance
+        attn: LocalAttentionPairBias instance
         Q_chunk: Query features [D, L_par, c_a]
         C_Q_chunk: Query conditioning [D, L_par, c_s]
         K_V_full: Key/Value features [D, L, c_a]
@@ -353,29 +353,29 @@ def local_attention_sparse_cross_attn(
 
     # Normalize queries with conditioning
     if exists(C_Q_chunk):
-        Q_normed = self.ada_ln_1(Q_chunk, C_Q_chunk)
+        Q_normed = attn.ada_ln_1(Q_chunk, C_Q_chunk)
     else:
-        Q_normed = self.ln_1(Q_chunk)
+        Q_normed = attn.ln_1(Q_chunk)
 
     # Normalize K/V - use full input for keys/values
     if exists(C_KV_full):
-        KV_normed = self.ada_ln_1(K_V_full, C_KV_full)
+        KV_normed = attn.ada_ln_1(K_V_full, C_KV_full)
     else:
-        KV_normed = self.ln_1(K_V_full)
+        KV_normed = attn.ln_1(K_V_full)
 
     # Project to Q, K, V
-    q = self.to_q(Q_normed)
-    k_proj = self.to_k(KV_normed)
-    v = self.to_v(KV_normed)
-    g = self.to_g(Q_normed)
+    q = attn.to_q(Q_normed)
+    k_proj = attn.to_k(KV_normed)
+    v = attn.to_v(KV_normed)
+    g = attn.to_g(Q_normed)
 
     # Apply KQ norm if enabled
-    if self.kq_norm:
-        q = self.ln_q(q)
-        k_proj = self.ln_k(k_proj)
+    if attn.kq_norm:
+        q = attn.ln_q(q)
+        k_proj = attn.ln_k(k_proj)
 
     # Project pair bias: [D, L_par, k, c_pair] → [D, L_par, k, H]
-    b_sparse = self.to_b(P_sparse_chunk)
+    b_sparse = attn.to_b(P_sparse_chunk)
 
     # Sparse cross-attention: gather K/V using indices, use pre-gathered bias
     attn_out = sparse_cross_attention_pregathered_bias(
@@ -385,14 +385,14 @@ def local_attention_sparse_cross_attn(
         B_sparse=b_sparse,
         G=g,
         indices=indices_chunk,
-        H=self.n_head,
+        H=attn.n_head,
     )
 
     # Output projection
-    attn_out = self.to_o(attn_out)
+    attn_out = attn.to_o(attn_out)
 
     # Apply output gating with query conditioning
     if exists(C_Q_chunk):
-        attn_out = self.linear_output_project(C_Q_chunk) * attn_out
+        attn_out = attn.linear_output_project(C_Q_chunk) * attn_out
 
     return attn_out

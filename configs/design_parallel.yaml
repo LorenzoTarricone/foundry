@@ -10,22 +10,22 @@
 # Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
 
 # Output settings
-out_dir: "inference_outputs/design_I_170AAASU_parallel"
+out_dir: "inference_outputs/design_momomer_100AA_parallel"
 
 # Protein design parameters 
-length: 170  # Length of protein to design (in amino acids)
+length: 100  # Length of protein to design (in amino acids)
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
-symmetry: I
+# symmetry: I
 
 # MPNN settings
-mpnn_batch_size: 8
+mpnn_batch_size: 5
 
 # Parallel processing
 # The script auto-detects allocated GPUs from CUDA_VISIBLE_DEVICES
 # Set attention_parallel_factor to override (e.g., 2 to use only 2 of 4 allocated GPUs)
-attention_parallel_factor: 8
+attention_parallel_factor: 2
 low_memory_mode: true  # Use structure local sequence local attention indices
 extra_chunking: false  # Further chunking to reduce memory at cost of speed
 

@@ -365,6 +365,13 @@ def debug_tensor(category: str, name: str, tensor: torch.Tensor, rank: int = 0):
     print(f"{prefix} {name}: {stats}", flush=True)
 
 
+def log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
+    """Log tensor statistics for debugging parallel blocks. Controlled by verbose_stats flag."""
+    if not debug_ctx.stats_enabled:
+        return
+    debug_tensor("BLOCKS", name, tensor, rank)
+
+
 def debug_elements(category: str, name: str, tensor: torch.Tensor, indices: list, rank: int = 0):
     """
     Log specific element values for comparison.

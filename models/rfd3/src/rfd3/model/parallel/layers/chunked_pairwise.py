@@ -11,7 +11,7 @@ from rfd3.model.debug_context import debug_ctx, debug_tensor_all_ranks
 
 
 def chunked_pairwise_forward_parallel(
-    self,  # ChunkedPairwiseEmbedder instance
+    embedder,  # ChunkedPairwiseEmbedder instance
     indices_chunk,
     query_start,
     query_end,
@@ -27,7 +27,7 @@ def chunked_pairwise_forward_parallel(
     - Each GPU calls this with its query_start:query_end range
 
     Args:
-        self: ChunkedPairwiseEmbedder instance
+        embedder: ChunkedPairwiseEmbedder instance
         indices_chunk: [B, L_par, k] - sparse neighbor indices for this chunk
         query_start: Start index of this GPU's queries
         query_end: End index of this GPU's queries
@@ -43,7 +43,7 @@ def chunked_pairwise_forward_parallel(
     device = indices_chunk.device
 
     # Ensure embedder modules are on the correct device
-    self.to(device)
+    embedder.to(device)
 
     # Get full data from initializer_outputs and move to correct device
     tok_idx = f.get("atom_to_token_map", initializer_outputs.get("tok_idx"))
@@ -61,7 +61,7 @@ def chunked_pairwise_forward_parallel(
 
     # Initialize output for this chunk
     P_LL_sparse_chunk = torch.zeros(
-        B, L_par, k, self.c_atompair, device=device, dtype=dtype
+        B, L_par, k, embedder.c_atompair, device=device, dtype=dtype
     )
 
     # Ensure indices_chunk is properly batched
@@ -83,8 +83,8 @@ def chunked_pairwise_forward_parallel(
         indices_clamped = torch.clamp(indices_for_gather, 0, C_L.shape[1] - 1)
         C_L_keys = torch.gather(C_L.unsqueeze(2).expand(-1, -1, k, -1), 1, indices_clamped)
 
-        single_l = self._get_process_single_l()(C_L_queries)
-        single_m = self._get_process_single_m()(C_L_keys)
+        single_l = embedder._get_process_single_l()(C_L_queries)
+        single_m = embedder._get_process_single_m()(C_L_keys)
         P_LL_sparse_chunk = P_LL_sparse_chunk + single_l + single_m
 
     # 2. Token pair features Z for chunk (VECTORIZED)
@@ -127,12 +127,12 @@ def chunked_pairwise_forward_parallel(
                 tk.flatten()
             ].view(L_par, k, -1)
 
-            Z_pairs_processed = self._get_process_z()(Z_pairs_full)
+            Z_pairs_processed = embedder._get_process_z()(Z_pairs_full)
             Z_pairs_processed_chunk = Z_pairs_processed.unsqueeze(0).expand(B, -1, -1, -1)
         else:
             # Standard mode: full Z tensor [I, I, c_z]
             I_z = Z_init_II.shape[0]
-            Z_processed = self._get_process_z()(Z_init_II)
+            Z_processed = embedder._get_process_z()(Z_init_II)
 
             # VECTORIZED gather for Z pairs
             tq_flat = torch.clamp(tok_queries_chunk.reshape(-1), 0, I_z - 1)
@@ -144,7 +144,7 @@ def chunked_pairwise_forward_parallel(
         P_LL_sparse_chunk = P_LL_sparse_chunk + Z_pairs_processed_chunk
 
     # Final MLP
-    P_LL_sparse_chunk = P_LL_sparse_chunk + self._get_pair_mlp()(P_LL_sparse_chunk)
+    P_LL_sparse_chunk = P_LL_sparse_chunk + embedder._get_pair_mlp()(P_LL_sparse_chunk)
 
     # MULTI-GPU DIAGNOSTIC
     debug_tensor_all_ranks("P_LL_SPARSE", f"forward_chunked_parallel_q{query_start}-{query_end}", P_LL_sparse_chunk)

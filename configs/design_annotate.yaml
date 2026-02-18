@@ -6,14 +6,14 @@
 #   python scripts/design_annotate.py --config configs/design_annotate.yaml
 
 # Output settings
-out_dir: "inference_outputs/design_demo"
+out_dir: "inference_outputs/design_check_100AA"
 
 # Protein design parameters
-length: 50
+length: 100
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
-symmetry: I
+# symmetry: I
 
 # MPNN settings
 mpnn_batch_size: 5

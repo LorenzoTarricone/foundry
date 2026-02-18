@@ -541,14 +541,17 @@ class AddAF3TokenBondFeatures(Transform):
         n_atoms = len(atom_array)
 
         if n_atoms <= self.atom_threshold:
-            # For smaller structures: use the standard atomworks transform
+            # For smaller structures: use the standard atomworks transform.
+            # Call .forward() directly to avoid __call__() registering a second
+            # 'AddAF3TokenBondFeatures' in the transform history (this instance
+            # is already registered by our own __call__ wrapper).
             from atomworks.ml.transforms.bonds import (
                 AddAF3TokenBondFeatures as AtomworksAddAF3TokenBondFeatures,
             )
             standard_transform = AtomworksAddAF3TokenBondFeatures(
                 distance_cutoff=self.distance_cutoff
             )
-            return standard_transform(data)
+            return standard_transform.forward(data)
 
         # Memory-efficient sparse implementation for large structures (parallel mode)
         print(

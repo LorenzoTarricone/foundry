@@ -175,8 +175,8 @@ class ParallelTokenInitializer(TokenInitializer):
                 if is_rank0 and debug_ctx.stats_enabled:
                     print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_SLICE: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
 
-                from rfd3.model.parallel.layers.pairformer_layers import attention_pair_bias_forward_chunked
-                S_I_chunk = S_I_chunk + attention_pair_bias_forward_chunked(
+                from rfd3.model.parallel.layers.pairformer_layers import attention_pair_bias_forward_parallel
+                S_I_chunk = S_I_chunk + attention_pair_bias_forward_parallel(
                     block.attention_pair_bias,                  # AttentionPairBiasPairformerDeepspeed instance
                     A_I_query=S_I_chunk,                       # [I_par, c_s]
                     A_I_key=S_I,                               # [I, c_s]
@@ -734,10 +734,10 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
 
             # Attention: queries [I_par] attend to all keys [I] using Z_chunk as bias
             if hasattr(block, 'attention_pair_bias'):
-                # Chunked attention: S_I_chunk queries, S_I keys, Z_chunk bias
-                # forward_chunked expects 2D inputs [I_par, c_s] and [I, c_s]
-                from rfd3.model.parallel.layers.pairformer_layers import attention_pair_bias_forward_chunked
-                S_I_chunk = S_I_chunk + attention_pair_bias_forward_chunked(
+                # Parallel attention: S_I_chunk queries, S_I keys, Z_chunk bias
+                # forward_parallel expects 2D inputs [I_par, c_s] and [I, c_s]
+                from rfd3.model.parallel.layers.pairformer_layers import attention_pair_bias_forward_parallel
+                S_I_chunk = S_I_chunk + attention_pair_bias_forward_parallel(
                     block.attention_pair_bias,              # AttentionPairBiasPairformerDeepspeed instance
                     A_I_query=S_I_chunk,                   # [I_par, c_s]
                     A_I_key=S_I_unbatched,                 # [I, c_s]
