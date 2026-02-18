@@ -10,14 +10,14 @@
 # Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
 
 # Output settings
-out_dir: "inference_outputs/design_check_parallel_I60_20AA"
+out_dir: "inference_outputs/design_check_parallel_200AA"
 
 # Protein design parameters 
-length: 20  # Length of protein to design (in amino acids)
+length: 200  # Length of protein to design (in amino acids)
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
-symmetry: I
+# symmetry: I
 
 # MPNN settings
 mpnn_batch_size: 8
@@ -33,7 +33,7 @@ extra_chunking: false  # Further chunking to reduce memory at cost of speed
 # All default to false for production runs
 verbose: false           # Master flag: enables ALL debug logging
 verbose_stats: false     # Tensor statistics (.float().mean()/.std() on large tensors - expensive!)
-verbose_time: true       # Timing for each pipeline phase
+verbose_time: false      # Timing for each pipeline phase
 verbose_memory: false     # GPU memory tracking at key stages
 
 # Reproducibility
