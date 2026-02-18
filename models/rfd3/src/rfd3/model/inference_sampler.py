@@ -203,6 +203,12 @@ def _broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
     """Broadcast tensor from source rank to all GPUs."""
     if not dist.is_initialized():
         return tensor
+    
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    expected_device = torch.device(f"cuda:{local_rank}")
+    if tensor.device != expected_device:
+        tensor = tensor.to(expected_device)
+        
     dist.broadcast(tensor, src=src)
     return tensor
 

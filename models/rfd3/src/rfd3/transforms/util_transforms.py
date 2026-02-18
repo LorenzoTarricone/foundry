@@ -548,7 +548,7 @@ class AddAF3TokenBondFeatures(Transform):
             standard_transform = AtomworksAddAF3TokenBondFeatures(
                 distance_cutoff=self.distance_cutoff
             )
-            return standard_transform(data)
+            return standard_transform.forward(data)
 
         # Memory-efficient sparse implementation for large structures (parallel mode)
         print(
