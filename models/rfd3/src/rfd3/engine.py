@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from os import PathLike
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import torch
 import yaml
@@ -21,11 +21,13 @@ from rfd3.constants import SAVED_CONDITIONING_ANNOTATIONS
 from rfd3.inference.datasets import (
     assemble_distributed_inference_loader_from_json,
 )
-from rfd3.inference.input_parsing import DesignInputSpecification
+from rfd3.inference.input_parsing import (
+    DesignInputSpecification,
+    ensure_input_is_abspath,
+)
 from rfd3.model.inference_sampler import SampleDiffusionConfig
 from rfd3.utils.inference import (
     ensure_inference_sampler_matches_design_spec,
-    ensure_input_is_abspath,
 )
 from rfd3.utils.io import (
     CIF_LIKE_EXTENSIONS,
@@ -46,9 +48,8 @@ class RFD3InferenceConfig:
     diffusion_batch_size: int = 16
 
     # RFD3 specific
-    skip_existing: bool = False
-    json_keys_subset: Optional[List[str]] = None
     skip_existing: bool = True
+    json_keys_subset: Optional[List[str]] = None
     specification: Optional[dict] = field(default_factory=dict)
     inference_sampler: SampleDiffusionConfig | dict = field(default_factory=dict)
 
@@ -214,11 +215,12 @@ class RFD3InferenceEngine(BaseInferenceEngine):
             inputs=inputs,
             n_batches=n_batches,
         )
-        # Checks that the design specifications that require symmetric sampler have
-        # been set to the correct sampler.
+        if len(design_specifications) == 0:
+            ranked_logger.info("No design specifications to run. Skipping.")
+            return None
         ensure_inference_sampler_matches_design_spec(
             design_specifications, self.inference_sampler_overrides
-        ) 
+        )
         # init before
         self.initialize()
         outputs = self._run_multi(design_specifications)
@@ -378,30 +380,39 @@ class RFD3InferenceEngine(BaseInferenceEngine):
 
     def _multiply_specifications(
         self, inputs: Dict[str, dict | DesignInputSpecification], n_batches=None
-    ) -> Dict[str, Dict[str, Any]]:
+    ) -> Dict[str, dict | DesignInputSpecification]:
         # Find existing example IDS in output directory
         if exists(self.out_dir):
-            existing_example_ids = set(
+            existing_example_ids_ = set(
                 extract_example_id_from_path(path, CIF_LIKE_EXTENSIONS)
                 for path in find_files_with_extension(self.out_dir, CIF_LIKE_EXTENSIONS)
             )
+            existing_example_ids = set(
+                [
+                    "_model_".join(eid.split("_model_")[:-1])
+                    for eid in existing_example_ids_
+                ]
+            )
             ranked_logger.info(
-                f"Found {len(existing_example_ids)} existing example IDs in the output directory."
+                f"Found {len(existing_example_ids)} existing example IDs in the output directory ({len(existing_example_ids_)} total)."
             )
 
         # Based on inputs, construct the specifications to loop through
         design_specifications = {}
         for prefix, example_spec in inputs.items():
             # Record task name in the specification
-            if "extra" not in example_spec:
-                example_spec["extra"] = {}
-            example_spec["extra"]["task_name"] = prefix
+            if isinstance(example_spec, DesignInputSpecification):
+                example_spec.extra = example_spec.extra or {}
+                example_spec.extra["task_name"] = prefix
+            else:
+                if "extra" not in example_spec:
+                    example_spec["extra"] = {}
+                example_spec["extra"]["task_name"] = prefix
 
             # ... Create n_batches for example
             for batch_id in range((n_batches) if exists(n_batches) else 1):
                 # ... Example ID
                 example_id = f"{prefix}_{batch_id}" if exists(n_batches) else prefix
-
                 if (
                     self.skip_existing
                     and exists(self.out_dir)

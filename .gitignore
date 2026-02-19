@@ -180,55 +180,24 @@ cython_debug/
 
 # Ruff
 ruff.toml
-.ruff_cache
+*/scratch/
+*/wandb/
+rf2aa/dataset_20240318.pkl
+*.csv
+*.err
+*.log
+*.json
+data/run.sh
 
-# Development
-dev.py
-
-# Pytest
-*.benchmarks/
-
-# Images
-*.pdf
-*.svg
-*.jpg
-*.jpeg
-*.gif
-*.bmp
-*.tiff
-
-# Versioning
-**/version.py
-
-# W&B
-wandb/
-
-# Hydra
-.hydra/
-
-# Logs
+# Personal stuff
+tests/
+slurm_logs/
 logs/
-
-# Other
-*.sif
-*.out
-
-# Misc
-**/notebooks/
-**/scratch/
-**/outputs/
-**/inference_outputs/
-**/slurm_logs/
-**/tmp/
-*.ckpt
-**/distillation/
-**/benchmarks/
-
-# AI
-**/CLAUDE.md
-**/.claude
-
-
-# Others 
-**/models/rfd3/docs/c5_symmetry.json
-submit_example_vscode_code_tunnel.sh
+wandb/
+inference_outputs/
+plotting/
+core
+configs/
+CLAUDE.md
+benchmark_outputs/
+benchmark_outputs_26_02_05/

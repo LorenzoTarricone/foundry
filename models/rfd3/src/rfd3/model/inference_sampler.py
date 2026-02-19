@@ -15,7 +15,6 @@ from foundry.utils.rotation_augmentation import (
     rot_vec_mul,
     uniform_random_rotation,
 )
-from rfd3.inference.symmetry.symmetry_utils import apply_symmetry_to_xyz_atomwise
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
 
@@ -121,8 +120,10 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 ranked_logger.info(
                     f"Using fallback: final step with t={noise_schedule[0].item():.6f}"
                 )
+        else:
+            noise_schedule = t_hat
 
-        return t_hat
+        return noise_schedule
 
     def _get_initial_structure(
         self,

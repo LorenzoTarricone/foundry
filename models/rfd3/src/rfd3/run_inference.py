@@ -2,7 +2,6 @@
 
 import os
 
-import torch
 import hydra
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
@@ -25,7 +24,6 @@ _config_path = os.path.join(
 )
 def run_inference(cfg: DictConfig) -> None:
     """Execute the specified inference pipeline"""
-    torch.set_float32_matmul_precision("high")
 
     run_params_set = {"inputs", "n_batches", "out_dir"}
     run_params = {k: v for k, v in cfg.items() if k in run_params_set}
