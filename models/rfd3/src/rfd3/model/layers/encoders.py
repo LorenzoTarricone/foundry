@@ -517,10 +517,44 @@ class TokenInitializer(nn.Module):
         #     linearNoBias(c_z, c_z),
         # )
 
+    def sync_chunked_embedder_weights(self):
+        """Copy weights from standard embedders to chunked embedders.
+
+        Called after checkpoint loading to ensure chunked embedders use trained
+        weights, since the checkpoint doesn't contain chunked embedder parameters
+        (they are new modules not present in the original training run).
+
+        The standard and chunked embedder classes have identical layer structures:
+          - SinusoidalDistEmbed / ChunkedSinusoidalDistEmbed: output_proj, process_valid_mask
+          - PositionPairDistEmbedder / ChunkedPositionPairDistEmbedder: process_inverse_dist, process_valid_mask
+        """
+        if not self.use_chunked_pll:
+            return
+
+        chunked = self.chunked_pairwise_embedder
+
+        # motif_pos_embedder: SinusoidalDistEmbed -> ChunkedSinusoidalDistEmbed
+        chunked.motif_pos_embedder.output_proj.weight.data.copy_(
+            self.motif_pos_embedder.output_proj.weight.data
+        )
+        chunked.motif_pos_embedder.process_valid_mask.weight.data.copy_(
+            self.motif_pos_embedder.process_valid_mask.weight.data
+        )
+
+        # ref_pos_embedder: PositionPairDistEmbedder -> ChunkedPositionPairDistEmbedder
+        chunked.ref_pos_embedder.process_inverse_dist.weight.data.copy_(
+            self.ref_pos_embedder.process_inverse_dist.weight.data
+        )
+        chunked.ref_pos_embedder.process_valid_mask.weight.data.copy_(
+            self.ref_pos_embedder.process_valid_mask.weight.data
+        )
+
+        print("[TokenInitializer] Synced chunked embedder weights from standard embedders.", flush=True)
+
     def forward(self, f):
         """
         Provides initial representation for atom and token representations.
-        
+
         Returns:
             dict containing:
                 - Q_L_init: [L, c_atom] initial atom features

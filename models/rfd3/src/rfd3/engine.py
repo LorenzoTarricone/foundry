@@ -358,6 +358,28 @@ class RFD3InferenceEngine(BaseInferenceEngine):
                     f"No L×L or I×I tensors will be materialized."
                 )
 
+    def initialize(self):
+        cfg = super().initialize()
+        # After checkpoint loading, sync chunked embedder weights from the
+        # standard embedders.  The checkpoint doesn't contain weights for the
+        # chunked embedder paths (they are created only when low_memory_mode is
+        # enabled), so they fall back to random init.  This copies the trained
+        # weights from the standard embedders which share the same layer structure.
+        # The top-level model may be an EMA wrapper (with .model and .shadow),
+        # so we sync both submodels.
+        top_model = self.trainer.state["model"]
+        submodels = []
+        if hasattr(top_model, "model") and hasattr(top_model, "shadow"):
+            # EMA wrapper
+            submodels = [top_model.model, top_model.shadow]
+        else:
+            submodels = [top_model]
+        for submodel in submodels:
+            ti = getattr(submodel, "token_initializer", None)
+            if ti is not None and hasattr(ti, "sync_chunked_embedder_weights"):
+                ti.sync_chunked_embedder_weights()
+        return cfg
+
     def run(
         self,
         *,
@@ -375,7 +397,7 @@ class RFD3InferenceEngine(BaseInferenceEngine):
         # been set to the correct sampler.
         ensure_inference_sampler_matches_design_spec(
             design_specifications, self.inference_sampler_overrides
-        ) 
+        )
         # init before
         self.initialize()
         # Debug: Log memory and clean up before _run_multi
