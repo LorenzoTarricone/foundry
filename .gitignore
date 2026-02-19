@@ -236,6 +236,7 @@ benchmark_outputs/
 benchmark_outputs_26_02_05/
 configs/benchmark/
 plotting/
+tests/
 
 # Core dumps
 core
