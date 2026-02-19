@@ -55,6 +55,63 @@ class ParallelDiffusionModule(RFD3DiffusionModule):
         from rfd3.model.parallel.layers.encoders import ParallelDiffusionTokenEncoder
         self.diffusion_token_encoder.__class__ = ParallelDiffusionTokenEncoder
 
+    def _run_encoder(self, Q_L, C_L, P_LL, f, chunked_pairwise_embedder, initializer_outputs):
+        """
+        Parallel encoder: each GPU processes L_par atom queries.
+
+        Same pattern as _compact_decoder_parallel_sparse:
+        - P_LL_sparse computed per-GPU via chunked_pairwise_forward_parallel
+        - Sparse cross-attention: Q_chunk queries attend to full Q_L keys
+        - All-gather Q_L_chunk after each block
+        """
+        if not initializer_outputs.get("parallel_mode") or chunked_pairwise_embedder is None:
+            return super()._run_encoder(Q_L, C_L, P_LL, f, chunked_pairwise_embedder, initializer_outputs)
+
+        from rfd3.model.parallel.layers.chunked_pairwise import chunked_pairwise_forward_parallel
+
+        gpu_rank, world_size = get_gpu_rank_and_world_size()
+        L = Q_L.shape[1]
+
+        # Compute atom chunk range for this GPU (same split as decoder)
+        chunk_ranges = compute_chunk_ranges(L, world_size)
+        if gpu_rank >= len(chunk_ranges):
+            return Q_L
+        start_l, end_l = chunk_ranges[gpu_rank]
+
+        # Slice attention indices for this GPU's atoms
+        indices_chunk = f["attn_indices"][:, start_l:end_l, :]  # [B, L_par, k]
+
+        with debug_time("DIFFUSION", "encoder_parallel"):
+            for block_idx, block in enumerate(self.encoder.blocks):
+                Q_L_chunk = Q_L[:, start_l:end_l, :]
+                C_L_chunk = C_L[:, start_l:end_l, :]
+
+                # Compute P_LL_sparse for this GPU's atoms only
+                P_sparse_chunk = chunked_pairwise_forward_parallel(
+                    embedder=chunked_pairwise_embedder,
+                    indices_chunk=indices_chunk,
+                    query_start=start_l,
+                    query_end=end_l,
+                    f=f,
+                    initializer_outputs=initializer_outputs,
+                )
+
+                # Sparse cross-attention + transition
+                Q_L_chunk = structure_local_atom_block_sparse_cross_attn(
+                    block,
+                    Q_chunk=Q_L_chunk,
+                    C_Q_chunk=C_L_chunk,
+                    K_V_full=Q_L,
+                    C_KV_full=C_L,
+                    P_sparse_chunk=P_sparse_chunk,
+                    indices_chunk=indices_chunk,
+                )
+
+                # All-gather Q_L chunks to reconstruct full Q_L for next block
+                Q_L = all_gather_along_dim(Q_L_chunk, world_size, dim=1, total_size=L)
+
+        return Q_L
+
     def _local_token_transformer_cross_attn(
         self,
         A_I_chunk,
@@ -458,7 +515,7 @@ class ParallelDiffusionModule(RFD3DiffusionModule):
                 Z_init_II=initializer_outputs["Z_II"],
                 tok_idx=f["atom_to_token_map"],
                 query_start=query_start,
-                streaming_mode=initializer_outputs.get("streaming_mode", False),
+                streaming_mode=initializer_outputs.get("parallel_mode", False),
                 z_chunk_range=initializer_outputs.get("z_chunk_range"),
             )
 

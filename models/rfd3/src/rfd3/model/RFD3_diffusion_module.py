@@ -195,6 +195,20 @@ class RFD3DiffusionModule(nn.Module):
         C_L = C_L * (t_L > 0).float()[..., None]  # [B, L, C_atom]
         return C_L
 
+    def _run_encoder(self, Q_L, C_L, P_LL, f, chunked_pairwise_embedder, initializer_outputs):
+        """Run atom-level encoder. Overridden in ParallelDiffusionModule."""
+        if chunked_pairwise_embedder is not None:
+            with debug_time("DIFFUSION", "encoder_low_memory"):
+                Q_L = self.encoder(
+                    Q_L, C_L, P_LL=None, indices=f["attn_indices"],
+                    f=f, chunked_pairwise_embedder=chunked_pairwise_embedder,
+                    initializer_outputs=initializer_outputs,
+                )
+        else:
+            with debug_time("DIFFUSION", "encoder_standard"):
+                Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])
+        return Q_L
+
     def forward(
         self,
         X_noisy_L,
@@ -320,18 +334,10 @@ class RFD3DiffusionModule(nn.Module):
         debug_tensor_memory("DIFFUSION", "S_I", S_I)
 
         # ... Run Local-Atom Self Attention and Pool
-        if chunked_pairwise_embedder is not None:
-            # Low-memory mode: sparse P_LL but single GPU
-            with debug_time("DIFFUSION", "encoder_low_memory"):
-                Q_L = self.encoder(
-                    Q_L, C_L, P_LL=None, indices=f["attn_indices"],
-                    f=f, chunked_pairwise_embedder=chunked_pairwise_embedder,
-                    initializer_outputs=initializer_outputs,
-                )                                              # [B, L, c_atom]
-        else:
-            # Standard mode: use full P_LL
-            with debug_time("DIFFUSION", "encoder_standard"):
-                Q_L = self.encoder(Q_L, C_L, P_LL, indices=f["attn_indices"])  # [B, L, c_atom]
+        # (Overridden in ParallelDiffusionModule for per-GPU parallel encoder)
+        Q_L = self._run_encoder(
+            Q_L, C_L, P_LL, f, chunked_pairwise_embedder, initializer_outputs,
+        )
         
         # DIAGNOSTIC: Log Q_L after encoder
         _log_tensor_stats("Q_L_after_encoder", Q_L)

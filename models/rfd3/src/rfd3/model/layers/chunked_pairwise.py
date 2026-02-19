@@ -475,6 +475,15 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 tq = tok_queries[b]  # [L_par, k]
                 tk = tok_keys[b]  # [L_par, k]
 
+                # DIAGNOSTIC: Print pre-clamp tq range to detect silent clamping
+                if b == 0:
+                    tq_pre_min, tq_pre_max = tq.min().item(), tq.max().item()
+                    n_clamped_tq = (tq >= I_z).sum().item()
+                    debug_log("PAIRWISE", "Z_clamp_check",
+                              f"I_z={I_z}, tq_pre_clamp=[{tq_pre_min},{tq_pre_max}], "
+                              f"n_clamped={n_clamped_tq}/{tq.numel()} "
+                              f"({'BUG: chunked Z used as full!' if n_clamped_tq > 0 else 'ok'})")
+
                 # Ensure indices are within bounds
                 tq = torch.clamp(tq, 0, I_z - 1)
                 tk = torch.clamp(tk, 0, I_z2 - 1)
@@ -509,5 +518,22 @@ class ChunkedPairwiseEmbedder(nn.Module):
         _log_tensor_stats("forward_chunked_single_m", single_m)
         _log_tensor_stats("forward_chunked_Z_pairs_processed", Z_pairs_processed)
         debug_log("PAIRWISE", "forward_chunked", f"query_start={query_start}, L_par={L_par}, L_full={L_full}")
-        
+
+        # DIAGNOSTIC: Split P_LL_sparse by token half to compare standard vs parallel chunks
+        if debug_ctx.stats_enabled and L_par > 0:
+            tok_idx_chunk = tok_idx[:L_par] if tok_idx.dim() == 1 else tok_idx[0, query_start:query_start+L_par]
+            I_total = tok_idx_chunk.max().item() + 1
+            I_mid = I_total // 2
+            first_half_mask = tok_idx_chunk < I_mid   # atoms whose token < I/2
+            second_half_mask = ~first_half_mask        # atoms whose token >= I/2
+            n_first = first_half_mask.sum().item()
+            n_second = second_half_mask.sum().item()
+            if n_first > 0 and n_second > 0:
+                p_first = P_LL_sparse[0, first_half_mask].float()
+                p_second = P_LL_sparse[0, second_half_mask].float()
+                debug_log("PAIRWISE", "P_LL_split_by_token_half",
+                          f"I_mid={I_mid}, "
+                          f"first_half(tok<{I_mid}): n={n_first}, mean={p_first.mean().item():.6f}, "
+                          f"second_half(tok>={I_mid}): n={n_second}, mean={p_second.mean().item():.6f}")
+
         return P_LL_sparse.contiguous()

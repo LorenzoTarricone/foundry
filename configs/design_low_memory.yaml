@@ -7,14 +7,14 @@
 #   python scripts/design_annotate.py --config config/design_low_memory.yaml
 
 # Output settings
-out_dir: "inference_outputs/design_I_50AAASU_lowmem"
+out_dir: "inference_outputs/design_check_400AA_monomer"
 
 # Protein design parameters
-length: 50
+length: 400
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
-symmetry: I
+# symmetry: I
 
 # MPNN settings
 mpnn_batch_size: 5

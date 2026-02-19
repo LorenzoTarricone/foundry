@@ -6,7 +6,7 @@ This script compares standard (1 GPU) and parallel (N GPUs) RFD3 implementations
 
 Usage:
     # Run full comparison (standard on 1 GPU, parallel on 2 GPUs):
-    python scripts/compare_parallel.py --config config/compare_parallel.yaml --num-gpus 2
+    python scripts/compare_parallel.py --config configs/compare_parallel.yaml --num-gpus 2
 
     # The script automatically:
     # 1. Runs standard mode on GPU 0
@@ -32,11 +32,11 @@ import pickle
 
 
 class TeeLogger:
-    """Write output to both stdout and a file."""
+    """Write output to both a terminal stream and a shared log file."""
 
-    def __init__(self, log_file_path: Path):
-        self.terminal = sys.stdout
-        self.log_file = open(log_file_path, 'w')
+    def __init__(self, log_file, terminal):
+        self.terminal = terminal
+        self.log_file = log_file
 
     def write(self, message):
         self.terminal.write(message)
@@ -46,9 +46,6 @@ class TeeLogger:
     def flush(self):
         self.terminal.flush()
         self.log_file.flush()
-
-    def close(self):
-        self.log_file.close()
 
 
 def init_distributed():
@@ -180,12 +177,16 @@ def build_rfd3_spec(length: int, symmetry: str = None):
 
 
 def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sampler: dict,
-                       ckpt_path: str, seed: int, out_dir: Path = None) -> torch.Tensor:
+                       ckpt_path: str, seed: int, out_dir: Path = None,
+                       debug_flags: dict = None) -> torch.Tensor:
     """Run standard (1 GPU) inference and return coordinates."""
     # CRITICAL: Set seed BEFORE any rfd3 imports to ensure deterministic behavior
     # Module imports can consume random numbers during initialization
     print(f"  Setting seed={seed} BEFORE imports...")
     set_seed(seed)
+
+    if debug_flags is None:
+        debug_flags = {}
 
     from atomworks.io.utils.io_utils import to_cif_file
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
@@ -196,6 +197,9 @@ def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sample
     debug_ctx.set_mode("STANDARD")
     debug_ctx.set_step(-1)
 
+    # Configure debug logging from config flags
+    debug_ctx.configure(debug_flags)
+
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
         diffusion_batch_size=1,
@@ -203,6 +207,10 @@ def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sample
         ckpt_path=ckpt_path,
         low_memory_mode=True,
         attention_parallel=False,
+        verbose=debug_flags.get('verbose', False),
+        verbose_stats=debug_flags.get('verbose_stats', False),
+        verbose_time=debug_flags.get('verbose_time', False),
+        verbose_memory=debug_flags.get('verbose_memory', False),
     )
 
     print("  Initializing standard RFD3 engine...")
@@ -238,12 +246,15 @@ def run_standard_mode(project_root: Path, rfd3_spec: dict, rfd3_inference_sample
 
 def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_inference_sampler: dict,
                                    ckpt_path: str, seed: int, output_cache: str,
-                                   out_dir: Path = None) -> int:
+                                   out_dir: Path = None, debug_flags: dict = None) -> int:
     """Run parallel (N GPU) inference in distributed mode and save results."""
     # CRITICAL: Set seed BEFORE any rfd3 imports to ensure deterministic behavior
     # Module imports can consume random numbers during initialization
     # NOTE: set_seed uses torch which is already imported at module level
     set_seed(seed)
+
+    if debug_flags is None:
+        debug_flags = {}
 
     from atomworks.io.utils.io_utils import to_cif_file
     from rfd3.engine import RFD3InferenceConfig, RFD3InferenceEngine
@@ -268,6 +279,9 @@ def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_infe
     debug_ctx.set_mode("PARALLEL")
     debug_ctx.set_step(-1)
 
+    # Configure debug logging from config flags
+    debug_ctx.configure(debug_flags)
+
     rfd3_config = RFD3InferenceConfig(
         specification=rfd3_spec,
         diffusion_batch_size=1,
@@ -275,6 +289,10 @@ def run_parallel_mode_distributed(project_root: Path, rfd3_spec: dict, rfd3_infe
         ckpt_path=ckpt_path,
         low_memory_mode=True,
         attention_parallel=True,
+        verbose=debug_flags.get('verbose', False),
+        verbose_stats=debug_flags.get('verbose_stats', False),
+        verbose_time=debug_flags.get('verbose_time', False),
+        verbose_memory=debug_flags.get('verbose_memory', False),
     )
 
     log("  Initializing parallel RFD3 engine...")
@@ -343,11 +361,13 @@ def run_orchestrator(config: dict, config_path: str, num_gpus: int, log_dir: Pat
     script_dir = Path(__file__).resolve().parent
     project_root = script_dir.parent
 
-    # Setup logging to both terminal and file
+    # Setup logging to both terminal and file (capture both stdout and stderr)
     log_file_path = log_dir / "compare_parallel.log"
-    tee = TeeLogger(log_file_path)
+    log_file = open(log_file_path, 'w')
     original_stdout = sys.stdout
-    sys.stdout = tee
+    original_stderr = sys.stderr
+    sys.stdout = TeeLogger(log_file, original_stdout)
+    sys.stderr = TeeLogger(log_file, original_stderr)
 
     try:
         setup_imports(project_root)
@@ -369,6 +389,15 @@ def run_orchestrator(config: dict, config_path: str, num_gpus: int, log_dir: Pat
         ckpt_path = get_checkpoint_path(project_root)
         rfd3_spec, rfd3_inference_sampler = build_rfd3_spec(length, symmetry)
 
+        # Extract debug/verbose flags from config
+        debug_flags = {
+            'verbose': config.get('verbose', False),
+            'verbose_stats': config.get('verbose_stats', False),
+            'verbose_time': config.get('verbose_time', False),
+            'verbose_memory': config.get('verbose_memory', False),
+        }
+        print(f"Debug flags: {debug_flags}")
+
         # Setup inference output directories for CIF files
         inference_out_dir = project_root / "inference_outputs"
         std_out_dir = inference_out_dir / "standard"
@@ -383,7 +412,7 @@ def run_orchestrator(config: dict, config_path: str, num_gpus: int, log_dir: Pat
         print("="*70)
 
         X_std = run_standard_mode(project_root, rfd3_spec, rfd3_inference_sampler, ckpt_path, seed,
-                                  out_dir=std_out_dir)
+                                  out_dir=std_out_dir, debug_flags=debug_flags)
 
         if X_std is None:
             print("  ERROR: Failed to get standard mode output")
@@ -502,9 +531,10 @@ def run_orchestrator(config: dict, config_path: str, num_gpus: int, log_dir: Pat
             return 0
 
     finally:
-        # Restore stdout and close log file
+        # Restore stdout/stderr and close shared log file
         sys.stdout = original_stdout
-        tee.close()
+        sys.stderr = original_stderr
+        log_file.close()
         print(f"Log saved to: {log_file_path}")
 
 
@@ -562,10 +592,16 @@ def main():
             config['length'], config.get('symmetry')
         )
         inference_out_dir = Path(args.inference_out_dir) if args.inference_out_dir else None
+        debug_flags = {
+            'verbose': config.get('verbose', False),
+            'verbose_stats': config.get('verbose_stats', False),
+            'verbose_time': config.get('verbose_time', False),
+            'verbose_memory': config.get('verbose_memory', False),
+        }
         return run_parallel_mode_distributed(
             project_root, rfd3_spec, rfd3_inference_sampler,
             ckpt_path, config['seed'], args.output_cache,
-            out_dir=inference_out_dir
+            out_dir=inference_out_dir, debug_flags=debug_flags
         )
     else:
         # Main orchestrator mode

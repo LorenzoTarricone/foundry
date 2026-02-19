@@ -10,10 +10,10 @@
 # Memory savings: O(L²/N + I²/N) per GPU, where N = number of GPUs
 
 # Output settings
-out_dir: "inference_outputs/design_momomer_100AA_parallel"
+out_dir: "inference_outputs/design_momomer_300AA_parallel"
 
 # Protein design parameters 
-length: 100  # Length of protein to design (in amino acids)
+length: 300  # Length of protein to design (in amino acids)
 num_designs: 1
 
 # Symmetry (null for no symmetry, or "C2", "C3", "D2", etc.)
