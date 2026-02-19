@@ -80,7 +80,7 @@ class PositionPairDistEmbedder(nn.Module):
     
     Supports both full and chunked (streaming) forward passes:
     - forward(): Full [I, I, c] or [L, L, c] output
-    - forward_chunk(): Chunked [I_par, I, c] output for streaming mode
+    - forward_parallel(): Chunked [I_par, I, c] output for streaming mode
     """
     
     def __init__(self, c_atompair, embed_frame=True):
@@ -141,7 +141,7 @@ class PositionPairDistEmbedder(nn.Module):
         P_LL = P_LL + self.process_valid_mask(V_LL.to(P_LL.dtype)) * V_LL
         return P_LL
 
-    def forward_chunk(
+    def forward_parallel(
         self, 
         ref_pos_query: torch.Tensor,  # [I_par, 3] query positions
         ref_pos_key: torch.Tensor,    # [I, 3] all key positions
@@ -224,7 +224,7 @@ class SinusoidalDistEmbed(nn.Module):
 
     Supports both full and chunked (streaming) forward passes:
     - forward(): Full [L, L, c] output
-    - forward_chunk(): Chunked [L_par, L, c] output for streaming mode
+    - forward_parallel(): Chunked [L_par, L, c] output for streaming mode
 
     Args:
         c_atompair (int): Output dimension of the projected embedding (must be even).
@@ -277,7 +277,7 @@ class SinusoidalDistEmbed(nn.Module):
         P_LL = P_LL + self.process_valid_mask(valid_mask.to(P_LL.dtype)) * valid_mask
         return P_LL
 
-    def forward_chunk(
+    def forward_parallel(
         self, 
         pos_query: torch.Tensor,   # [B, I_par, 3] query positions
         pos_key: torch.Tensor,     # [B, I, 3] all key positions
@@ -443,13 +443,13 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
         attn_parallel = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
         if attn_parallel not in ("0", "", "false", "False"):
             # Marker that chunking is enabled; actual chunk count determined at runtime
-            self.chunk_size = -1  # Will use dist.get_world_size() in _forward_chunked
+            self.chunk_size = -1  # Will use dist.get_world_size() in _forward_paralleled
 
     def forward(self, f):
         if self.chunk_size is None:
             return self._forward_full(f)
         else:
-            return self._forward_chunked(f)
+            return self._forward_paralleled(f)
 
     def _forward_full(self, f):
         b_samechain_II = f["asym_id"].unsqueeze(-1) == f["asym_id"].unsqueeze(-2)
@@ -521,7 +521,7 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
             ).to(torch.float)
         )
 
-    def _forward_chunked(self, f):
+    def _forward_paralleled(self, f):
         # Stream over query dimension to avoid holding full LxL intermediates
         import torch.distributed as dist
         L = f["asym_id"].shape[0]
@@ -586,7 +586,7 @@ class RelativePositionEncodingWithIndexRemoval(nn.Module):
 
         return torch.cat(outputs, dim=0)
 
-    def forward_chunk(self, f: dict, start_i: int, end_i: int) -> torch.Tensor:
+    def forward_parallel(self, f: dict, start_i: int, end_i: int) -> torch.Tensor:
         """
         Compute RPE for a specific row range (query chunk) against all columns (keys).
 

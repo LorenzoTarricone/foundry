@@ -17,6 +17,8 @@ Usage:
 import os
 os.environ.setdefault('CCD_MIRROR_PATH', '')
 os.environ.setdefault('PDB_MIRROR_PATH', '')
+# Required for torch.use_deterministic_algorithms(True) with CUDA >= 10.2
+os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
 import sys
 import argparse
@@ -82,6 +84,11 @@ def set_seed(seed: int = 42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # Force deterministic algorithms for CUDA ops (esp. cuBLAS matmuls)
+    # to eliminate inter-process non-determinism between standard and parallel runs.
+    # warn_only=True because index_reduce_cuda (used in process_a) lacks a
+    # deterministic impl, but it's not our divergence source (encoder matches exactly).
+    torch.use_deterministic_algorithms(True, warn_only=True)
     # Reset the default generator to ensure identical state
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):

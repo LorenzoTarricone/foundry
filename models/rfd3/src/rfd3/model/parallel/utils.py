@@ -120,6 +120,25 @@ def compute_gpu_query_range(total: int, rank: int, world_size: int) -> Tuple[int
     return chunk_ranges[rank]
 
 
+def broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
+    """
+    Broadcast tensor from source rank to all GPUs.
+
+    No-op if torch.distributed is not initialized.
+
+    Args:
+        tensor: Tensor to broadcast (in-place on all ranks).
+        src: Source rank to broadcast from.
+
+    Returns:
+        The broadcast tensor (same object, modified in-place).
+    """
+    if not dist.is_initialized():
+        return tensor
+    dist.broadcast(tensor, src=src)
+    return tensor
+
+
 def all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = None) -> torch.Tensor:
     """
     Gather tensors from all GPUs and concatenate along specified dimension.
@@ -280,54 +299,6 @@ def all_gather_along_dim(
         result = result[tuple(indices)].contiguous()
 
     return result
-
-
-def make_all_gather_fn(world_size: int):
-    """
-    Create a memory-efficient all_gather closure for use in parallel forward passes.
-
-    This replaces the inline closure previously defined in RFD3DiffusionModule.forward().
-
-    Args:
-        world_size: Number of GPUs
-
-    Returns:
-        Callable that gathers and concatenates tensors from all GPUs
-    """
-    def _all_gather_fn(tensor, ws, dim):
-        tensor = tensor.contiguous()
-
-        if hasattr(dist, 'all_gather_into_tensor'):
-            flat_input = tensor.view(-1)
-            flat_output = torch.empty(flat_input.numel() * ws, dtype=tensor.dtype, device=tensor.device)
-            timed_all_gather(flat_output, flat_input,
-                             "ALL_GATHER", "parallel.utils.make_all_gather_fn.data",
-                             gather_type="all_gather_into_tensor")
-
-            chunk_shape = list(tensor.shape)
-            reshaped = flat_output.view(ws, *chunk_shape)
-
-            if dim == 0:
-                result = reshaped.view(-1, *chunk_shape[1:])
-            else:
-                perm = list(range(1, dim + 1)) + [0] + list(range(dim + 1, len(chunk_shape) + 1))
-                transposed = reshaped.permute(*perm)
-                final_shape = list(tensor.shape)
-                final_shape[dim] = final_shape[dim] * ws
-                result = transposed.contiguous().view(*final_shape)
-
-            del flat_input, flat_output, reshaped
-            return result
-        else:
-            gathered = [torch.zeros_like(tensor) for _ in range(ws)]
-            timed_all_gather(gathered, tensor,
-                             "ALL_GATHER", "parallel.utils.make_all_gather_fn.data_fallback",
-                             gather_type="all_gather")
-            result = torch.cat(gathered, dim=dim)
-            del gathered
-            return result
-
-    return _all_gather_fn
 
 
 def z_transition_chunked(Z: torch.Tensor, transition_fn, key_chunk: int = 512, extra_chunking: bool = None) -> torch.Tensor:

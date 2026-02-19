@@ -8,15 +8,15 @@
 # Expected: SYNC_OK messages (max_diff < 1e-5) at all checkpoints
 
 # Output settings
-out_dir: "inference_outputs/compare_parallel_monomer"
+out_dir: "inference_outputs/compare_parallel_I60_40"
 
 # Protein design parameters
-length: 500
+length: 40
 num_designs: 1
 
 # Symmetry: I = Icosahedral (60-fold symmetry)
 # This creates 60 * length = 1800 residues total
-# symmetry: I
+symmetry: I
 
 # MPNN settings
 mpnn_batch_size: 3

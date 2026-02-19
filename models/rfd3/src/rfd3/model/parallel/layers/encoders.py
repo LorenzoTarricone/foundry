@@ -5,12 +5,15 @@ Classes extracted from encoders.py for parallel (multi-GPU) mode.
 """
 
 import gc
+import logging
 import os
 import torch
 import torch.distributed as dist
 
 from rfd3.model.layers.encoders import TokenInitializer, DiffusionTokenEncoder
-from rfd3.model.debug_context import debug_ctx, debug_tensor_all_ranks, verify_tensor_sync, debug_memory
+from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks, debug_tensor_all_ranks, verify_tensor_sync, debug_memory
+
+logger = logging.getLogger(__name__)
 from rfd3.model.parallel.utils import (
     get_gpu_rank_and_world_size,
     compute_chunk_ranges,
@@ -118,20 +121,18 @@ class ParallelTokenInitializer(TokenInitializer):
         # ================================================================
         S_I_chunk = S_I[start_i:end_i]                        # [I_par, c_s]
 
-        # DEBUG: Print S_I_chunk used for Z_chunk computation
         if is_rank0 and debug_ctx.stats_enabled:
-            print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_COMPUTATION: S_I_chunk={_stat_tensor(S_I_chunk)}, Z_j={_stat_tensor(Z_j)}", flush=True)
+            debug_log_all_ranks("ENCODER-S_I", "Z_CHUNK_COMPUTATION", f"S_I_chunk={_stat_tensor(S_I_chunk)}, Z_j={_stat_tensor(Z_j)}")
 
         Z_i = self.to_z_init_i(S_I_chunk).unsqueeze(-2)       # [I_par, 1, c_z]
         Z_j_full = Z_j.unsqueeze(0)                           # [1, I, c_z]
         Z_chunk = Z_i + Z_j_full                              # [I_par, I, c_z]
 
-        # DEBUG: Print initial Z_chunk
         if is_rank0 and debug_ctx.stats_enabled:
-            print(f"{debug_ctx.prefix('ENCODER-S_I')} Z_CHUNK_INITIAL: Z_chunk={_stat_tensor(Z_chunk)}", flush=True)
+            debug_log_all_ranks("ENCODER-S_I", "Z_CHUNK_INITIAL", f"Z_chunk={_stat_tensor(Z_chunk)}")
 
         # Add RPE
-        Z_chunk = Z_chunk + self.relative_position_encoding.forward_chunk(
+        Z_chunk = Z_chunk + self.relative_position_encoding.forward_parallel(
             f, start_i, end_i
         )                                                      # [I_par, I, c_z]
 
@@ -147,7 +148,7 @@ class ParallelTokenInitializer(TokenInitializer):
         valid_mask = (
             ref_space_uid_chunk.unsqueeze(-1) == ref_space_uid.unsqueeze(0)
         ).unsqueeze(-1)                                        # [I_par, I, 1]
-        ref_pos_embed = self.ref_pos_embedder_tok.forward_chunk(
+        ref_pos_embed = self.ref_pos_embedder_tok.forward_parallel(
             ref_pos_chunk, ref_pos, valid_mask
         )                                                      # [I_par, I, c_z]
         Z_chunk = Z_chunk + ref_pos_embed
@@ -158,9 +159,8 @@ class ParallelTokenInitializer(TokenInitializer):
         # Note: _stat_tensor and is_rank0 are already defined above
 
         for block_idx, block in enumerate(self.transformer_stack):
-            # DEBUG: Print S_I stats at start of each block to verify it's being updated
             if is_rank0 and debug_ctx.stats_enabled:
-                print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} START: S_I={_stat_tensor(S_I)}, device={S_I.device}", flush=True)
+                debug_log_all_ranks("ENCODER-S_I", f"block{block_idx}_START", f"S_I={_stat_tensor(S_I)}, device={S_I.device}")
 
             # Step 1: Apply z_transition (ACCUMULATES across blocks)
             Z_chunk = z_transition_chunked(Z_chunk, block.z_transition)
@@ -171,9 +171,8 @@ class ParallelTokenInitializer(TokenInitializer):
                 # S_I should have been updated from the previous iteration's all_gather
                 S_I_chunk = S_I[start_i:end_i].clone()        # [I_par, c_s] - clone to ensure fresh tensor
 
-                # DEBUG: Print S_I_chunk stats after slicing
                 if is_rank0 and debug_ctx.stats_enabled:
-                    print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_SLICE: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
+                    debug_log_all_ranks("ENCODER-S_I", f"block{block_idx}_AFTER_SLICE", f"S_I_chunk={_stat_tensor(S_I_chunk)}")
 
                 from rfd3.model.parallel.layers.pairformer_layers import attention_pair_bias_forward_parallel
                 S_I_chunk = S_I_chunk + attention_pair_bias_forward_parallel(
@@ -185,9 +184,8 @@ class ParallelTokenInitializer(TokenInitializer):
                 )                                              # [I_par, c_s]
                 S_I_chunk = S_I_chunk + block.s_transition(S_I_chunk)
 
-                # DEBUG: Print S_I_chunk stats after processing
                 if is_rank0 and debug_ctx.stats_enabled:
-                    print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} AFTER_PROCESS: S_I_chunk={_stat_tensor(S_I_chunk)}", flush=True)
+                    debug_log_all_ranks("ENCODER-S_I", f"block{block_idx}_AFTER_PROCESS", f"S_I_chunk={_stat_tensor(S_I_chunk)}")
 
                 # Step 3: All-gather S_I chunks to update full S_I for next block
                 # CRITICAL: This updates S_I for the next iteration
@@ -208,9 +206,8 @@ class ParallelTokenInitializer(TokenInitializer):
                     S_I = S_I_gathered
                 else:
                     S_I = S_I_chunk
-                    # DEBUG: Single GPU case
                     if is_rank0 and debug_ctx.stats_enabled:
-                        print(f"{debug_ctx.prefix('ENCODER-S_I')} block{block_idx} SINGLE_GPU: S_I={_stat_tensor(S_I)}", flush=True)
+                        debug_log_all_ranks("ENCODER-S_I", f"block{block_idx}_SINGLE_GPU", f"S_I={_stat_tensor(S_I)}")
 
                 # Memory cleanup after each block to prevent excessive accumulation
                 # (parallel mode memory optimization)
@@ -331,7 +328,7 @@ class ParallelTokenInitializer(TokenInitializer):
 
             # Post-transformer Z processing (matches standard path exactly)
             # Standard path does: cat(Z, RPE2) → process_z_init → transition_1[0..1]
-            rpe2_chunk = self.relative_position_encoding2.forward_chunk(
+            rpe2_chunk = self.relative_position_encoding2.forward_parallel(
                 f, start_i, end_i
             )                                                 # [I_par, I, c_z]
             Z_chunk = torch.cat(
@@ -483,13 +480,13 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
 
         # DIAGNOSTIC: Verify device consistency before copy
         if Z_init_chunk.device != device:
-            print(f"[RANK{rank}] ERROR: Z_init_chunk on {Z_init_chunk.device}, Z_chunk on {device}", flush=True)
+            logger.warning(f"[RANK{rank}] Z_init_chunk on {Z_init_chunk.device}, Z_chunk on {device}")
             Z_init_chunk = Z_init_chunk.to(device)
 
         # Perform the copy with explicit synchronization for multi-GPU stability
         try:
             Z_chunk[:, :, :, :base_z_dim] = Z_init_chunk.unsqueeze(0).expand(B, -1, -1, -1)
-            torch.cuda.synchronize(device)  # Ensure copy completes before proceeding
+            # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
             debug_memory("DIFF_ENCODER", "after_Z_init_copy")
         except RuntimeError as e:
             print(f"[RANK{rank}] COPY_ERROR: {e}", flush=True)
@@ -508,13 +505,13 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
             # Verify f["is_ca"] device before boolean indexing
             is_ca = f["is_ca"]
             if is_ca.device != device:
-                print(f"[RANK{rank}] DEVICE_FIX: is_ca on {is_ca.device}, moving to {device}", flush=True)
+                logger.warning(f"[RANK{rank}] DEVICE_FIX: is_ca on {is_ca.device}, moving to {device}")
                 is_ca = is_ca.to(device)
                 f["is_ca"] = is_ca
 
             try:
                 R_ca = R_L[..., is_ca, :]                 # [B, I, 3]
-                torch.cuda.synchronize(device)  # Ensure indexing completes
+                # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
                 debug_memory("DIFF_ENCODER", "after_R_ca_indexing")
             except RuntimeError as e:
                 print(f"[RANK{rank}] R_ca_INDEXING_ERROR: {e}", flush=True)
@@ -528,7 +525,7 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
                 # Verify motif mask device
                 motif_full = f["is_motif_atom_with_fixed_coord"]
                 if motif_full.device != device:
-                    print(f"[RANK{rank}] DEVICE_FIX: motif on {motif_full.device}, moving to {device}", flush=True)
+                    logger.warning(f"[RANK{rank}] DEVICE_FIX: motif on {motif_full.device}, moving to {device}")
                     motif_full = motif_full.to(device)
                     f["is_motif_atom_with_fixed_coord"] = motif_full
 
@@ -545,17 +542,16 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
                     # Check the output_proj Linear layer's weight device
                     embedder_device = self.dist_embedder.output_proj.weight.device
                     if embedder_device != device:
-                        print(f"[RANK{rank}] WARNING: dist_embedder on {embedder_device}, moving to {device}", flush=True)
+                        logger.warning(f"[RANK{rank}] dist_embedder on {embedder_device}, moving to {device}")
                         self.dist_embedder = self.dist_embedder.to(device)
-                        # Synchronize to ensure move is complete before use
-                        torch.cuda.synchronize(device)
+                        # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
 
                 # Sinusoidal distance embedding for this chunk
                 try:
-                    D_chunk = self.dist_embedder.forward_chunk(
+                    D_chunk = self.dist_embedder.forward_parallel(
                         R_ca_query, R_ca, ~mask_chunk
                     )                                          # [B, I_par, I, c_z]
-                    torch.cuda.synchronize(device)  # Ensure forward completes
+                    # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
                     debug_memory("DIFF_ENCODER", "after_dist_embedder")
                 except RuntimeError as e:
                     print(f"[RANK{rank}] DIST_EMBEDDER_ERROR: {e}", flush=True)
@@ -568,9 +564,9 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
                 # DIAGNOSTIC: Log before bucketized distogram
                 debug_memory("DIFF_ENCODER", f"before_bucketized_distogram_Rca{list(R_ca.shape)}")
                 if R_ca.device != device:
-                    print(f"[RANK{rank}] WARNING: R_ca on {R_ca.device}, expected {device}", flush=True)
+                    logger.warning(f"[RANK{rank}] R_ca on {R_ca.device}, expected {device}")
                     R_ca = R_ca.to(device)
-                    torch.cuda.synchronize(device)
+                    # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
 
                 try:
                     D_chunk = bucketize_scaled_distogram_chunked(
@@ -578,7 +574,7 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
                         min_dist=1, max_dist=30, sigma_data=16,  # default sigma_data
                         n_bins=self.n_bins_distogram
                     )                                          # [B, I_par, I, n_bins]
-                    torch.cuda.synchronize(device)  # Ensure distogram computation completes
+                    # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
                     debug_memory("DIFF_ENCODER", f"after_bucketized_distogram_Dchunk{list(D_chunk.shape)}")
                 except RuntimeError as e:
                     print(f"[RANK{rank}] BUCKETIZED_DISTOGRAM_ERROR: {e}", flush=True)
@@ -590,14 +586,14 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
             # DIAGNOSTIC: Log before copy into Z_chunk
             debug_memory("DIFF_ENCODER", "before_D_chunk_copy")
             if D_chunk.device != device:
-                print(f"[RANK{rank}] WARNING: D_chunk on {D_chunk.device}, Z_chunk on {device}", flush=True)
+                logger.warning(f"[RANK{rank}] D_chunk on {D_chunk.device}, Z_chunk on {device}")
                 D_chunk = D_chunk.to(device)
-                torch.cuda.synchronize(device)
+                # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
 
             # Copy into pre-allocated slice (avoids cat)
             try:
                 Z_chunk[:, :, :, offset:offset+distogram_dim] = D_chunk
-                torch.cuda.synchronize(device)  # Ensure copy completes
+                # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
                 debug_memory("DIFF_ENCODER", "after_D_chunk_copy")
             except RuntimeError as e:
                 print(f"[RANK{rank}] D_CHUNK_COPY_ERROR: {e}", flush=True)
@@ -615,9 +611,9 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
             if D_II_self is not None:
                 # CRITICAL: Ensure D_II_self is on the correct device (multi-node fix)
                 if D_II_self.device != device:
-                    print(f"[RANK{rank}] WARNING: D_II_self on {D_II_self.device}, moving to {device}", flush=True)
+                    logger.warning(f"[RANK{rank}] D_II_self on {D_II_self.device}, moving to {device}")
                     D_II_self = D_II_self.to(device)
-                    torch.cuda.synchronize(device)
+                    # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
                 # =======================================================================
                 # MEMORY OPTIMIZATION: D_II_self may already be chunked [B, I_par, I, n_bins]
                 # In multi-GPU mode, RFD3_diffusion_module now returns the chunk directly
@@ -637,7 +633,7 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
                         B, I_par, I, self.n_bins_distogram,
                         device=device, dtype=dtype
                     )                                          # [B, I_par, I, n_bins]
-                    torch.cuda.synchronize(device)
+                    # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
                     debug_memory("DIFF_ENCODER", f"after_zeros_D_self_chunk{list(D_self_chunk.shape)}")
                 except RuntimeError as e:
                     print(f"[RANK{rank}] ZEROS_ERROR: {e}", flush=True)
@@ -648,7 +644,7 @@ class ParallelDiffusionTokenEncoder(DiffusionTokenEncoder):
             debug_memory("DIFF_ENCODER", "before_D_self_copy")
             try:
                 Z_chunk[:, :, :, offset:offset+self.n_bins_distogram] = D_self_chunk
-                torch.cuda.synchronize(device)
+                # torch.cuda.synchronize(device)  # DEBUG: re-enable for multi-node debugging
                 debug_memory("DIFF_ENCODER", "after_D_self_copy")
             except RuntimeError as e:
                 print(f"[RANK{rank}] D_SELF_COPY_ERROR: {e}", flush=True)

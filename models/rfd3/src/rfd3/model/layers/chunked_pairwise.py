@@ -370,6 +370,47 @@ class ChunkedPairwiseEmbedder(nn.Module):
         single_m = self._get_process_single_m()(C_L_keys)  # [B, L_par, k, c_atompair]
         P_LL_sparse += single_l + single_m
 
+        # DEBUG: Print singles breakdown split by token half for cross-mode comparison
+        if debug_ctx.stats_enabled and L_par > 0:
+            tok_idx_chunk = tok_idx[:L_par] if tok_idx.dim() == 1 else tok_idx[0, query_start:query_start+L_par]
+            I_total = tok_idx_chunk.max().item() + 1
+            I_mid = I_total // 2
+            first_half_mask = tok_idx_chunk < I_mid
+            second_half_mask = ~first_half_mask
+            n_first = first_half_mask.sum().item()
+            n_second = second_half_mask.sum().item()
+            if n_first > 0 and n_second > 0:
+                sl_first = single_l[0, first_half_mask].float().mean().item()
+                sl_second = single_l[0, second_half_mask].float().mean().item()
+                sm_first = single_m[0, first_half_mask].float().mean().item()
+                sm_second = single_m[0, second_half_mask].float().mean().item()
+                p_first = P_LL_sparse[0, first_half_mask].float().mean().item()
+                p_second = P_LL_sparse[0, second_half_mask].float().mean().item()
+                debug_log("PAIRWISE", "SINGLES_SPLIT",
+                          f"first_half: single_l={sl_first:.6f}, single_m={sm_first:.6f}, P_after_singles={p_first:.6f} | "
+                          f"second_half: single_l={sl_second:.6f}, single_m={sm_second:.6f}, P_after_singles={p_second:.6f}")
+                # Checksum indices and C_L_keys for cross-mode comparison
+                # Split indices by first/second half
+                first_half_indices = valid_indices[0, first_half_mask]  # [n_first, k]
+                second_half_indices = valid_indices[0, second_half_mask]  # [n_second, k]
+                first_idx_sum = first_half_indices.float().sum().item()
+                second_idx_sum = second_half_indices.float().sum().item()
+                first_clk_mean = C_L_keys[0, first_half_mask].float().mean().item()
+                second_clk_mean = C_L_keys[0, second_half_mask].float().mean().item()
+                first_clq_mean = C_L_queries[0, first_half_mask].float().mean().item()
+                second_clq_mean = C_L_queries[0, second_half_mask].float().mean().item()
+                # First/last index rows of each half
+                first_idx_row0 = first_half_indices[0, :10].tolist()
+                second_idx_row0 = second_half_indices[0, :10].tolist()
+                first_idx_rowlast = first_half_indices[-1, :10].tolist()
+                second_idx_rowlast = second_half_indices[-1, :10].tolist()
+                debug_log("PAIRWISE", "INDICES_CHECK_SPLIT",
+                          f"first_half: idx_sum={first_idx_sum:.1f}, first_row={first_idx_row0}, last_row={first_idx_rowlast} | "
+                          f"second_half: idx_sum={second_idx_sum:.1f}, first_row={second_idx_row0}, last_row={second_idx_rowlast}")
+                debug_log("PAIRWISE", "CL_KEYS_CHECK_SPLIT",
+                          f"first_half: C_L_keys_mean={first_clk_mean:.6f}, C_L_queries_mean={first_clq_mean:.6f} | "
+                          f"second_half: C_L_keys_mean={second_clk_mean:.6f}, C_L_queries_mean={second_clq_mean:.6f}")
+
         # 4. Token pair features Z_init_II
         # Map atoms to tokens and gather token pair features
         # Handle tok_idx dimensions properly
@@ -454,6 +495,29 @@ class ChunkedPairwiseEmbedder(nn.Module):
             debug_log("PAIRWISE", "Z_init_II_stats",
                       f"mean={Z_init_II.float().mean().item():.6f}, std={Z_init_II.float().std().item():.6f}")
 
+            # DEBUG: Print Z_init_II values at positions corresponding to RANK1's local positions
+            # For cross-mode comparison: RANK1 has z_chunk_range=(I/2, I), so its local [0,0] = global [I/2,0]
+            if debug_ctx.stats_enabled:
+                I_half = I_z // 2
+                # Print values at RANK0-equivalent positions (global [0, 0], [0, 50])
+                z_00 = Z_init_II[0, 0, :5].tolist()
+                z_050 = Z_init_II[0, 50, :5].tolist()
+                # Print values at RANK1-equivalent positions (global [I/2, 0], [I/2, 50])
+                z_half_0 = Z_init_II[I_half, 0, :5].tolist()
+                z_half_50 = Z_init_II[I_half, 50, :5].tolist()
+                mid_rank1 = I_half + I_half // 2
+                z_mid_rank1 = Z_init_II[min(mid_rank1, I_z-1), 0, :5].tolist()
+                # Also print first/second half stats
+                z_first_half_mean = Z_init_II[:I_half].float().mean().item()
+                z_second_half_mean = Z_init_II[I_half:].float().mean().item()
+                debug_log("PAIRWISE", "Z_INIT_II_CROSSMODE",
+                          f"I_half={I_half}, "
+                          f"[0,0,:5]={z_00}, [0,50,:5]={z_050}, "
+                          f"[{I_half},0,:5]={z_half_0}, [{I_half},50,:5]={z_half_50}, "
+                          f"[{min(mid_rank1,I_z-1)},0,:5]={z_mid_rank1}, "
+                          f"first_half_mean={z_first_half_mean:.6f}, "
+                          f"second_half_mean={z_second_half_mean:.6f}")
+
             # CRITICAL: Match standard implementation exactly!
             # Standard does: self.process_z(Z_init_II)[..., tok_idx, :, :][..., tok_idx, :]
             # This means: 1) Process Z_init_II first, 2) Then do double token indexing
@@ -506,6 +570,22 @@ class ChunkedPairwiseEmbedder(nn.Module):
                 Z_pairs_processed[b] = Z_processed[tq, tk]  # [L, k, c_atompair]
 
         P_LL_sparse += Z_pairs_processed
+
+        # DEBUG: Print P_LL AFTER Z_pairs, BEFORE pair_mlp split by token half
+        if debug_ctx.stats_enabled and L_par > 0:
+            tok_idx_chunk_pre = tok_idx[:L_par] if tok_idx.dim() == 1 else tok_idx[0, query_start:query_start+L_par]
+            I_total_pre = tok_idx_chunk_pre.max().item() + 1
+            I_mid_pre = I_total_pre // 2
+            first_mask_pre = tok_idx_chunk_pre < I_mid_pre
+            second_mask_pre = ~first_mask_pre
+            if first_mask_pre.sum() > 0 and second_mask_pre.sum() > 0:
+                p_first_pre = P_LL_sparse[0, first_mask_pre].float().mean().item()
+                p_second_pre = P_LL_sparse[0, second_mask_pre].float().mean().item()
+                zp_first = Z_pairs_processed[0, first_mask_pre].float().mean().item()
+                zp_second = Z_pairs_processed[0, second_mask_pre].float().mean().item()
+                debug_log("PAIRWISE", "P_AFTER_Z_BEFORE_MLP_SPLIT",
+                          f"first_half: Z_pairs={zp_first:.6f}, P={p_first_pre:.6f} | "
+                          f"second_half: Z_pairs={zp_second:.6f}, P={p_second_pre:.6f}")
 
         # 5. Final MLP - ADD the result, don't replace (to match standard implementation)
         P_LL_sparse = P_LL_sparse + self._get_pair_mlp()(P_LL_sparse)

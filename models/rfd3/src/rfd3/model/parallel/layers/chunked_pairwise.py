@@ -5,9 +5,8 @@ Free function extracted from chunked_pairwise.py.
 """
 
 import torch
-import torch.distributed as dist
 
-from rfd3.model.debug_context import debug_ctx, debug_tensor_all_ranks
+from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks, debug_tensor_all_ranks
 
 
 def chunked_pairwise_forward_parallel(
@@ -87,6 +86,26 @@ def chunked_pairwise_forward_parallel(
         single_m = embedder._get_process_single_m()(C_L_keys)
         P_LL_sparse_chunk = P_LL_sparse_chunk + single_l + single_m
 
+        # DEBUG: Log single_l + single_m stats on ALL ranks
+        if debug_ctx.stats_enabled:
+            sl_mean = single_l.float().mean().item()
+            sm_mean = single_m.float().mean().item()
+            p_after_singles = P_LL_sparse_chunk.float().mean().item()
+            debug_log_all_ranks("P_LL_SPARSE", "SINGLES",
+                f"single_l_mean={sl_mean:.6f}, single_m_mean={sm_mean:.6f}, "
+                f"P_after_singles={p_after_singles:.6f}")
+            idx_sum = indices_chunk.float().sum().item()
+            idx_clamped_sum = indices_clamped.float().sum().item()
+            clk_mean = C_L_keys.float().mean().item()
+            clq_mean = C_L_queries.float().mean().item()
+            idx_first = indices_chunk[0, 0, :10].tolist()
+            idx_last = indices_chunk[0, -1, :10].tolist()
+            debug_log_all_ranks("P_LL_SPARSE", "INDICES_CHECK",
+                f"sum={idx_sum:.1f}, clamped_sum={idx_clamped_sum:.1f}, "
+                f"first_row={idx_first}, last_row={idx_last}")
+            debug_log_all_ranks("P_LL_SPARSE", "CL_KEYS_CHECK",
+                f"C_L_keys_mean={clk_mean:.6f}, C_L_queries_mean={clq_mean:.6f}")
+
     # 2. Token pair features Z for chunk (VECTORIZED)
     if tok_idx is not None and Z_init_II is not None:
         if tok_idx.dim() == 1:
@@ -121,13 +140,47 @@ def chunked_pairwise_forward_parallel(
             local_tq = torch.clamp(tq - start_i, 0, I_par_z - 1)
             tk = torch.clamp(tk, 0, I_z - 1)
 
+            # DEBUG: Log Z_init_II chunk stats and specific values on ALL ranks
+            if debug_ctx.stats_enabled:
+                z_mean = Z_init_II.float().mean().item()
+                z_std = Z_init_II.float().std().item()
+                z_00 = Z_init_II[0, 0, :5].tolist()
+                z_050 = Z_init_II[0, 50, :5].tolist()
+                mid = min(I_par_z // 2, I_par_z - 1)
+                z_mid = Z_init_II[mid, 0, :5].tolist()
+                debug_log_all_ranks("P_LL_SPARSE", "Z_INIT_II_CHUNK",
+                    f"shape={list(Z_init_II.shape)}, range=({start_i},{end_i}), "
+                    f"mean={z_mean:.6f}, std={z_std:.6f}")
+                debug_log_all_ranks("P_LL_SPARSE", "Z_INIT_II_VALUES",
+                    f"[0,0,:5]={z_00}, [0,50,:5]={z_050}, [{mid},0,:5]={z_mid}")
+                debug_log_all_ranks("P_LL_SPARSE", "TOK_RANGE",
+                    f"tq=[{tq.min().item()},{tq.max().item()}], "
+                    f"tk=[{tk.min().item()},{tk.max().item()}], "
+                    f"local_tq=[{local_tq.min().item()},{local_tq.max().item()}]")
+
             # Index into chunked Z
             Z_pairs_full = Z_init_II[
                 local_tq.flatten(),
                 tk.flatten()
             ].view(L_par, k, -1)
 
+            # DEBUG: Log Z_pairs stats BEFORE process_z on ALL ranks
+            if debug_ctx.stats_enabled:
+                zp_mean = Z_pairs_full.float().mean().item()
+                zp_00 = Z_pairs_full[0, 0, :5].tolist()
+                zp_100_50 = Z_pairs_full[min(100, L_par-1), min(50, k-1), :5].tolist()
+                debug_log_all_ranks("P_LL_SPARSE", "Z_PAIRS_BEFORE_PROCESS_Z",
+                    f"mean={zp_mean:.6f}, [0,0,:5]={zp_00}, [100,50,:5]={zp_100_50}")
+
             Z_pairs_processed = embedder._get_process_z()(Z_pairs_full)
+
+            # DEBUG: Log Z_pairs stats AFTER process_z on ALL ranks
+            if debug_ctx.stats_enabled:
+                zpp_mean = Z_pairs_processed.float().mean().item()
+                zpp_00 = Z_pairs_processed[0, 0, :5].tolist()
+                debug_log_all_ranks("P_LL_SPARSE", "Z_PAIRS_AFTER_PROCESS_Z",
+                    f"mean={zpp_mean:.6f}, [0,0,:5]={zpp_00}")
+
             Z_pairs_processed_chunk = Z_pairs_processed.unsqueeze(0).expand(B, -1, -1, -1)
         else:
             # Standard mode: full Z tensor [I, I, c_z]
@@ -142,6 +195,12 @@ def chunked_pairwise_forward_parallel(
 
         # Add Z_pairs to P_LL
         P_LL_sparse_chunk = P_LL_sparse_chunk + Z_pairs_processed_chunk
+
+        # DEBUG: Log P_LL stats AFTER adding Z_pairs, BEFORE pair_mlp on ALL ranks
+        if debug_ctx.stats_enabled:
+            p_after_z = P_LL_sparse_chunk.float().mean().item()
+            debug_log_all_ranks("P_LL_SPARSE", "P_AFTER_Z_BEFORE_MLP",
+                f"mean={p_after_z:.6f}")
 
     # Final MLP
     P_LL_sparse_chunk = P_LL_sparse_chunk + embedder._get_pair_mlp()(P_LL_sparse_chunk)

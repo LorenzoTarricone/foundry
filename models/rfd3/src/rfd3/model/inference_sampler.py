@@ -2,7 +2,7 @@ import inspect
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Literal, Optional, Tuple, List
+from typing import Any, Literal, Optional
 
 import torch
 import torch.distributed as dist
@@ -19,154 +19,12 @@ from foundry.utils.rotation_augmentation import (
     uniform_random_rotation,
 )
 from rfd3.model.debug_context import debug_ctx, debug_log_all_ranks, debug_time, debug_time_log, TimingInstrument
-from rfd3.model.parallel.utils import compute_chunk_ranges
+from rfd3.model.parallel.utils import (
+    broadcast_tensor as _broadcast_tensor,
+    get_gpu_rank_and_world_size as _get_gpu_rank_and_world_size,
+)
 
 ranked_logger = RankedLogger(__name__, rank_zero_only=True)
-
-
-# =============================================================================
-# Multi-GPU Parallel Inference Utilities
-# =============================================================================
-
-def _is_parallel_mode() -> bool:
-    """
-    Check if streaming/parallel attention mode is enabled.
-
-    Env var scheme:
-      - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
-      - RFD3_ATTENTION_PARALLEL=1 or any non-zero value → parallel mode (True)
-    """
-    val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    return val not in ("0", "", "false", "False")
-
-
-def _get_gpu_rank_and_world_size() -> Tuple[int, int]:
-    """Get current GPU rank and total world size for distributed processing."""
-    if dist.is_initialized():
-        return dist.get_rank(), dist.get_world_size()
-    else:
-        return 0, 1
-
-
-def _compute_gpu_query_range(total: int, rank: int, world_size: int) -> Tuple[int, int]:
-    """
-    Compute the query index range for a specific GPU.
-
-    Uses compute_chunk_ranges to ensure consistent chunk distribution
-    across all code paths (encoder, transformer, decoder).
-
-    Args:
-        total: Total number of queries (I or L)
-        rank: This GPU's rank (0 to world_size-1)
-        world_size: Total number of GPUs
-
-    Returns:
-        (start_idx, end_idx): Query range for this GPU [start, end)
-    """
-    chunk_ranges = compute_chunk_ranges(total, world_size)
-    if rank >= len(chunk_ranges):
-        return total, total  # No tokens for this rank
-    return chunk_ranges[rank]
-
-
-def _all_gather_variable_size(
-    tensor: torch.Tensor, 
-    dim: int, 
-    sizes: List[int],
-) -> torch.Tensor:
-    """
-    Gather tensors of potentially different sizes along a dimension.
-    
-    Args:
-        tensor: Local tensor chunk
-        dim: Dimension along which chunks vary
-        sizes: List of sizes for each GPU's chunk
-        
-    Returns:
-        Concatenated tensor from all GPUs
-    """
-    if not dist.is_initialized():
-        return tensor
-    
-    world_size = dist.get_world_size()
-    if world_size == 1:
-        return tensor
-    
-    # Create placeholder tensors for each GPU's contribution
-    gathered = []
-    for i, size in enumerate(sizes):
-        # Create tensor with correct size for GPU i
-        shape = list(tensor.shape)
-        shape[dim] = size
-        gathered.append(torch.zeros(shape, dtype=tensor.dtype, device=tensor.device))
-    
-    # Gather all tensors
-    dist.all_gather(gathered, tensor)
-    
-    return torch.cat(gathered, dim=dim)
-
-
-def _all_gather_concat(tensor: torch.Tensor, dim: int = 0, total_size: int = None) -> torch.Tensor:
-    """
-    Gather tensors from all GPUs and concatenate along specified dimension.
-
-    Handles uneven chunk sizes: when dividing N elements across W GPUs,
-    the last GPU may have fewer elements. This function pads smaller chunks
-    before gathering and slices to the correct total size.
-
-    Args:
-        tensor: Local tensor to gather
-        dim: Dimension to concatenate along
-        total_size: Expected total size after gathering (handles uneven chunks)
-
-    Returns:
-        Concatenated tensor from all GPUs
-    """
-    if not dist.is_initialized():
-        return tensor
-
-    world_size = dist.get_world_size()
-    if world_size == 1:
-        return tensor
-
-    # Handle uneven chunk sizes by finding max size and padding
-    local_size = tensor.shape[dim]
-    local_size_tensor = torch.tensor([local_size], dtype=torch.long, device=tensor.device)
-    all_sizes = [torch.zeros(1, dtype=torch.long, device=tensor.device) for _ in range(world_size)]
-    dist.all_gather(all_sizes, local_size_tensor)
-    all_sizes = [s.item() for s in all_sizes]
-    max_size = max(all_sizes)
-    actual_total = sum(all_sizes)
-
-    # Pad tensor if needed
-    if local_size < max_size:
-        pad_size = max_size - local_size
-        pad_shape = list(tensor.shape)
-        pad_shape[dim] = pad_size
-        padding = torch.zeros(pad_shape, dtype=tensor.dtype, device=tensor.device)
-        tensor = torch.cat([tensor, padding], dim=dim)
-
-    # Gather all tensors
-    gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
-    dist.all_gather(gathered, tensor)
-    result = torch.cat(gathered, dim=dim)
-
-    # Slice to correct size
-    final_size = total_size if total_size is not None else actual_total
-    if result.shape[dim] > final_size:
-        indices = [slice(None)] * result.dim()
-        indices[dim] = slice(0, final_size)
-        result = result[tuple(indices)].contiguous()
-
-    return result
-
-
-def _broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
-    """Broadcast tensor from source rank to all GPUs."""
-    if not dist.is_initialized():
-        return tensor
-    dist.broadcast(tensor, src=src)
-    return tensor
 
 
 @dataclass(kw_only=True)
@@ -294,11 +152,9 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
             X_L: Initial noisy coordinates [D, L, 3]
         """
         noise = c0 * torch.normal(mean=0.0, std=1.0, size=(D, L, 3), device=c0.device)
-        # NOTE: Initial noise is NOT broadcast here because tensors may not be on
-        # correct local devices yet. Initial noise synchronization relies on
-        # set_seed() being called with the same seed on all ranks. The per-step
-        # epsilon_L noise IS broadcast in the diffusion loop where device placement
-        # is correct.
+        # NOTE: Initial noise is NOT broadcast here — the caller is responsible for
+        # broadcasting X_L after this returns. CUDA RNG states diverge across ranks
+        # even with identical seeds, so set_seed() alone is insufficient.
         noise[..., is_motif_atom_with_fixed_coord, :] = 0  # Zero out noise going in
         X_L = noise + coord_atom_lvl_to_be_noised
         return X_L
@@ -385,6 +241,14 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                 device=X_L.device,
             )
 
+        # CRITICAL: In multi-GPU mode, broadcast initial X_L from rank 0 to ensure
+        # all GPUs start with identical noisy coordinates. Without this, each GPU
+        # generates different initial noise (CUDA RNG states diverge across ranks),
+        # causing X_noisy_L to differ, which produces different KNN attention indices,
+        # different C_L_keys, and ultimately divergent P_LL outputs.
+        if parallel_mode and world_size > 1:
+            _broadcast_tensor(X_L, src=0)
+
         X_noisy_L_traj = []
         X_denoised_L_traj = []
         sequence_entropy_traj = []
@@ -447,6 +311,11 @@ class SampleDiffusionWithMotif(SampleDiffusionConfig):
                     centering_affects_motif=(max(step_num - 1, 0)) >= threshold_step,
                     s_trans=self.s_trans if step_num >= threshold_step else 0.0,
                 )
+                # Broadcast augmented X_L so all ranks have identical coordinates
+                # before noise is added (augmentation uses random rotations that
+                # would diverge across ranks due to independent CUDA RNG states)
+                if parallel_mode and world_size > 1:
+                    _broadcast_tensor(X_L, src=0)
 
             # Update gamma & step scale
             gamma = self.gamma_0 if c_t > self.gamma_min else 0
@@ -881,6 +750,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                     coord_atom_lvl_to_be_noised,
                     is_motif_atom_with_fixed_coord,
                 )
+                # Broadcast augmented X_L so all ranks have identical coordinates
+                # before noise is added (augmentation uses random rotations that
+                # would diverge across ranks due to independent CUDA RNG states)
+                if parallel_mode and world_size > 1:
+                    _broadcast_tensor(X_L, src=0)
 
             # Update gamma & step scale
             gamma = self.gamma_0 if c_t > self.gamma_min else 0
@@ -901,16 +775,11 @@ class SampleDiffusionWithSymmetry(SampleDiffusionWithMotif):
                 * torch.normal(mean=0.0, std=1.0, size=X_L.shape, device=X_L.device)
             )                                              # [D, L, 3]
 
-            # DEBUG: Track epsilon generation
-            debug_log_all_ranks("SAMPLER", "EPSILON_GENERATED", f"device={epsilon_L.device}, mean={epsilon_L.mean().item():.6f}")
-
             # CRITICAL: In multi-GPU mode, broadcast noise from rank 0 to ensure
             # all GPUs use identical noise. Otherwise each GPU generates different
             # random noise, causing X_noisy_L to diverge across GPUs.
             if parallel_mode and world_size > 1:
-                debug_log_all_ranks("SAMPLER", "BEFORE_BROADCAST", f"epsilon_L.device={epsilon_L.device}")
                 _broadcast_tensor(epsilon_L, src=0)
-                debug_log_all_ranks("SAMPLER", "AFTER_BROADCAST", f"epsilon_L.mean={epsilon_L.mean().item():.6f}")
 
             epsilon_L[..., is_motif_atom_with_fixed_coord, :] = 0  # No noise for fixed atoms
 

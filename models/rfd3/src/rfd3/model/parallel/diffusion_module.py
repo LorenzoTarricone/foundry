@@ -908,6 +908,10 @@ class ParallelDiffusionModule(RFD3DiffusionModule):
         debug_tensor_memory("DIFFUSION", "S_I_after_encoder", S_I)
         debug_tensor_memory("DIFFUSION", "Z_II_after_encoder", Z_II)
 
+        # DIAGNOSTIC: Log S_I and Z_II after Pairformer for cross-mode comparison
+        log_tensor_stats("S_I_after_pairformer", S_I)
+        log_tensor_stats("Z_II_after_pairformer", Z_II)
+
         # Determine full mode for transformer
         gpu_rank, world_size = get_gpu_rank_and_world_size()
         use_full_attention = not (
@@ -957,6 +961,13 @@ class ParallelDiffusionModule(RFD3DiffusionModule):
                     ),
                     full=use_full_attention,
                 )                                              # [B, I, c_token]
+
+        # DIAGNOSTIC: Log A_I after transformer for cross-mode comparison
+        log_tensor_stats("A_I_after_transformer", A_I)
+
+        # DIAGNOSTIC: Log inputs before decoder for cross-mode comparison
+        log_tensor_stats("A_I_before_decoder", A_I)
+        log_tensor_stats("Q_L_before_decoder", Q_L)
 
         # ... Decoder readout
         # Handle all combinations of LOW_MEMORY_MODE and ATTENTION_PARALLEL:
@@ -1024,10 +1035,19 @@ class ParallelDiffusionModule(RFD3DiffusionModule):
                     indices=f["attn_indices"],
                 )
 
+        # DIAGNOSTIC: Log Q_L after decoder for cross-mode comparison
+        log_tensor_stats("Q_L_after_decoder", Q_L)
+
         # ... Process outputs to positions update
         R_update_L = self.to_r_update(Q_L)                 # [B, L, 3]
 
+        # DIAGNOSTIC: Log R_update_L (the model's prediction)
+        log_tensor_stats("R_update_L", R_update_L)
+
         X_out_L = self.scale_positions_out(R_update_L, X_noisy_L, t_L)  # [B, L, 3]
+
+        # DIAGNOSTIC: Log X_out_L (final denoised positions)
+        log_tensor_stats("X_out_L", X_out_L)
 
         sequence_logits_I, sequence_indices_I = self.sequence_head(A_I=A_I)
 

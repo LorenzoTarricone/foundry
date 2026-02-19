@@ -25,6 +25,7 @@ from rfd3.model.debug_context import (
     debug_ctx, debug_tensor, debug_log,
     debug_memory, debug_tensor_memory, debug_time,
 )
+from rfd3.model.parallel.utils import is_parallel_mode
 
 from foundry.model.layers.blocks import (
     FourierEmbedding,
@@ -37,21 +38,6 @@ def _log_tensor_stats(name: str, tensor: torch.Tensor, rank: int = 0):
     if not debug_ctx.stats_enabled:
         return
     debug_tensor("MODEL", name, tensor, rank)
-
-
-def _is_parallel_mode() -> bool:
-    """
-    Check if streaming/parallel mode is enabled.
-
-    Env var scheme:
-      - RFD3_ATTENTION_PARALLEL=0 or unset → standard mode (False)
-      - RFD3_ATTENTION_PARALLEL=1 or any non-zero value → parallel mode (True)
-
-    NOTE: design_parallel.py sets this to world_size (e.g., "4" for 4 GPUs),
-    so we check for any truthy non-zero value, not just "1".
-    """
-    val = os.environ.get("RFD3_ATTENTION_PARALLEL", "0")
-    return val not in ("0", "", "false", "False")
 
 
 
@@ -80,6 +66,32 @@ class RFD3DiffusionModule(nn.Module):
         use_local_token_attention=True,
         **_,
     ):
+        """Initialize the RFD3 diffusion module (denoising network).
+
+        This is the core UNet-like network that takes noisy coordinates and
+        predicts denoised coordinates at each diffusion step. Processes:
+        encoder (atom-level) -> downcast -> token encoder (Pairformer) ->
+        transformer -> decoder (token->atom) -> coordinate prediction.
+
+        Args:
+            c_atom: Atom feature dimension.
+            c_atompair: Atom pair feature dimension.
+            c_token: Token activation dimension.
+            c_s: Token single feature dimension.
+            c_z: Token pair feature dimension.
+            c_t_embed: Time embedding dimension for Fourier features.
+            sigma_data: Data normalization constant (16).
+            f_pred: Number of predicted output features per atom.
+            n_attn_seq_neighbours: Number of sequence neighbors for local attention.
+            n_attn_keys: Number of attention keys for local attention.
+            n_recycle: Number of recycling iterations per diffusion step.
+            atom_attention_encoder: Config dict for LocalAtomTransformer encoder.
+            diffusion_token_encoder: Config dict for DiffusionTokenEncoder.
+            diffusion_transformer: Config dict for LocalTokenTransformer.
+            atom_attention_decoder: Config dict for CompactDecoder.
+            downcast: Config dict for Downcast module.
+            use_local_token_attention: If True, use local attention in transformer.
+        """
         super().__init__()
         self.sigma_data = sigma_data
         self.c_atom = c_atom
@@ -302,7 +314,27 @@ class RFD3DiffusionModule(nn.Module):
             f=f,
             n_attn_keys=self.n_attn_keys,
             n_attn_seq_neighbours=self.n_attn_seq_neighbours,
-        )                                                  # [B, L, k] 
+        )                                                  # [B, L, k]
+
+        # DEBUG: Check X_noisy_L and attn_indices consistency across ranks
+        if debug_ctx.stats_enabled:
+            import torch.distributed as dist
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            xn_mean = X_noisy_L.float().mean().item()
+            xn_sum = X_noisy_L.float().sum().item()
+            idx = f["attn_indices"]
+            idx_sum = idx.float().sum().item()
+            # Print first/second half stats for cross-mode comparison
+            L_half = L // 2
+            xn_first = X_noisy_L[:, :L_half].float().mean().item()
+            xn_second = X_noisy_L[:, L_half:].float().mean().item()
+            idx_first = idx[:, :L_half].float().sum().item()
+            idx_second = idx[:, L_half:].float().sum().item()
+            print(f"[RANK{rank}] X_NOISY_CHECK: mean={xn_mean:.6f}, sum={xn_sum:.1f}, "
+                  f"first_half_mean={xn_first:.6f}, second_half_mean={xn_second:.6f}", flush=True)
+            print(f"[RANK{rank}] ATTN_INDICES_CHECK: total_sum={idx_sum:.1f}, "
+                  f"first_half_sum={idx_first:.1f}, second_half_sum={idx_second:.1f}, "
+                  f"shape={list(idx.shape)}", flush=True)
 
         # ... Expand t tensors
         t_L = t.unsqueeze(-1).expand(-1, L) * (
@@ -482,9 +514,13 @@ class RFD3DiffusionModule(nn.Module):
         debug_tensor_memory("DIFFUSION", "S_I_after_encoder", S_I)
         debug_tensor_memory("DIFFUSION", "Z_II_after_encoder", Z_II)
 
+        # DIAGNOSTIC: Log S_I and Z_II after Pairformer for cross-mode comparison
+        _log_tensor_stats("S_I_after_pairformer", S_I)
+        _log_tensor_stats("Z_II_after_pairformer", Z_II)
+
         # Determine full mode for transformer
         use_full_attention = not (
-            os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1" or _is_parallel_mode()
+            os.environ.get("RFD3_LOW_MEMORY_MODE", None) == "1" or is_parallel_mode()
         )
 
         # ... Diffusion transformer
@@ -505,6 +541,10 @@ class RFD3DiffusionModule(nn.Module):
         # DIAGNOSTIC: Log A_I after diffusion transformer
         _log_tensor_stats("A_I_after_transformer", A_I)
         
+        # DIAGNOSTIC: Log inputs before decoder for cross-mode comparison
+        _log_tensor_stats("A_I_before_decoder", A_I)
+        _log_tensor_stats("Q_L_before_decoder", Q_L)
+
         # ... Decoder readout
         with debug_time("DIFFUSION", "decoder"):
             if chunked_pairwise_embedder is not None:
